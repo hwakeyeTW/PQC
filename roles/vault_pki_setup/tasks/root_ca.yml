@@ -1,0 +1,49 @@
+---
+- name: Enable Root CA PKI secrets engine
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: sys/mounts/{{ vault_pki_root_path }}
+    data:
+      type: pki
+      config:
+        max_lease_ttl: "{{ vault_pki_root_max_ttl }}"
+    ca_cert: "{{ omit if vault_skip_tls_verify else omit }}"
+  register: _pki_root_mount
+  failed_when:
+    - _pki_root_mount is failed
+    - "'existing mount' not in (_pki_root_mount.msg | default(''))"
+
+- name: Tune Root CA mount TTL
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "sys/mounts/{{ vault_pki_root_path }}/tune"
+    data:
+      max_lease_ttl: "{{ vault_pki_root_max_ttl }}"
+
+- name: Generate Root CA certificate
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_root_path }}/root/generate/internal"
+    data:
+      common_name: "{{ vault_pki_root_common_name }}"
+      organization: "{{ vault_pki_root_organization }}"
+      country: "{{ vault_pki_root_country }}"
+      ttl: "{{ vault_pki_root_ttl }}"
+      key_type: "{{ vault_pki_root_key_type }}"
+      key_bits: "{{ vault_pki_root_key_bits }}"
+      issuer_name: "{{ vault_pki_root_issuer_name }}"
+  register: _root_ca_result
+
+- name: Store Root CA certificate fact
+  ansible.builtin.set_fact:
+    vault_root_ca_cert: "{{ _root_ca_result.data.data.certificate | default(_root_ca_result.data.certificate | default('')) }}"
+
+- name: Display Root CA info
+  ansible.builtin.debug:
+    msg: >-
+      Root CA generated: {{ vault_pki_root_common_name }}
+      (issuer={{ vault_pki_root_issuer_name }},
+       key_type={{ vault_pki_root_key_type }}/{{ vault_pki_root_key_bits }})

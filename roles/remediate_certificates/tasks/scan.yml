@@ -1,0 +1,61 @@
+---
+- name: Find certificate files in scan paths
+  ansible.builtin.find:
+    paths: "{{ remediate_cert_scan_paths }}"
+    patterns: "{{ remediate_cert_scan_extensions }}"
+    file_type: file
+    recurse: true
+  register: _cert_files_found
+
+- name: Inspect each certificate
+  ansible.builtin.command:
+    cmd: >-
+      openssl x509 -noout -text
+      -in {{ item.path }}
+  loop: "{{ _cert_files_found.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _cert_inspections
+  changed_when: false
+  failed_when: false
+
+- name: Classify certificates by PQC readiness
+  ansible.builtin.set_fact:
+    _non_pqc_certs: >-
+      {{ _non_pqc_certs | default([]) + [{
+        'path': item.item.path,
+        'algorithm': (item.stdout | regex_search('Public Key Algorithm:\s*(\S+)', '\1') | default(['unknown'], true) | first),
+        'key_size': (item.stdout | regex_search('Public-Key:\s*\((\d+)\s*bit', '\1') | default(['0'], true) | first | int),
+        'subject': (item.stdout | regex_search('Subject:\s*(.*)', '\1') | default(['unknown'], true) | first),
+        'issuer': (item.stdout | regex_search('Issuer:\s*(.*)', '\1') | default(['unknown'], true) | first),
+        'not_after': (item.stdout | regex_search('Not After\s*:\s*(.*)', '\1') | default(['unknown'], true) | first),
+        'is_ca': (item.stdout is search('CA:TRUE')),
+        'is_self_signed': ((item.stdout | regex_search('Subject:\s*(.*)', '\1') | default([''], true) | first)
+                          == (item.stdout | regex_search('Issuer:\s*(.*)', '\1') | default(['_'], true) | first)),
+      }] }}
+  loop: "{{ _cert_inspections.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when:
+    - item.rc == 0
+    - (item.stdout | regex_search('Public Key Algorithm:\s*(\S+)', '\1') | default([''], true) | first)
+      in remediate_cert_vulnerable_algorithms
+
+- name: Filter out CA and system certs if configured
+  ansible.builtin.set_fact:
+    _non_pqc_certs: >-
+      {{ _non_pqc_certs | default([])
+         | rejectattr('is_ca', 'eq', true) | list
+         if remediate_cert_skip_ca_certs
+         else _non_pqc_certs | default([]) }}
+
+- name: Set empty list if no vulnerable certs found
+  ansible.builtin.set_fact:
+    _non_pqc_certs: "{{ _non_pqc_certs | default([]) }}"
+
+- name: Display scan results
+  ansible.builtin.debug:
+    msg: >-
+      Found {{ _non_pqc_certs | length }} non-PQC-compliant certificate(s)
+      across {{ remediate_cert_scan_paths | join(', ') }}.
+      {% if remediate_cert_dry_run %}DRY RUN — no changes will be made.{% endif %}

@@ -1,0 +1,116 @@
+---
+- name: Ensure Vault service is started and enabled
+  ansible.builtin.systemd:
+    name: vault
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for Vault API to become available
+  ansible.builtin.uri:
+    url: "{{ vault_api_addr }}/v1/sys/health"
+    method: GET
+    validate_certs: false
+    status_code: [200, 429, 472, 473, 501]
+  register: _vault_health
+  retries: 12
+  delay: 5
+  until: _vault_health.status in [200, 429, 472, 473, 501]
+
+- name: Check initialization status
+  ansible.builtin.uri:
+    url: "{{ vault_api_addr }}/v1/sys/init"
+    method: GET
+    validate_certs: false
+  register: _vault_init_status
+
+- name: Initialize Vault
+  when: not _vault_init_status.json.initialized
+  block:
+    - name: Initialize Vault operator
+      ansible.builtin.uri:
+        url: "{{ vault_api_addr }}/v1/sys/init"
+        method: PUT
+        validate_certs: false
+        body_format: json
+        body:
+          secret_shares: "{{ vault_init_secret_shares }}"
+          secret_threshold: "{{ vault_init_secret_threshold }}"
+      register: _vault_init_result
+      no_log: true
+
+    - name: Store init credentials securely
+      ansible.builtin.copy:
+        content: "{{ _vault_init_result.json | to_nice_json }}"
+        dest: "{{ vault_config_dir }}/init-keys.json"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Display critical security notice
+      ansible.builtin.debug:
+        msg: >-
+          CRITICAL: Vault initialized. Unseal keys and root token saved to
+          {{ vault_config_dir }}/init-keys.json — this file MUST be secured
+          immediately. Move keys to a secure offline location and delete this
+          file. Never store unseal keys alongside Vault in production.
+
+- name: Check seal status
+  ansible.builtin.uri:
+    url: "{{ vault_api_addr }}/v1/sys/seal-status"
+    method: GET
+    validate_certs: false
+  register: _vault_seal_status
+
+- name: Unseal Vault
+  when:
+    - _vault_seal_status.json.sealed
+    - _vault_init_result is defined
+    - _vault_init_result.json.keys is defined
+  block:
+    - name: Load init keys if not in memory
+      ansible.builtin.slurp:
+        src: "{{ vault_config_dir }}/init-keys.json"
+      register: _vault_init_keys_file
+      no_log: true
+      when: _vault_init_result is not defined or _vault_init_result is skipped
+
+    - name: Set init keys fact
+      ansible.builtin.set_fact:
+        _vault_unseal_keys: >-
+          {{ (_vault_init_result.json.keys
+              if (_vault_init_result is defined and _vault_init_result is not skipped)
+              else (_vault_init_keys_file.content | b64decode | from_json).keys) }}
+      no_log: true
+
+    - name: Submit unseal keys
+      ansible.builtin.uri:
+        url: "{{ vault_api_addr }}/v1/sys/unseal"
+        method: PUT
+        validate_certs: false
+        body_format: json
+        body:
+          key: "{{ item }}"
+      loop: "{{ _vault_unseal_keys[:vault_init_secret_threshold] }}"
+      loop_control:
+        label: "unseal-key-{{ ansible_loop.index }}"
+        extended: true
+      no_log: true
+      register: _vault_unseal_result
+
+    - name: Verify Vault is unsealed
+      ansible.builtin.uri:
+        url: "{{ vault_api_addr }}/v1/sys/seal-status"
+        method: GET
+        validate_certs: false
+      register: _vault_final_seal
+      failed_when: _vault_final_seal.json.sealed
+
+- name: Set Vault root token fact for downstream tasks
+  ansible.builtin.set_fact:
+    vault_root_token: "{{ _vault_init_result.json.root_token }}"
+  no_log: true
+  when:
+    - _vault_init_result is defined
+    - _vault_init_result is not skipped

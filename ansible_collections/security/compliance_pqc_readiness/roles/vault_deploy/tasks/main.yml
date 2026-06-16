@@ -1,0 +1,27 @@
+---
+- name: Install Vault binary and dependencies
+  ansible.builtin.import_tasks: install.yml
+  tags:
+    - vault_install
+
+- name: Configure Vault server
+  ansible.builtin.import_tasks: configure.yml
+  tags:
+    - vault_configure
+
+- name: Generate self-signed TLS bootstrap certificate
+  ansible.builtin.import_tasks: tls_bootstrap.yml
+  when: not vault_tls_disable
+  tags:
+    - vault_tls
+
+- name: Start and initialize Vault
+  ansible.builtin.import_tasks: init.yml
+  tags:
+    - vault_init
+
+- name: Enable audit logging
+  ansible.builtin.import_tasks: audit.yml
+  when: vault_enable_audit_file
+  tags:
+    - vault_audit

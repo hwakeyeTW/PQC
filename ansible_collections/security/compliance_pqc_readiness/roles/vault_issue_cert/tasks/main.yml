@@ -1,0 +1,16 @@
+---
+- name: Issue certificate from Vault PKI
+  ansible.builtin.import_tasks: issue.yml
+  tags:
+    - vault_cert_issue
+
+- name: Deploy certificate files to host
+  ansible.builtin.import_tasks: deploy.yml
+  tags:
+    - vault_cert_deploy
+
+- name: Update system CA trust store
+  ansible.builtin.import_tasks: trust.yml
+  when: vault_cert_update_ca_trust
+  tags:
+    - vault_cert_trust

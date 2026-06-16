@@ -1,0 +1,42 @@
+---
+- name: Install prerequisites
+  ansible.builtin.dnf:
+    name:
+      - jq
+      - openssl
+    state: present
+
+- name: Add HashiCorp repository
+  ansible.builtin.yum_repository:
+    name: hashicorp
+    description: HashiCorp Stable - $basearch
+    baseurl: https://rpm.releases.hashicorp.com/RHEL/$releasever/$basearch/stable
+    gpgcheck: true
+    gpgkey: https://rpm.releases.hashicorp.com/gpg
+    enabled: true
+
+- name: Install Vault
+  ansible.builtin.dnf:
+    name: "vault-{{ vault_version }}"
+    state: present
+
+- name: Create vault system group
+  ansible.builtin.group:
+    name: "{{ vault_group }}"
+    system: true
+    state: present
+
+- name: Create vault system user
+  ansible.builtin.user:
+    name: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ vault_data_dir }}"
+    create_home: false
+
+- name: Set IPC_LOCK capability on vault binary
+  community.general.capabilities:
+    path: /usr/bin/vault
+    capability: cap_ipc_lock=+ep
+    state: present

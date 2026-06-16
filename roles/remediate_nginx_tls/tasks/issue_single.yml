@@ -1,0 +1,76 @@
+---
+- name: "Inspect current nginx certificate: {{ _site.cert_path }}"
+  community.crypto.x509_certificate_info:
+    path: "{{ _site.cert_path }}"
+  register: _current_nginx_cert
+  failed_when: false
+
+- name: "Check if certificate is PQC-compliant"
+  ansible.builtin.set_fact:
+    _cert_needs_replacement: >-
+      {{ _current_nginx_cert.public_key_type | default('RSA') in ['RSA', 'ECC', 'DSA'] }}
+  when: _current_nginx_cert is not failed
+
+- name: "Backup existing nginx certificate: {{ _site.cert_path }}"
+  ansible.builtin.copy:
+    src: "{{ _site.cert_path }}"
+    dest: "{{ _site.cert_path }}.pre-pqc.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+  when:
+    - remediate_nginx_backup
+    - _cert_needs_replacement | default(true)
+
+- name: "Extract server_name from nginx config"
+  ansible.builtin.shell:
+    cmd: >-
+      grep -h 'server_name' {{ _site.config_file }}
+      | grep -v '#'
+      | head -1
+      | awk '{for(i=2;i<=NF;i++) printf "%s ", $i}'
+      | tr -d ';'
+  register: _nginx_server_names
+  changed_when: false
+
+- name: "Set certificate common name"
+  ansible.builtin.set_fact:
+    _nginx_cert_cn: "{{ (_nginx_server_names.stdout | trim | split(' ') | first) | default(ansible_fqdn) }}"
+    _nginx_cert_sans: "{{ _nginx_server_names.stdout | trim | split(' ') | select | list }}"
+
+- name: "Issue replacement certificate from Vault: {{ _nginx_cert_cn }}"
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_cert_pki_path }}/issue/{{ vault_cert_role }}"
+    data:
+      common_name: "{{ _nginx_cert_cn }}"
+      alt_names: "{{ (_nginx_cert_sans + [ansible_fqdn]) | unique | join(',') }}"
+      ip_sans: "{{ ansible_default_ipv4.address | default('127.0.0.1') }},127.0.0.1"
+      ttl: "{{ remediate_nginx_cert_ttl }}"
+      format: pem
+  register: _nginx_vault_cert
+  no_log: true
+  when: _cert_needs_replacement | default(true)
+
+- name: "Deploy certificate to nginx"
+  ansible.builtin.copy:
+    content: |
+      {{ _nginx_vault_cert.data.data.certificate | default(_nginx_vault_cert.data.certificate) }}
+      {{ (_nginx_vault_cert.data.data.ca_chain | default(_nginx_vault_cert.data.ca_chain | default([]))) | join('\n') }}
+    dest: "{{ _site.cert_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: _cert_needs_replacement | default(true)
+  notify: Reload nginx
+
+- name: "Deploy private key to nginx"
+  ansible.builtin.copy:
+    content: "{{ _nginx_vault_cert.data.data.private_key | default(_nginx_vault_cert.data.private_key) }}\n"
+    dest: "{{ _site.cert_path | regex_replace('\\.(pem|crt)$', '-key.pem') }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: _cert_needs_replacement | default(true)
+  notify: Reload nginx

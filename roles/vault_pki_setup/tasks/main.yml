@@ -1,0 +1,26 @@
+---
+- name: Configure Root CA PKI engine
+  ansible.builtin.import_tasks: root_ca.yml
+  tags:
+    - vault_pki_root
+
+- name: Configure Intermediate CA PKI engine
+  ansible.builtin.import_tasks: intermediate_ca.yml
+  tags:
+    - vault_pki_intermediate
+
+- name: Create certificate issuance roles
+  ansible.builtin.import_tasks: roles.yml
+  tags:
+    - vault_pki_roles
+
+- name: Configure CRL and OCSP endpoints
+  ansible.builtin.import_tasks: endpoints.yml
+  tags:
+    - vault_pki_endpoints
+
+- name: Create automation policy and AppRole
+  ansible.builtin.import_tasks: approle.yml
+  when: vault_pki_create_approle
+  tags:
+    - vault_pki_approle

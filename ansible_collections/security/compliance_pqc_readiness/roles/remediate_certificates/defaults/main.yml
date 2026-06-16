@@ -1,0 +1,34 @@
+---
+vault_addr: "https://127.0.0.1:8200"
+vault_skip_tls_verify: false
+
+vault_cert_pki_path: pki_int
+vault_cert_role: pqc-server
+
+remediate_cert_scan_paths:
+  - /etc/pki/tls/certs
+  - /etc/pki/ca-trust/source/anchors
+
+remediate_cert_scan_extensions:
+  - "*.pem"
+  - "*.crt"
+  - "*.cer"
+
+# Algorithms considered non-PQC-safe (classical-only)
+remediate_cert_vulnerable_algorithms:
+  - rsaEncryption
+  - id-ecPublicKey
+  - dsaEncryption
+
+# Minimum RSA key size to flag (all RSA certs are vulnerable to quantum, but smaller are worse)
+remediate_cert_min_rsa_bits: 2048
+
+remediate_cert_skip_ca_certs: true
+remediate_cert_skip_system_certs: true
+remediate_cert_backup: true
+remediate_cert_dry_run: false
+
+remediate_cert_ttl: "2160h"
+
+remediate_cert_owner: root
+remediate_cert_group: root

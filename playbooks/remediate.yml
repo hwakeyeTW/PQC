@@ -1,0 +1,143 @@
+---
+# PQC Compliance: Full Remediation Pipeline
+#
+# Replaces the placeholder remediate.yml with a complete remediation workflow
+# that uses HashiCorp Vault as a Certificate Authority.
+#
+# Usage:
+#   Full remediation:
+#     ansible-playbook playbooks/remediate.yml \
+#       -e vault_addr=https://vault:8200 \
+#       -e vault_token=<token>
+#
+#   Selective remediation via tags:
+#     ansible-playbook playbooks/remediate.yml --tags remediate_certificates
+#     ansible-playbook playbooks/remediate.yml --tags remediate_crypto_policy
+#     ansible-playbook playbooks/remediate.yml --tags remediate_nginx
+#     ansible-playbook playbooks/remediate.yml --tags remediate_sshd
+#
+#   Dry run (assess only, no changes):
+#     ansible-playbook playbooks/remediate.yml \
+#       -e remediate_cert_dry_run=true \
+#       -e remediate_crypto_dry_run=true \
+#       -e remediate_nginx_dry_run=true \
+#       -e remediate_sshd_dry_run=true
+#
+#   Limit to specific hosts:
+#     ansible-playbook playbooks/remediate.yml --limit pqc_not_ready
+#
+# Required variables:
+#   vault_addr:  Vault API address
+#   vault_token: Vault token with certificate issuance privileges
+#
+# Available tags:
+#   remediate_certificates  - Replace non-PQC system certificates via Vault CA
+#   remediate_crypto_policy - Update RHEL crypto-policies for PQC
+#   remediate_nginx         - Re-issue nginx TLS certs and configure PQC key exchange
+#   remediate_sshd          - Harden SSH with PQC KEX algorithms
+
+- name: "PQC Compliance: Discovery Scan"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - always
+
+  roles:
+    - role: crypto_posture_snapshot
+      vars:
+        pqc_write_local_report: false
+
+  tasks:
+    - name: Classify host PQC readiness
+      ansible.builtin.set_fact:
+        pqc_ready: >-
+          {{ (pqc_crypto_report.openssl_tls1_3_groups | default(''))
+             is regex('(?i)mlkem') }}
+
+- name: "PQC Compliance: Certificate Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_certificates
+
+  pre_tasks:
+    - name: Validate Vault connectivity for certificate remediation
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: "{{ not (vault_skip_tls_verify | default(false)) }}"
+        status_code: [200, 429, 472, 473]
+      delegate_to: localhost
+      run_once: true
+
+  roles:
+    - role: remediate_certificates
+
+- name: "PQC Compliance: RHEL Crypto Policy Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_crypto_policy
+
+  roles:
+    - role: remediate_crypto_policy
+
+- name: "PQC Compliance: nginx TLS Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_nginx
+
+  pre_tasks:
+    - name: Validate Vault connectivity for nginx remediation
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: "{{ not (vault_skip_tls_verify | default(false)) }}"
+        status_code: [200, 429, 472, 473]
+      delegate_to: localhost
+      run_once: true
+
+  roles:
+    - role: remediate_nginx_tls
+
+- name: "PQC Compliance: SSH Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_sshd
+
+  roles:
+    - role: remediate_sshd
+
+- name: "PQC Compliance: Post-Remediation Validation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - always
+
+  roles:
+    - role: crypto_posture_snapshot
+      vars:
+        pqc_write_local_report: false
+
+  tasks:
+    - name: Classify post-remediation PQC readiness
+      ansible.builtin.set_fact:
+        pqc_ready_after: >-
+          {{ (pqc_crypto_report.openssl_tls1_3_groups | default(''))
+             is regex('(?i)mlkem') }}
+
+    - name: Display remediation outcome
+      ansible.builtin.debug:
+        msg: |
+          === Remediation Complete: {{ inventory_hostname }} ===
+          PQC ready before: {{ pqc_ready | default('unknown') }}
+          PQC ready after:  {{ pqc_ready_after }}
+          Status: {{ 'REMEDIATED' if pqc_ready_after | bool else 'REQUIRES MANUAL INTERVENTION' }}

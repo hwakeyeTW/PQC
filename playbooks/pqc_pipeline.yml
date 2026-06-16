@@ -33,6 +33,12 @@
         profile_id: "{{ compliance_profile }}"
       register: _pqc_evaluate
 
+    - name: Generate CBOM from crypto posture
+      generate_cbom:
+        crypto_report: "{{ pqc_crypto_report }}"
+      register: _pqc_cbom
+      when: pqc_write_cbom | default(false) | bool
+
     - name: Emit findings for Backstage consumption
       ansible.builtin.set_fact:
         findings: "{{ _pqc_evaluate.findings }}"

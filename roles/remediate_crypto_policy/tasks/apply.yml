@@ -1,0 +1,35 @@
+---
+- name: Build target policy string
+  ansible.builtin.set_fact:
+    _target_policy: >-
+      {{ remediate_crypto_policy_base }}{% if remediate_crypto_policy_subpolicies | length > 0 %}:{{ remediate_crypto_policy_subpolicies | join(':') }}{% endif %}
+
+- name: Set system-wide crypto policy
+  ansible.builtin.command:
+    cmd: "update-crypto-policies --set {{ _target_policy }}"
+  register: _policy_set_result
+  when: _crypto_assessment.policy_needs_update | bool
+  changed_when: "'Setting system policy' in (_policy_set_result.stdout | default(''))"
+
+- name: Verify new crypto policy
+  ansible.builtin.command:
+    cmd: update-crypto-policies --show
+  register: _verify_policy
+  changed_when: false
+
+- name: Validate policy was applied
+  ansible.builtin.assert:
+    that:
+      - _target_policy in _verify_policy.stdout
+    fail_msg: >-
+      Failed to apply crypto policy {{ _target_policy }}.
+      Current policy: {{ _verify_policy.stdout | trim }}.
+      The PQC sub-policy may not be available on this RHEL version.
+
+- name: Restart dependent services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop: "{{ remediate_crypto_restart_services }}"
+  failed_when: false
+  when: _policy_set_result is changed

@@ -1,0 +1,61 @@
+---
+- name: Check if nginx is installed
+  ansible.builtin.command:
+    cmd: nginx -v
+  register: _nginx_version_check
+  changed_when: false
+  failed_when: false
+
+- name: Set nginx installed fact
+  ansible.builtin.set_fact:
+    _nginx_installed: "{{ _nginx_version_check.rc == 0 }}"
+
+- name: Find nginx SSL configuration files
+  ansible.builtin.find:
+    paths:
+      - "{{ remediate_nginx_config_root }}/conf.d"
+      - "{{ remediate_nginx_config_root }}/sites-enabled"
+    patterns: "*.conf"
+    contains: "ssl_certificate"
+    file_type: file
+  register: _nginx_ssl_configs
+  when: _nginx_installed
+
+- name: Parse SSL certificate paths from nginx configs
+  ansible.builtin.shell:
+    cmd: >-
+      grep -h 'ssl_certificate\b' {{ item.path }}
+      | grep -v '#'
+      | awk '{print $2}'
+      | tr -d ';'
+  loop: "{{ _nginx_ssl_configs.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _nginx_cert_paths
+  changed_when: false
+  when: _nginx_installed
+
+- name: Build list of nginx SSL sites
+  ansible.builtin.set_fact:
+    _nginx_ssl_sites: >-
+      {{ _nginx_ssl_sites | default([]) + [{
+        'config_file': item.item.path,
+        'cert_path': (item.stdout_lines | first | default('')),
+      }] }}
+  loop: "{{ _nginx_cert_paths.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('none') }}"
+  when:
+    - _nginx_installed
+    - item.stdout_lines | default([]) | length > 0
+
+- name: Set empty list if no SSL sites found
+  ansible.builtin.set_fact:
+    _nginx_ssl_sites: "{{ _nginx_ssl_sites | default([]) }}"
+
+- name: Display nginx detection results
+  ansible.builtin.debug:
+    msg: >-
+      nginx {{ 'installed' if _nginx_installed else 'not installed' }}.
+      Found {{ _nginx_ssl_sites | length }} SSL-enabled site(s).
+      {% if remediate_nginx_dry_run %}DRY RUN — no changes will be made.{% endif %}

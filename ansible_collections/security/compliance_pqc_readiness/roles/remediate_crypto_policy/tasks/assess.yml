@@ -1,0 +1,49 @@
+---
+- name: Get current crypto policy
+  ansible.builtin.command:
+    cmd: update-crypto-policies --show
+  register: _current_crypto_policy
+  changed_when: false
+
+- name: Check FIPS mode status
+  ansible.builtin.command:
+    cmd: fips-mode-setup --check
+  register: _fips_status
+  changed_when: false
+  failed_when: false
+
+- name: Check OpenSSL version for PQC support
+  ansible.builtin.command:
+    cmd: openssl version
+  register: _openssl_version
+  changed_when: false
+
+- name: Check for PQC TLS group support
+  ansible.builtin.command:
+    cmd: openssl list -tls-groups
+  register: _openssl_tls_groups
+  changed_when: false
+  failed_when: false
+
+- name: Assess PQC readiness
+  ansible.builtin.set_fact:
+    _crypto_assessment:
+      current_policy: "{{ _current_crypto_policy.stdout | trim }}"
+      fips_enabled: "{{ 'is enabled' in (_fips_status.stdout | default('')) }}"
+      openssl_version: "{{ _openssl_version.stdout | trim }}"
+      mlkem_available: "{{ (_openssl_tls_groups.stdout | default('')) is regex('(?i)mlkem') }}"
+      policy_needs_update: >-
+        {{ remediate_crypto_policy_base not in (_current_crypto_policy.stdout | trim)
+           or (remediate_crypto_policy_subpolicies | length > 0
+               and remediate_crypto_policy_subpolicies | join(':') not in (_current_crypto_policy.stdout | trim)) }}
+
+- name: Display assessment
+  ansible.builtin.debug:
+    msg: |
+      === Crypto Policy Assessment: {{ inventory_hostname }} ===
+      Current policy: {{ _crypto_assessment.current_policy }}
+      FIPS enabled: {{ _crypto_assessment.fips_enabled }}
+      OpenSSL: {{ _crypto_assessment.openssl_version }}
+      ML-KEM available: {{ _crypto_assessment.mlkem_available }}
+      Policy needs update: {{ _crypto_assessment.policy_needs_update }}
+      {% if remediate_crypto_dry_run %}DRY RUN — no changes will be made.{% endif %}

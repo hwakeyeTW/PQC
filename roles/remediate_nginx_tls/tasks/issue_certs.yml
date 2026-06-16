@@ -1,0 +1,7 @@
+---
+- name: Process each nginx SSL site
+  ansible.builtin.include_tasks: issue_single.yml
+  loop: "{{ _nginx_ssl_sites }}"
+  loop_control:
+    loop_var: _site
+    label: "{{ _site.config_file }}"

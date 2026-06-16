@@ -1,0 +1,34 @@
+---
+- name: Configure CRL distribution on Root CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_root_path }}/config/urls"
+    data:
+      issuing_certificates: "{{ vault_addr }}/v1/{{ vault_pki_root_path }}/ca"
+      crl_distribution_points: "{{ vault_addr }}/v1/{{ vault_pki_root_path }}/crl"
+      ocsp_servers: "{{ vault_addr }}/v1/{{ vault_pki_root_path }}/ocsp"
+  when: vault_pki_crl_distribution_points
+
+- name: Configure CRL distribution on Intermediate CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/config/urls"
+    data:
+      issuing_certificates: "{{ vault_addr }}/v1/{{ vault_pki_intermediate_path }}/ca"
+      crl_distribution_points: "{{ vault_addr }}/v1/{{ vault_pki_intermediate_path }}/crl"
+      ocsp_servers: "{{ vault_addr }}/v1/{{ vault_pki_intermediate_path }}/ocsp"
+  when: vault_pki_crl_distribution_points
+
+- name: Enable auto-tidy on Intermediate CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/config/auto-tidy"
+    data:
+      enabled: true
+      interval_duration: "12h"
+      tidy_cert_store: true
+      tidy_revoked_certs: true
+      safety_buffer: "72h"

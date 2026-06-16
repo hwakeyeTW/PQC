@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: vault_pki_setup
+  author: PQC-AAP
+  description: Configure Vault PKI secrets engine with Root and Intermediate CA for PQC certificate issuance.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+dependencies: []

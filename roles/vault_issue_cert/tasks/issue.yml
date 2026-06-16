@@ -1,0 +1,32 @@
+---
+- name: Build SAN list
+  ansible.builtin.set_fact:
+    _vault_cert_alt_names_str: >-
+      {{ (vault_cert_alt_names + [ansible_fqdn, ansible_hostname]) | unique | join(',') }}
+    _vault_cert_ip_sans_str: >-
+      {{ (vault_cert_ip_sans
+          + [ansible_default_ipv4.address | default('')]
+          + ['127.0.0.1'])
+         | select | unique | join(',') }}
+
+- name: Request certificate from Vault
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_cert_pki_path }}/issue/{{ vault_cert_role }}"
+    data:
+      common_name: "{{ vault_cert_common_name }}"
+      alt_names: "{{ _vault_cert_alt_names_str }}"
+      ip_sans: "{{ _vault_cert_ip_sans_str }}"
+      ttl: "{{ vault_cert_ttl }}"
+      format: "{{ vault_cert_format }}"
+  register: _vault_cert_result
+  no_log: true
+
+- name: Extract certificate components
+  ansible.builtin.set_fact:
+    _vault_issued_cert: "{{ _vault_cert_result.data.data.certificate | default(_vault_cert_result.data.certificate) }}"
+    _vault_issued_key: "{{ _vault_cert_result.data.data.private_key | default(_vault_cert_result.data.private_key) }}"
+    _vault_issued_chain: "{{ _vault_cert_result.data.data.ca_chain | default(_vault_cert_result.data.ca_chain | default([])) }}"
+    _vault_issued_serial: "{{ _vault_cert_result.data.data.serial_number | default(_vault_cert_result.data.serial_number | default('unknown')) }}"
+  no_log: true

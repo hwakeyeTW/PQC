@@ -1,0 +1,47 @@
+---
+- name: Check if OpenSSL config exists
+  ansible.builtin.stat:
+    path: "{{ remediate_crypto_openssl_conf_path }}"
+  register: _openssl_conf_stat
+
+- name: Backup OpenSSL config
+  ansible.builtin.copy:
+    src: "{{ remediate_crypto_openssl_conf_path }}"
+    dest: "{{ remediate_crypto_openssl_conf_path }}.pre-pqc.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+  when: _openssl_conf_stat.stat.exists
+
+- name: Create PQC OpenSSL configuration snippet
+  ansible.builtin.copy:
+    content: |
+      # PQC Key Exchange configuration — managed by PQC-AAP remediation
+      [system_default_sect]
+      Groups = {{ remediate_crypto_openssl_groups }}
+      MinProtocol = TLSv1.3
+    dest: /etc/crypto-policies/local.d/pqc-openssl.config
+    owner: root
+    group: root
+    mode: "0644"
+  register: _pqc_openssl_snippet
+
+- name: Apply crypto-policies local override
+  ansible.builtin.command:
+    cmd: update-crypto-policies
+  when: _pqc_openssl_snippet is changed
+  changed_when: _pqc_openssl_snippet is changed
+
+- name: Verify PQC groups are available
+  ansible.builtin.command:
+    cmd: openssl s_client -groups x25519_mlkem768 -connect localhost:443 -msg
+  register: _pqc_verify
+  changed_when: false
+  failed_when: false
+  timeout: 5
+
+- name: Display OpenSSL PQC status
+  ansible.builtin.debug:
+    msg: >-
+      OpenSSL PQC configuration applied.
+      Preferred groups: {{ remediate_crypto_openssl_groups }}.
+      ML-KEM negotiation {{ 'succeeded' if _pqc_verify.rc == 0 else 'could not be verified (no TLS listener or ML-KEM not supported)' }}.

@@ -1,0 +1,20 @@
+---
+vault_addr: "https://127.0.0.1:8200"
+vault_skip_tls_verify: false
+
+vault_cert_pki_path: pki_int
+vault_cert_role: pqc-nginx
+
+remediate_nginx_config_root: /etc/nginx
+remediate_nginx_cert_ttl: "2160h"
+remediate_nginx_backup: true
+remediate_nginx_dry_run: false
+
+# PQC TLS configuration for nginx (OpenSSL 3.5+)
+remediate_nginx_ssl_protocols: TLSv1.3
+remediate_nginx_ssl_prefer_server_ciphers: true
+remediate_nginx_ssl_ecdh_curve: "X25519MLKEM768:X25519:secp384r1"
+remediate_nginx_ssl_session_timeout: "1d"
+remediate_nginx_ssl_session_cache: "shared:PQC:10m"
+
+remediate_nginx_hsts_max_age: 63072000

@@ -41,6 +41,14 @@
       changed_when: true
       when: pqc_write_pdf_report | bool
 
+    - name: Generate per-host CBOM
+      generate_cbom:
+        crypto_report: "{{ pqc_crypto_report }}"
+        output_file: "{{ (playbook_dir | dirname) }}/reports/cbom/{{ inventory_hostname }}.cbom.json"
+      delegate_to: localhost
+      become: false
+      when: pqc_write_cbom | default(false) | bool
+
 - name: Generate aggregate fleet report
   hosts: localhost
   gather_facts: true
@@ -82,6 +90,16 @@
           "{{ (playbook_dir | dirname) }}/reports/pqc_fleet_report.pdf"
       changed_when: true
       when: pqc_write_pdf_report | default(false) | bool
+
+    - name: Generate fleet aggregate CBOM
+      generate_cbom:
+        crypto_report: "{{ item }}"
+        output_file: "{{ (playbook_dir | dirname) }}/reports/cbom/{{ item.host | default('host-' ~ ansible_loop.index) }}.cbom.json"
+      loop: "{{ _pqc_all_reports }}"
+      loop_control:
+        label: "{{ item.host | default('unknown') }}"
+        extended: true
+      when: pqc_write_cbom | default(false) | bool
 
     - name: Report generation summary
       ansible.builtin.debug:

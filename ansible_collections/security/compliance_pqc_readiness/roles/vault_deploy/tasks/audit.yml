@@ -1,0 +1,31 @@
+---
+- name: Determine Vault token for API calls
+  ansible.builtin.set_fact:
+    _vault_token: "{{ vault_root_token | default(vault_token) }}"
+  no_log: true
+
+- name: Check existing audit backends
+  ansible.builtin.uri:
+    url: "{{ vault_api_addr }}/v1/sys/audit"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ _vault_token }}"
+    validate_certs: false
+  register: _vault_audit_backends
+  no_log: true
+
+- name: Enable file audit backend
+  ansible.builtin.uri:
+    url: "{{ vault_api_addr }}/v1/sys/audit/file"
+    method: PUT
+    headers:
+      X-Vault-Token: "{{ _vault_token }}"
+    validate_certs: false
+    body_format: json
+    body:
+      type: file
+      options:
+        file_path: "{{ vault_audit_file_path }}"
+    status_code: [200, 204]
+  when: "'file/' not in (_vault_audit_backends.json | default({}))"
+  no_log: true

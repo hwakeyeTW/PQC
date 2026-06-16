@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: remediate_certificates
+  author: PQC-AAP
+  description: Scan and replace non-PQC-compliant system certificates using Vault CA.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+dependencies: []

@@ -1,0 +1,27 @@
+---
+- name: Build certificate remediation report
+  ansible.builtin.set_fact:
+    pqc_cert_remediation_report:
+      host: "{{ inventory_hostname }}"
+      scan_paths: "{{ remediate_cert_scan_paths }}"
+      total_scanned: "{{ _cert_files_found.files | length }}"
+      non_pqc_found: "{{ _non_pqc_certs | length }}"
+      replaced: "{{ _remediation_results | default([]) | length }}"
+      dry_run: "{{ remediate_cert_dry_run }}"
+      results: "{{ _remediation_results | default([]) }}"
+      skipped_self_signed: >-
+        {{ _non_pqc_certs | selectattr('is_self_signed', 'eq', true) | list | length }}
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+
+- name: Display remediation summary
+  ansible.builtin.debug:
+    msg: |
+      === Certificate Remediation Report: {{ inventory_hostname }} ===
+      Certificates scanned: {{ pqc_cert_remediation_report.total_scanned }}
+      Non-PQC certificates found: {{ pqc_cert_remediation_report.non_pqc_found }}
+      Certificates replaced: {{ pqc_cert_remediation_report.replaced }}
+      Self-signed skipped: {{ pqc_cert_remediation_report.skipped_self_signed }}
+      Dry run: {{ pqc_cert_remediation_report.dry_run }}
+      {% for r in _remediation_results | default([]) %}
+        - {{ r.original_path }}: {{ r.original_algorithm }} → Vault CA (serial={{ r.new_serial }})
+      {% endfor %}

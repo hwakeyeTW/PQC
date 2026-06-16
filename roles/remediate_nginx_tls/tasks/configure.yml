@@ -1,0 +1,35 @@
+---
+- name: Deploy PQC TLS configuration snippet for nginx
+  ansible.builtin.copy:
+    content: |
+      # PQC TLS configuration — managed by PQC-AAP remediation
+      ssl_protocols {{ remediate_nginx_ssl_protocols }};
+      ssl_prefer_server_ciphers {{ 'on' if remediate_nginx_ssl_prefer_server_ciphers else 'off' }};
+      ssl_ecdh_curve {{ remediate_nginx_ssl_ecdh_curve }};
+      ssl_session_timeout {{ remediate_nginx_ssl_session_timeout }};
+      ssl_session_cache {{ remediate_nginx_ssl_session_cache }};
+      ssl_session_tickets off;
+
+      ssl_stapling on;
+      ssl_stapling_verify on;
+
+      add_header Strict-Transport-Security "max-age={{ remediate_nginx_hsts_max_age }}; includeSubDomains" always;
+    dest: "{{ remediate_nginx_config_root }}/conf.d/pqc-tls.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Validate nginx configuration
+  ansible.builtin.command:
+    cmd: nginx -t
+  register: _nginx_test
+  changed_when: false
+
+- name: Display nginx TLS remediation status
+  ansible.builtin.debug:
+    msg: >-
+      nginx PQC TLS configuration deployed.
+      Protocols: {{ remediate_nginx_ssl_protocols }},
+      ECDH curves: {{ remediate_nginx_ssl_ecdh_curve }}.
+      Config test: {{ 'passed' if _nginx_test.rc == 0 else 'FAILED — check nginx config' }}.
