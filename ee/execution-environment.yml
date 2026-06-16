@@ -26,7 +26,9 @@ dependencies:
       - name: community.crypto
       - name: ansible.posix
       - name: community.general
-  python: []
+      - name: community.hashi_vault
+  python:
+    - hvac>=2.1.0
   system: []
 
 additional_build_files:

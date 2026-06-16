@@ -1,0 +1,33 @@
+---
+- name: Create certificate issuance roles on Intermediate CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/roles/{{ item.name }}"
+    data:
+      allowed_domains: "{{ item.allowed_domains }}"
+      allow_subdomains: "{{ item.allow_subdomains | default(true) }}"
+      allow_bare_domains: "{{ item.allow_bare_domains | default(false) }}"
+      allow_glob_domains: "{{ item.allow_glob_domains | default(false) }}"
+      allow_ip_sans: "{{ item.allow_ip_sans | default(false) }}"
+      allow_localhost: "{{ item.allow_localhost | default(false) }}"
+      max_ttl: "{{ item.max_ttl | default('8760h') }}"
+      ttl: "{{ item.ttl | default('2160h') }}"
+      key_type: "{{ item.key_type | default('ec') }}"
+      key_bits: "{{ item.key_bits | default(384) }}"
+      require_cn: "{{ item.require_cn | default(true) }}"
+      server_flag: "{{ item.server_flag | default(false) }}"
+      client_flag: "{{ item.client_flag | default(false) }}"
+      key_usage: "{{ item.key_usage | default(['DigitalSignature']) }}"
+      ext_key_usage: "{{ item.ext_key_usage | default([]) }}"
+      no_store: false
+      generate_lease: true
+  loop: "{{ vault_pki_roles }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Display created roles
+  ansible.builtin.debug:
+    msg: >-
+      PKI roles created on {{ vault_pki_intermediate_path }}:
+      {{ vault_pki_roles | map(attribute='name') | join(', ') }}

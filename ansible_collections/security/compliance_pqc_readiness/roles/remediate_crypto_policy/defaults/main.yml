@@ -1,0 +1,20 @@
+---
+# Target crypto policy (RHEL 9.4+ supports PQC sub-policies)
+remediate_crypto_policy_base: FUTURE
+remediate_crypto_policy_subpolicies:
+  - PQC
+
+# Set to true to only apply the sub-policy without changing the base
+remediate_crypto_policy_subpolicy_only: false
+
+# Whether to also configure OpenSSL for PQC key exchange
+remediate_crypto_openssl_conf: true
+remediate_crypto_openssl_groups: "x25519_mlkem768:x25519:secp384r1:secp256r1"
+remediate_crypto_openssl_conf_path: /etc/pki/tls/openssl.cnf
+
+# Restart dependent services after policy change
+remediate_crypto_restart_services:
+  - sshd
+  - nginx
+
+remediate_crypto_dry_run: false

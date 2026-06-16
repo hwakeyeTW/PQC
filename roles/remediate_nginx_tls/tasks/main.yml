@@ -1,0 +1,22 @@
+---
+- name: Detect nginx installation and current TLS config
+  ansible.builtin.import_tasks: detect.yml
+  tags:
+    - remediate_nginx_detect
+
+- name: Issue and deploy Vault certificates for nginx
+  ansible.builtin.import_tasks: issue_certs.yml
+  when:
+    - _nginx_installed
+    - _nginx_ssl_sites | length > 0
+    - not remediate_nginx_dry_run
+  tags:
+    - remediate_nginx_certs
+
+- name: Apply PQC TLS configuration to nginx
+  ansible.builtin.import_tasks: configure.yml
+  when:
+    - _nginx_installed
+    - not remediate_nginx_dry_run
+  tags:
+    - remediate_nginx_configure

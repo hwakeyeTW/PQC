@@ -82,6 +82,22 @@
       failed_when: false
       no_log: true
 
+    - name: Generate CBOM per host
+      security.compliance_pqc_readiness.generate_cbom:
+        crypto_report: "{{ hostvars[item].pqc_crypto_report }}"
+        output_file: >-
+          {{ (pqc_cbom_output_dir | default(''))
+             ~ '/' ~ item ~ '.cbom.json'
+             if (pqc_cbom_output_dir | default('')) | length > 0
+             else omit }}
+      register: _cbom_results
+      loop: "{{ groups['all'] | select('ne', 'localhost') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - hostvars[item].pqc_crypto_report is defined
+        - pqc_write_cbom | default(false) | bool
+
     - name: Emit findings as facts for event-based fallback
       ansible.builtin.set_fact:
         findings: "{{ _pqc_results.results | default([]) | map(attribute='findings') | flatten | list }}"

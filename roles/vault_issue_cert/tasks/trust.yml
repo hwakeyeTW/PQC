@@ -1,0 +1,15 @@
+---
+- name: Install Vault CA chain into system trust anchors
+  ansible.builtin.copy:
+    content: "{{ _vault_issued_chain | join('\n') }}\n"
+    dest: "/etc/pki/ca-trust/source/anchors/vault-pqc-ca-chain.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  register: _ca_trust_installed
+
+- name: Update system CA trust store
+  ansible.builtin.command:
+    cmd: update-ca-trust extract
+  changed_when: _ca_trust_installed is changed
+  when: _ca_trust_installed is changed

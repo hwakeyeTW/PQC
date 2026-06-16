@@ -1,0 +1,37 @@
+---
+# Standalone CBOM generation utility.
+#
+# Requires pqc_crypto_report fact from a prior crypto_posture_snapshot run.
+# Produces a CycloneDX v1.6 Cryptography Bill of Materials (CBOM) per host.
+# In production, CBOM generation is handled by pqc_pipeline.yml when
+# pqc_write_cbom=true.
+
+- name: Generate CycloneDX CBOM from PQC crypto posture
+  hosts: pqc_targets
+  gather_facts: false
+
+  tasks:
+    - name: Verify pqc_crypto_report is available
+      ansible.builtin.assert:
+        that:
+          - pqc_crypto_report is defined
+          - pqc_crypto_report | length > 0
+        fail_msg: >-
+          pqc_crypto_report fact is missing. Run the crypto_posture_snapshot role
+          before this playbook (or use playbooks/pqc_pipeline.yml for the full flow).
+
+    - name: Generate CBOM from crypto posture report
+      generate_cbom:
+        crypto_report: "{{ pqc_crypto_report }}"
+        output_file: "{{ pqc_cbom_output_file | default(omit) }}"
+      register: pqc_cbom
+
+    - name: Expose CBOM as ansible_fact for downstream use
+      ansible.builtin.set_fact:
+        cbom: "{{ pqc_cbom.cbom }}"
+
+    - name: CBOM generation summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: CBOM generated with
+          {{ pqc_cbom.cbom.components | length }} cryptographic components

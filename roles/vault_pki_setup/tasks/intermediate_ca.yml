@@ -1,0 +1,83 @@
+---
+- name: Enable Intermediate CA PKI secrets engine
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "sys/mounts/{{ vault_pki_intermediate_path }}"
+    data:
+      type: pki
+      config:
+        max_lease_ttl: "{{ vault_pki_intermediate_max_ttl }}"
+  register: _pki_int_mount
+  failed_when:
+    - _pki_int_mount is failed
+    - "'existing mount' not in (_pki_int_mount.msg | default(''))"
+
+- name: Tune Intermediate CA mount TTL
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "sys/mounts/{{ vault_pki_intermediate_path }}/tune"
+    data:
+      max_lease_ttl: "{{ vault_pki_intermediate_max_ttl }}"
+
+- name: Generate Intermediate CA CSR
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/intermediate/generate/internal"
+    data:
+      common_name: "{{ vault_pki_intermediate_common_name }}"
+      organization: "{{ vault_pki_intermediate_organization }}"
+      country: "{{ vault_pki_intermediate_country }}"
+      key_type: "{{ vault_pki_intermediate_key_type }}"
+      key_bits: "{{ vault_pki_intermediate_key_bits }}"
+      issuer_name: "{{ vault_pki_intermediate_issuer_name }}"
+  register: _intermediate_csr
+
+- name: Extract CSR content
+  ansible.builtin.set_fact:
+    _int_csr_pem: "{{ _intermediate_csr.data.data.csr | default(_intermediate_csr.data.csr | default('')) }}"
+
+- name: Sign Intermediate CA with Root CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_root_path }}/root/sign-intermediate"
+    data:
+      csr: "{{ _int_csr_pem }}"
+      common_name: "{{ vault_pki_intermediate_common_name }}"
+      organization: "{{ vault_pki_intermediate_organization }}"
+      ttl: "{{ vault_pki_intermediate_ttl }}"
+      format: pem_bundle
+  register: _signed_intermediate
+
+- name: Extract signed certificate
+  ansible.builtin.set_fact:
+    _int_signed_cert: "{{ _signed_intermediate.data.data.certificate | default(_signed_intermediate.data.certificate | default('')) }}"
+
+- name: Install signed Intermediate CA certificate
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/intermediate/set-signed"
+    data:
+      certificate: "{{ _int_signed_cert }}"
+
+- name: Set default issuer for Intermediate CA
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_pki_intermediate_path }}/config/issuers"
+    data:
+      default: "{{ vault_pki_intermediate_issuer_name }}"
+  failed_when: false
+
+- name: Display Intermediate CA info
+  ansible.builtin.debug:
+    msg: >-
+      Intermediate CA generated and signed:
+      {{ vault_pki_intermediate_common_name }}
+      (issuer={{ vault_pki_intermediate_issuer_name }},
+       key_type={{ vault_pki_intermediate_key_type }}/{{ vault_pki_intermediate_key_bits }},
+       signed by={{ vault_pki_root_common_name }})

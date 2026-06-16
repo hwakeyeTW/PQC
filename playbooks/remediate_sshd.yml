@@ -1,0 +1,19 @@
+---
+# Standalone SSH remediation for PQC readiness
+#
+# Usage:
+#   ansible-playbook playbooks/remediate_sshd.yml
+#
+# Dry run:
+#   ansible-playbook playbooks/remediate_sshd.yml -e remediate_sshd_dry_run=true
+#
+# With host key regeneration:
+#   ansible-playbook playbooks/remediate_sshd.yml -e remediate_sshd_regenerate_host_keys=true
+
+- name: "PQC Remediation: SSH Configuration"
+  hosts: pqc_targets
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: remediate_sshd

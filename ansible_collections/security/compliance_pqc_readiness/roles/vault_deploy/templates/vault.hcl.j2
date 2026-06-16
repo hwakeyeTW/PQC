@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# HashiCorp Vault server configuration for PQC Certificate Authority
+
+ui = true
+disable_mlock = false
+
+listener "tcp" {
+  address       = "{{ vault_listen_address }}"
+  tls_disable   = {{ vault_tls_disable | lower }}
+{% if not vault_tls_disable %}
+  tls_cert_file = "{{ vault_tls_cert_file }}"
+  tls_key_file  = "{{ vault_tls_key_file }}"
+  tls_min_version = "{{ vault_tls_min_version }}"
+{% endif %}
+}
+
+storage "{{ vault_storage_backend }}" {
+{% if vault_storage_backend == 'file' %}
+  path = "{{ vault_data_dir }}"
+{% elif vault_storage_backend == 'raft' %}
+  path    = "{{ vault_data_dir }}"
+  node_id = "{{ ansible_hostname }}"
+{% endif %}
+}
+
+api_addr     = "{{ vault_api_addr }}"
+cluster_addr = "{{ vault_cluster_addr }}"
+
+plugin_directory = "{{ vault_plugin_dir }}"
+
+{% if vault_seal_type != 'shamir' %}
+seal "{{ vault_seal_type }}" {
+  # Seal-specific configuration provided via environment or additional config
+}
+{% endif %}
+
+telemetry {
+  disable_hostname = true
+}

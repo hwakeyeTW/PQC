@@ -1,0 +1,97 @@
+---
+vault_addr: "https://127.0.0.1:8200"
+vault_skip_tls_verify: false
+
+# Root CA
+vault_pki_root_path: pki
+vault_pki_root_max_ttl: "87600h"
+vault_pki_root_common_name: "PQC Root CA"
+vault_pki_root_organization: "PQC-AAP"
+vault_pki_root_country: "US"
+vault_pki_root_ttl: "87600h"
+vault_pki_root_key_type: ec
+vault_pki_root_key_bits: 384
+vault_pki_root_issuer_name: pqc-root-ca
+
+# Intermediate CA
+vault_pki_intermediate_path: pki_int
+vault_pki_intermediate_max_ttl: "43800h"
+vault_pki_intermediate_common_name: "PQC Intermediate CA"
+vault_pki_intermediate_organization: "PQC-AAP"
+vault_pki_intermediate_country: "US"
+vault_pki_intermediate_ttl: "43800h"
+vault_pki_intermediate_key_type: ec
+vault_pki_intermediate_key_bits: 384
+vault_pki_intermediate_issuer_name: pqc-intermediate-ca
+
+# Certificate issuance roles
+vault_pki_roles:
+  - name: pqc-server
+    allowed_domains:
+      - "example.com"
+    allow_subdomains: true
+    allow_bare_domains: false
+    allow_glob_domains: true
+    allow_ip_sans: true
+    allow_localhost: true
+    max_ttl: "8760h"
+    ttl: "2160h"
+    key_type: ec
+    key_bits: 384
+    require_cn: true
+    server_flag: true
+    client_flag: false
+    key_usage:
+      - DigitalSignature
+      - KeyEncipherment
+    ext_key_usage:
+      - ServerAuth
+
+  - name: pqc-client
+    allowed_domains:
+      - "example.com"
+    allow_subdomains: true
+    allow_bare_domains: true
+    max_ttl: "8760h"
+    ttl: "2160h"
+    key_type: ec
+    key_bits: 384
+    require_cn: true
+    server_flag: false
+    client_flag: true
+    key_usage:
+      - DigitalSignature
+    ext_key_usage:
+      - ClientAuth
+
+  - name: pqc-nginx
+    allowed_domains:
+      - "example.com"
+    allow_subdomains: true
+    allow_bare_domains: true
+    allow_glob_domains: true
+    allow_ip_sans: true
+    max_ttl: "8760h"
+    ttl: "2160h"
+    key_type: ec
+    key_bits: 384
+    require_cn: true
+    server_flag: true
+    client_flag: false
+    key_usage:
+      - DigitalSignature
+      - KeyEncipherment
+    ext_key_usage:
+      - ServerAuth
+
+# CRL / OCSP
+vault_pki_crl_distribution_points: true
+vault_pki_ocsp_enable: true
+
+# AppRole for automation
+vault_pki_create_approle: true
+vault_pki_approle_name: pqc-cert-issuer
+vault_pki_approle_token_ttl: "1h"
+vault_pki_approle_token_max_ttl: "4h"
+vault_pki_approle_policies:
+  - pqc-cert-issue

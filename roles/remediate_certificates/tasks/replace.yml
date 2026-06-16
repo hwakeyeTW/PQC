@@ -1,0 +1,12 @@
+---
+- name: Process each non-PQC certificate
+  ansible.builtin.include_tasks: replace_single.yml
+  loop: "{{ _non_pqc_certs }}"
+  loop_control:
+    loop_var: _cert
+    label: "{{ _cert.path }}"
+  when: not _cert.is_self_signed
+
+- name: Record replacement results
+  ansible.builtin.set_fact:
+    _remediation_results: "{{ _remediation_results | default([]) }}"

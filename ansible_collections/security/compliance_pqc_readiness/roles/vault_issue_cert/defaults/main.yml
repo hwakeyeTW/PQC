@@ -1,0 +1,26 @@
+---
+vault_addr: "https://127.0.0.1:8200"
+vault_skip_tls_verify: false
+
+vault_cert_pki_path: pki_int
+vault_cert_role: pqc-server
+
+vault_cert_common_name: "{{ ansible_fqdn }}"
+vault_cert_alt_names: []
+vault_cert_ip_sans: []
+vault_cert_ttl: "2160h"
+vault_cert_format: pem
+
+vault_cert_dest_dir: /etc/pki/tls
+vault_cert_dest_cert: "{{ vault_cert_dest_dir }}/certs/{{ vault_cert_common_name }}.pem"
+vault_cert_dest_key: "{{ vault_cert_dest_dir }}/private/{{ vault_cert_common_name }}-key.pem"
+vault_cert_dest_chain: "{{ vault_cert_dest_dir }}/certs/{{ vault_cert_common_name }}-chain.pem"
+vault_cert_dest_fullchain: "{{ vault_cert_dest_dir }}/certs/{{ vault_cert_common_name }}-fullchain.pem"
+
+vault_cert_owner: root
+vault_cert_group: root
+
+vault_cert_backup_existing: true
+vault_cert_update_ca_trust: true
+
+vault_cert_notify_handlers: []

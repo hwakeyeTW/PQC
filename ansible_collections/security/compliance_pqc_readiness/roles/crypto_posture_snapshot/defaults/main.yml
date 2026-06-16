@@ -11,6 +11,7 @@ pqc_collect_crypto_policy: true
 pqc_write_local_report: false
 pqc_write_html_report: false
 pqc_write_pdf_report: false
+pqc_write_cbom: false
 
 pqc_openssl_package_names:
   - openssl

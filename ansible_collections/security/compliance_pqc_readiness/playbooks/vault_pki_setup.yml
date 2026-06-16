@@ -1,0 +1,32 @@
+---
+# Configure Vault PKI secrets engine with Root + Intermediate CA (Collection)
+#
+# Usage:
+#   ansible-playbook security.compliance_pqc_readiness.vault_pki_setup \
+#     -e vault_addr=https://vault:8200 -e vault_token=<token>
+
+- name: "Vault PKI: Configure Certificate Authority Hierarchy"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required Vault parameters
+      ansible.builtin.assert:
+        that:
+          - vault_addr is defined and vault_addr | length > 0
+          - vault_token is defined and vault_token | length > 0
+        fail_msg: "Provide vault_addr and vault_token via extra vars"
+
+  roles:
+    - role: security.compliance_pqc_readiness.vault_pki_setup
+
+  post_tasks:
+    - name: Display PKI setup summary
+      ansible.builtin.debug:
+        msg: |
+          === Vault PKI Configuration Complete ===
+          Root CA: {{ vault_pki_root_common_name }}
+          Intermediate CA: {{ vault_pki_intermediate_common_name }}
+          Roles: {{ vault_pki_roles | map(attribute='name') | join(', ') }}
+          CA chain: {{ vault_addr }}/v1/{{ vault_pki_intermediate_path }}/ca_chain

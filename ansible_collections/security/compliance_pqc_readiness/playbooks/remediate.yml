@@ -1,29 +1,125 @@
 ---
-# PQC Remediation — placeholder for future implementation.
+# PQC Compliance: Full Remediation Pipeline (Collection)
 #
-# PQC remediation is not yet available because:
-#   1. ML-DSA certificate issuance requires CA infrastructure changes
-#   2. PQC SSH host keys require OpenSSH ML-DSA support (not yet mainstream)
-#   3. Crypto-policy PQC sub-policies are RHEL version-dependent
+# Uses HashiCorp Vault as a Certificate Authority to remediate non-PQC-compliant
+# cryptographic assets discovered by the assessment pipeline.
 #
-# When remediation roles become available, this playbook will import them
-# with tag-based scoping matching the CaC pattern used by STIG/CIS profiles.
+# Usage from AAP:
+#   Run via the 'compliance-remediate-pqc-readiness' job template.
+#   Requires vault_addr and vault_token as extra vars or credential lookup.
 #
-# Selective remediation via Controller:
-#   --tags:       comma-separated rule IDs from the Remediation Builder
-#   --extra-vars: parameter overrides
-#   --limit:      target hosts from the remediation scope selection
+# Selective remediation via tags:
+#   --tags remediate_certificates  - Replace non-PQC system certificates via Vault CA
+#   --tags remediate_crypto_policy - Update RHEL crypto-policies for PQC
+#   --tags remediate_nginx         - Re-issue nginx TLS certs and configure PQC key exchange
+#   --tags remediate_sshd          - Harden SSH with PQC KEX algorithms
+#
+# Dry run (assess only):
+#   -e remediate_cert_dry_run=true -e remediate_crypto_dry_run=true
+#   -e remediate_nginx_dry_run=true -e remediate_sshd_dry_run=true
 
-- name: "PQC Compliance: Remediation (placeholder)"
+- name: "PQC Compliance: Pre-Remediation Discovery"
   hosts: all
   become: true
   gather_facts: true
+  tags:
+    - always
+
+  roles:
+    - role: security.compliance_pqc_readiness.crypto_posture_snapshot
+      vars:
+        pqc_write_local_report: false
 
   tasks:
-    - name: Remediation not yet available
+    - name: Classify host PQC readiness
+      ansible.builtin.set_fact:
+        pqc_ready: >-
+          {{ (pqc_crypto_report.openssl_tls1_3_groups | default(''))
+             is regex('(?i)mlkem') }}
+
+- name: "PQC Compliance: Certificate Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_certificates
+
+  pre_tasks:
+    - name: Validate Vault connectivity
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: "{{ not (vault_skip_tls_verify | default(false)) }}"
+        status_code: [200, 429, 472, 473]
+      delegate_to: localhost
+      run_once: true
+
+  roles:
+    - role: security.compliance_pqc_readiness.remediate_certificates
+
+- name: "PQC Compliance: RHEL Crypto Policy Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_crypto_policy
+
+  roles:
+    - role: security.compliance_pqc_readiness.remediate_crypto_policy
+
+- name: "PQC Compliance: nginx TLS Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_nginx
+
+  pre_tasks:
+    - name: Validate Vault connectivity for nginx remediation
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: "{{ not (vault_skip_tls_verify | default(false)) }}"
+        status_code: [200, 429, 472, 473]
+      delegate_to: localhost
+      run_once: true
+
+  roles:
+    - role: security.compliance_pqc_readiness.remediate_nginx_tls
+
+- name: "PQC Compliance: SSH Remediation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - remediate_sshd
+
+  roles:
+    - role: security.compliance_pqc_readiness.remediate_sshd
+
+- name: "PQC Compliance: Post-Remediation Validation"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - always
+
+  roles:
+    - role: security.compliance_pqc_readiness.crypto_posture_snapshot
+      vars:
+        pqc_write_local_report: false
+
+  tasks:
+    - name: Classify post-remediation PQC readiness
+      ansible.builtin.set_fact:
+        pqc_ready_after: >-
+          {{ (pqc_crypto_report.openssl_tls1_3_groups | default(''))
+             is regex('(?i)mlkem') }}
+
+    - name: Display remediation outcome
       ansible.builtin.debug:
-        msg: >-
-          PQC remediation roles are not yet implemented. Findings provide
-          manual fix_text guidance for each rule. Automated remediation
-          will be added as PQC algorithm support matures in RHEL packages.
-      tags: always
+        msg: |
+          === Remediation Complete: {{ inventory_hostname }} ===
+          PQC ready before: {{ pqc_ready | default('unknown') }}
+          PQC ready after:  {{ pqc_ready_after }}
+          Status: {{ 'REMEDIATED' if pqc_ready_after | bool else 'REQUIRES MANUAL INTERVENTION' }}

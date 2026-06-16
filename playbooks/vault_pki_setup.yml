@@ -1,0 +1,59 @@
+---
+# Configure Vault PKI secrets engine with Root + Intermediate CA hierarchy
+#
+# Usage:
+#   ansible-playbook playbooks/vault_pki_setup.yml \
+#     -e vault_addr=https://vault.example.com:8200 \
+#     -e vault_token=<root-or-admin-token>
+#
+# Required variables:
+#   vault_addr:  Vault API address
+#   vault_token: Vault token with admin/root privileges
+#
+# Optional overrides (see roles/vault_pki_setup/defaults/main.yml):
+#   vault_pki_root_common_name, vault_pki_roles[].allowed_domains, etc.
+#
+# This playbook:
+#   1. Creates a Root CA in the 'pki' mount
+#   2. Creates an Intermediate CA in the 'pki_int' mount, signed by Root
+#   3. Configures certificate issuance roles (pqc-server, pqc-client, pqc-nginx)
+#   4. Sets up CRL and OCSP distribution points
+#   5. Creates an AppRole + policy for automated certificate issuance
+
+- name: "Vault PKI: Configure Certificate Authority Hierarchy"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required Vault parameters
+      ansible.builtin.assert:
+        that:
+          - vault_addr is defined and vault_addr | length > 0
+          - vault_token is defined and vault_token | length > 0
+        fail_msg: >-
+          Provide vault_addr and vault_token via extra vars:
+          -e vault_addr=https://vault:8200 -e vault_token=<token>
+
+  roles:
+    - role: vault_pki_setup
+
+  post_tasks:
+    - name: Display PKI setup summary
+      ansible.builtin.debug:
+        msg: |
+          === Vault PKI Configuration Complete ===
+          Root CA: {{ vault_pki_root_common_name }} ({{ vault_pki_root_path }})
+          Intermediate CA: {{ vault_pki_intermediate_common_name }} ({{ vault_pki_intermediate_path }})
+          Issuance roles: {{ vault_pki_roles | map(attribute='name') | join(', ') }}
+          AppRole: {{ vault_pki_approle_name if vault_pki_create_approle else 'not created' }}
+          {% if vault_pki_create_approle %}
+          AppRole role_id: {{ vault_approle_role_id }}
+
+          Store the AppRole credentials in AAP:
+            1. Create a 'HashiCorp Vault Secret Lookup' credential type
+            2. Set role_id and secret_id from this deployment
+            3. Reference this credential in remediation job templates
+          {% endif %}
+
+          CA chain available at: {{ vault_addr }}/v1/{{ vault_pki_intermediate_path }}/ca_chain

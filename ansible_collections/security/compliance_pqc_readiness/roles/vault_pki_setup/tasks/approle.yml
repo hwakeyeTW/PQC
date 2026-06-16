@@ -1,0 +1,84 @@
+---
+- name: Enable AppRole auth method
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: sys/auth/approle
+    data:
+      type: approle
+  register: _approle_enable
+  failed_when:
+    - _approle_enable is failed
+    - "'existing mount' not in (_approle_enable.msg | default(''))"
+
+- name: Create certificate issuance policy
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "sys/policies/acl/pqc-cert-issue"
+    data:
+      policy: |
+        # Issue certificates from Intermediate CA
+        path "{{ vault_pki_intermediate_path }}/issue/*" {
+          capabilities = ["create", "update"]
+        }
+        path "{{ vault_pki_intermediate_path }}/sign/*" {
+          capabilities = ["create", "update"]
+        }
+        # Read CA chain and CRL
+        path "{{ vault_pki_intermediate_path }}/ca/pem" {
+          capabilities = ["read"]
+        }
+        path "{{ vault_pki_intermediate_path }}/ca_chain" {
+          capabilities = ["read"]
+        }
+        path "{{ vault_pki_intermediate_path }}/crl/pem" {
+          capabilities = ["read"]
+        }
+        # Revoke certificates
+        path "{{ vault_pki_intermediate_path }}/revoke" {
+          capabilities = ["create", "update"]
+        }
+
+- name: Create AppRole for certificate issuance
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "auth/approle/role/{{ vault_pki_approle_name }}"
+    data:
+      token_policies: "{{ vault_pki_approle_policies }}"
+      token_ttl: "{{ vault_pki_approle_token_ttl }}"
+      token_max_ttl: "{{ vault_pki_approle_token_max_ttl }}"
+      secret_id_ttl: "0"
+      token_num_uses: 0
+
+- name: Retrieve AppRole role ID
+  community.hashi_vault.vault_read:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "auth/approle/role/{{ vault_pki_approle_name }}/role-id"
+  register: _approle_role_id
+
+- name: Generate AppRole secret ID
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "auth/approle/role/{{ vault_pki_approle_name }}/secret-id"
+    data: {}
+  register: _approle_secret_id
+  no_log: true
+
+- name: Set AppRole credentials as facts
+  ansible.builtin.set_fact:
+    vault_approle_role_id: "{{ _approle_role_id.data.data.role_id | default(_approle_role_id.data.role_id | default('')) }}"
+    vault_approle_secret_id: "{{ _approle_secret_id.data.data.secret_id | default(_approle_secret_id.data.secret_id | default('')) }}"
+  no_log: true
+
+- name: Display AppRole configuration
+  ansible.builtin.debug:
+    msg: >-
+      AppRole '{{ vault_pki_approle_name }}' configured.
+      role_id={{ vault_approle_role_id }}.
+      Store the secret_id securely — it will not be shown again.
+      Use these credentials in AAP as a HashiCorp Vault credential
+      for automated certificate issuance.

@@ -1,0 +1,67 @@
+---
+- name: Read current sshd_config
+  ansible.builtin.slurp:
+    src: "{{ remediate_sshd_config_path }}"
+  register: _sshd_config_raw
+
+- name: Decode sshd_config
+  ansible.builtin.set_fact:
+    _sshd_config_content: "{{ _sshd_config_raw.content | b64decode }}"
+
+- name: Parse current KEX algorithms
+  ansible.builtin.set_fact:
+    _current_kex: >-
+      {{ _sshd_config_content
+         | regex_search('(?m)^KexAlgorithms\s+(.*)', '\1')
+         | default(['not set'], true) | first }}
+
+- name: Parse current ciphers
+  ansible.builtin.set_fact:
+    _current_ciphers: >-
+      {{ _sshd_config_content
+         | regex_search('(?m)^Ciphers\s+(.*)', '\1')
+         | default(['not set'], true) | first }}
+
+- name: Parse current MACs
+  ansible.builtin.set_fact:
+    _current_macs: >-
+      {{ _sshd_config_content
+         | regex_search('(?m)^MACs\s+(.*)', '\1')
+         | default(['not set'], true) | first }}
+
+- name: Check for PQC KEX support in OpenSSH
+  ansible.builtin.command:
+    cmd: ssh -Q kex
+  register: _ssh_kex_support
+  changed_when: false
+  failed_when: false
+
+- name: Determine available PQC KEX algorithms
+  ansible.builtin.set_fact:
+    _available_pqc_kex: >-
+      {{ remediate_sshd_kex_algorithms
+         | select('in', _ssh_kex_support.stdout_lines | default([]))
+         | list }}
+    _unavailable_pqc_kex: >-
+      {{ remediate_sshd_kex_algorithms
+         | reject('in', _ssh_kex_support.stdout_lines | default([]))
+         | list }}
+
+- name: Scan existing host key types
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: "ssh_host_*_key.pub"
+    file_type: file
+  register: _host_key_files
+
+- name: Display SSH assessment
+  ansible.builtin.debug:
+    msg: |
+      === SSH PQC Assessment: {{ inventory_hostname }} ===
+      Current KEX: {{ _current_kex }}
+      Current Ciphers: {{ _current_ciphers }}
+      Current MACs: {{ _current_macs }}
+      Available PQC KEX: {{ _available_pqc_kex | join(', ') | default('none') }}
+      Unavailable PQC KEX: {{ _unavailable_pqc_kex | join(', ') | default('none') }}
+      Host key files: {{ _host_key_files.files | map(attribute='path') | list | join(', ') }}
+      {% if remediate_sshd_dry_run %}DRY RUN — no changes will be made.{% endif %}

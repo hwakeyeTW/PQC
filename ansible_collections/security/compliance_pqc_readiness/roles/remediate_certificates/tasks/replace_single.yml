@@ -1,0 +1,72 @@
+---
+- name: "Extract CN from certificate subject: {{ _cert.path }}"
+  ansible.builtin.set_fact:
+    _cert_cn: >-
+      {{ _cert.subject | regex_search('CN\s*=\s*([^,/]+)', '\1') | default([ansible_fqdn], true) | first | trim }}
+
+- name: "Backup existing certificate: {{ _cert.path }}"
+  ansible.builtin.copy:
+    src: "{{ _cert.path }}"
+    dest: "{{ _cert.path }}.pre-pqc.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+  when: remediate_cert_backup
+
+- name: "Issue replacement certificate from Vault: {{ _cert_cn }}"
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "{{ vault_cert_pki_path }}/issue/{{ vault_cert_role }}"
+    data:
+      common_name: "{{ _cert_cn }}"
+      alt_names: "{{ _cert_cn }},{{ ansible_fqdn }},{{ ansible_hostname }}"
+      ip_sans: "{{ ansible_default_ipv4.address | default('127.0.0.1') }},127.0.0.1"
+      ttl: "{{ remediate_cert_ttl }}"
+      format: pem
+  register: _replacement_result
+  no_log: true
+
+- name: "Extract replacement certificate data"
+  ansible.builtin.set_fact:
+    _new_cert: "{{ _replacement_result.data.data.certificate | default(_replacement_result.data.certificate) }}"
+    _new_key: "{{ _replacement_result.data.data.private_key | default(_replacement_result.data.private_key) }}"
+    _new_chain: "{{ _replacement_result.data.data.ca_chain | default(_replacement_result.data.ca_chain | default([])) }}"
+    _new_serial: "{{ _replacement_result.data.data.serial_number | default(_replacement_result.data.serial_number | default('unknown')) }}"
+  no_log: true
+
+- name: "Deploy replacement certificate: {{ _cert.path }}"
+  ansible.builtin.copy:
+    content: "{{ _new_cert }}\n"
+    dest: "{{ _cert.path }}"
+    owner: "{{ remediate_cert_owner }}"
+    group: "{{ remediate_cert_group }}"
+    mode: "0644"
+
+- name: "Deploy replacement private key"
+  ansible.builtin.copy:
+    content: "{{ _new_key }}\n"
+    dest: "{{ _cert.path | regex_replace('\\.(pem|crt|cer)$', '-key.pem') }}"
+    owner: "{{ remediate_cert_owner }}"
+    group: "{{ remediate_cert_group }}"
+    mode: "0600"
+  no_log: true
+
+- name: "Deploy CA chain for replacement"
+  ansible.builtin.copy:
+    content: "{{ _new_chain | join('\n') }}\n"
+    dest: "{{ _cert.path | regex_replace('\\.(pem|crt|cer)$', '-chain.pem') }}"
+    owner: "{{ remediate_cert_owner }}"
+    group: "{{ remediate_cert_group }}"
+    mode: "0644"
+
+- name: "Record remediation result"
+  ansible.builtin.set_fact:
+    _remediation_results: >-
+      {{ _remediation_results | default([]) + [{
+        'original_path': _cert.path,
+        'original_algorithm': _cert.algorithm,
+        'new_serial': _new_serial,
+        'common_name': _cert_cn,
+        'status': 'replaced',
+        'timestamp': ansible_date_time.iso8601,
+      }] }}

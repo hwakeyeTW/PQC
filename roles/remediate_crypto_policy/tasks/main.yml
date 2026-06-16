@@ -1,0 +1,19 @@
+---
+- name: Assess current crypto policy state
+  ansible.builtin.import_tasks: assess.yml
+  tags:
+    - remediate_crypto_assess
+
+- name: Apply PQC-ready crypto policy
+  ansible.builtin.import_tasks: apply.yml
+  when: not remediate_crypto_dry_run
+  tags:
+    - remediate_crypto_apply
+
+- name: Configure OpenSSL for PQC key exchange
+  ansible.builtin.import_tasks: openssl.yml
+  when:
+    - remediate_crypto_openssl_conf
+    - not remediate_crypto_dry_run
+  tags:
+    - remediate_crypto_openssl

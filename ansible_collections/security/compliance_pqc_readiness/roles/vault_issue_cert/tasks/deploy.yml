@@ -1,0 +1,68 @@
+---
+- name: Ensure destination directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ vault_cert_owner }}"
+    group: "{{ vault_cert_group }}"
+    mode: "0755"
+  loop:
+    - "{{ vault_cert_dest_cert | dirname }}"
+    - "{{ vault_cert_dest_key | dirname }}"
+
+- name: Backup existing certificate
+  ansible.builtin.copy:
+    src: "{{ vault_cert_dest_cert }}"
+    dest: "{{ vault_cert_dest_cert }}.bak.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+  when: vault_cert_backup_existing
+  failed_when: false
+
+- name: Deploy certificate file
+  ansible.builtin.copy:
+    content: "{{ _vault_issued_cert }}\n"
+    dest: "{{ vault_cert_dest_cert }}"
+    owner: "{{ vault_cert_owner }}"
+    group: "{{ vault_cert_group }}"
+    mode: "0644"
+  notify: "{{ vault_cert_notify_handlers }}"
+
+- name: Deploy private key file
+  ansible.builtin.copy:
+    content: "{{ _vault_issued_key }}\n"
+    dest: "{{ vault_cert_dest_key }}"
+    owner: "{{ vault_cert_owner }}"
+    group: "{{ vault_cert_group }}"
+    mode: "0600"
+  no_log: true
+  notify: "{{ vault_cert_notify_handlers }}"
+
+- name: Deploy CA chain file
+  ansible.builtin.copy:
+    content: "{{ _vault_issued_chain | join('\n') }}\n"
+    dest: "{{ vault_cert_dest_chain }}"
+    owner: "{{ vault_cert_owner }}"
+    group: "{{ vault_cert_group }}"
+    mode: "0644"
+
+- name: Deploy full chain (cert + CA chain)
+  ansible.builtin.copy:
+    content: |
+      {{ _vault_issued_cert }}
+      {{ _vault_issued_chain | join('\n') }}
+    dest: "{{ vault_cert_dest_fullchain }}"
+    owner: "{{ vault_cert_owner }}"
+    group: "{{ vault_cert_group }}"
+    mode: "0644"
+
+- name: Record issued certificate metadata
+  ansible.builtin.set_fact:
+    vault_issued_certificate:
+      serial: "{{ _vault_issued_serial }}"
+      common_name: "{{ vault_cert_common_name }}"
+      cert_file: "{{ vault_cert_dest_cert }}"
+      key_file: "{{ vault_cert_dest_key }}"
+      chain_file: "{{ vault_cert_dest_chain }}"
+      fullchain_file: "{{ vault_cert_dest_fullchain }}"
+      issued_at: "{{ ansible_date_time.iso8601 }}"

@@ -1,0 +1,54 @@
+---
+- name: Remove weak SSH host keys (DSA, ECDSA)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/ssh/ssh_host_dsa_key
+    - /etc/ssh/ssh_host_dsa_key.pub
+    - /etc/ssh/ssh_host_ecdsa_key
+    - /etc/ssh/ssh_host_ecdsa_key.pub
+
+- name: Ensure Ed25519 host key exists
+  ansible.builtin.command:
+    cmd: ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
+    creates: /etc/ssh/ssh_host_ed25519_key
+
+- name: Set correct permissions on Ed25519 host key
+  ansible.builtin.file:
+    path: /etc/ssh/ssh_host_ed25519_key
+    owner: root
+    group: ssh_keys
+    mode: "0640"
+  failed_when: false
+
+- name: Ensure RSA host key uses strong parameters
+  ansible.builtin.stat:
+    path: /etc/ssh/ssh_host_rsa_key.pub
+  register: _rsa_host_key
+
+- name: Check RSA host key size
+  ansible.builtin.command:
+    cmd: ssh-keygen -l -f /etc/ssh/ssh_host_rsa_key.pub
+  register: _rsa_key_info
+  changed_when: false
+  when: _rsa_host_key.stat.exists
+
+- name: Regenerate RSA host key if too small
+  when:
+    - _rsa_host_key.stat.exists
+    - (_rsa_key_info.stdout | regex_search('(\d+)', '\1') | first | int) < 4096
+  block:
+    - name: Remove weak RSA host key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/ssh/ssh_host_rsa_key
+        - /etc/ssh/ssh_host_rsa_key.pub
+
+    - name: Generate strong RSA host key
+      ansible.builtin.command:
+        cmd: ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ""
+        creates: /etc/ssh/ssh_host_rsa_key
+      notify: Restart sshd

@@ -1,0 +1,38 @@
+---
+# Standalone certificate remediation using Vault CA
+#
+# Usage:
+#   ansible-playbook playbooks/remediate_certificates.yml \
+#     -e vault_addr=https://vault:8200 \
+#     -e vault_token=<token>
+#
+# Dry run:
+#   ansible-playbook playbooks/remediate_certificates.yml \
+#     -e vault_addr=https://vault:8200 \
+#     -e vault_token=<token> \
+#     -e remediate_cert_dry_run=true
+
+- name: "PQC Remediation: System Certificates"
+  hosts: pqc_targets
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate Vault parameters
+      ansible.builtin.assert:
+        that:
+          - vault_addr is defined and vault_addr | length > 0
+          - vault_token is defined and vault_token | length > 0
+        fail_msg: "Provide vault_addr and vault_token via -e"
+
+    - name: Verify Vault is accessible and unsealed
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        method: GET
+        validate_certs: "{{ not (vault_skip_tls_verify | default(false)) }}"
+        status_code: [200, 429, 472, 473]
+      delegate_to: localhost
+      run_once: true
+
+  roles:
+    - role: remediate_certificates

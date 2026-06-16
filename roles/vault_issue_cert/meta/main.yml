@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: vault_issue_cert
+  author: PQC-AAP
+  description: Issue a certificate from Vault PKI and deploy it to the target host.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+dependencies: []

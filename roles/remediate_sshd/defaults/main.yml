@@ -1,0 +1,34 @@
+---
+# PQC-ready SSH key exchange algorithms (ML-KEM hybrid + classical fallbacks)
+remediate_sshd_kex_algorithms:
+  - mlkem768x25519-sha256
+  - sntrup761x25519-sha512@openssh.com
+  - curve25519-sha256
+  - curve25519-sha256@libssh.org
+  - diffie-hellman-group16-sha512
+  - diffie-hellman-group18-sha512
+
+# Host key algorithms (ordered by preference)
+remediate_sshd_host_key_algorithms:
+  - ssh-ed25519
+  - ssh-ed25519-cert-v01@openssh.com
+  - rsa-sha2-512
+  - rsa-sha2-256
+
+# Ciphers (AEAD preferred)
+remediate_sshd_ciphers:
+  - chacha20-poly1305@openssh.com
+  - aes256-gcm@openssh.com
+  - aes128-gcm@openssh.com
+
+# MACs (only needed for non-AEAD ciphers)
+remediate_sshd_macs:
+  - hmac-sha2-512-etm@openssh.com
+  - hmac-sha2-256-etm@openssh.com
+
+# Whether to regenerate host keys (replaces RSA/ECDSA with Ed25519)
+remediate_sshd_regenerate_host_keys: false
+
+remediate_sshd_config_path: /etc/ssh/sshd_config
+remediate_sshd_backup: true
+remediate_sshd_dry_run: false
