@@ -311,3 +311,86 @@ def test_invalid_identity_or_source(change):
         observed = 'invalid'
     with pytest.raises(ValueError):
         runtime.normalize_openssl(document(), host, snapshot(), source, observed, RULES)
+
+
+# F-R1-01: test the complete helper embedded in the actual role and the
+# actual normalizer, validator, canonical APIs and evaluator, not a replica.
+_R1_ALIAS_CASES = [
+    ('kem', 'ML-KEM-768', 'ML-KEM-512', 'ML-KEM-1024', 'MLKEM768',
+     'ml-kem-768', 'ml-kem-1024', '2.16.840.1.101.3.4.4.2'),
+    ('signature', 'ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87', 'MLDSA44',
+     'ml-dsa-44-signature', 'ml-dsa-87-signature', '2.16.840.1.101.3.4.3.17'),
+]
+
+
+def _r1_alias_roundtrip(slot, raw, parser_state, parser_reason, parsed_rows,
+                        collection_state, pass_ids=(), unknown_count=0):
+    parsed = parse(slot, raw)
+    assert (parsed['state'], parsed['reason'], parsed['rc']) == (parser_state, parser_reason, 0)
+    assert parsed['rows'] == parsed_rows
+    snap = snapshot(packages=False, **{slot: parsed})
+    before, saved = document(), copy.deepcopy(snap)
+    normalized, diagnostics = norm(snap, before)
+    assert snap == saved and before == document()
+    assert normalized['claims'] == normalized['findings'] == []
+    c = next(c for c in normalized['collections'] if c['scope_key'] == 'openssl-' + slot)
+    assert c['collection_state'] == collection_state
+    d = next(d for d in diagnostics if d['collection_id'] == c['collection_id'])
+    assert d['state'] == collection_state and d['rc'] == 0
+    caps = rows(normalized, 'RUNTIME_CAPABILITY')
+    assert all(r['collection_id'] == c['collection_id'] and r['data']['supported'] is True for r in caps)
+    assert {r['algorithm']['algorithm_id'] for r in caps if r['algorithm']['algorithm_id'] is not None} == set(pass_ids)
+    assert sum(r['algorithm']['algorithm_id'] is None for r in caps) == unknown_count
+    reread = evidence.parse_evidence_bytes(evidence.canonical_bytes(normalized))
+    assessed = assessment.evaluate_document(reread, RULES)
+    assert evidence.parse_evidence_bytes(evidence.canonical_bytes(assessed)) == assessed
+    assert all(cl['level'] == 'L2' and cl['assessment_state'] in ('PASS', 'UNKNOWN') for cl in assessed['claims'])
+    assert sorted(cl['subject']['algorithm_id'] for cl in assessed['claims'] if cl['assessment_state'] == 'PASS') == sorted(pass_ids)
+    assert sum(cl['assessment_state'] == 'UNKNOWN' for cl in assessed['claims']) == unknown_count
+    assert all(f['assessment_state'] != 'FAIL' for f in assessed['findings'])
+    # A rejected row cannot leak a retained alias to diagnostics or evidence.
+    assert len(d.get('observations', [])) == len(caps)
+    return normalized, assessed
+
+
+@pytest.mark.parametrize('slot,one,two,other,alias,aid,other_id,oid', _R1_ALIAS_CASES)
+@pytest.mark.parametrize('format_string', [
+    '{one},  {two}',          # original CE01 / CE02
+    '{one},\t{two}',          # tab separator is outside the grammar
+    '{one},{two}',            # no separator space
+    '{one}, {two}!',          # invalid punctuation
+    '{one}, ',                # empty trailing alias
+    '/bad, {one}',            # invalid first alias
+    '{one}, {one},  {two}',   # valid duplicates must not hide invalid tokens
+])
+def test_r1_atomic_malformed_alias_rows(slot, one, two, other, alias, aid, other_id, oid, format_string):
+    bad = '{ ' + format_string.format(one=one, two=two) + ' } @ default\n'
+    _r1_alias_roundtrip(slot, bad, 'UNKNOWN', 'UNRECOGNIZED_OUTPUT', [], 'UNKNOWN')
+    # Malformed and independent valid rows: preserve only the latter's proof.
+    _r1_alias_roundtrip(slot, bad + other + ' @ default\n', 'PARTIAL', 'FORMAT_GAP',
+                        [['default', [other]]], 'PARTIAL', (other_id,))
+
+
+@pytest.mark.parametrize('slot,one,two,other,alias,aid,other_id,oid', _R1_ALIAS_CASES)
+def test_r1_valid_ambiguous_and_independent_rows(slot, one, two, other, alias, aid, other_id, oid):
+    ambiguous = '{ ' + one + ', ' + two + ' } @ default\n'
+    row = ['default', sorted([one, two])]
+    _r1_alias_roundtrip(slot, ambiguous, 'COLLECTED', 'OK', [row], 'UNKNOWN')
+    both = sorted([row, ['default', [other]]], key=runtime.serial)
+    _r1_alias_roundtrip(slot, ambiguous + other + ' @ default\n', 'COLLECTED', 'OK', both,
+                        'PARTIAL', (other_id,))
+
+
+@pytest.mark.parametrize('slot,one,two,other,alias,aid,other_id,oid', _R1_ALIAS_CASES)
+def test_r1_valid_aliases_oid_duplicates_and_unknown(slot, one, two, other, alias, aid, other_id, oid):
+    # Multiple aliases for exactly one ID, including a valid numeric OID.
+    raw = '{ ' + ', '.join([oid, one, alias]) + ' } @ default\n'
+    _r1_alias_roundtrip(slot, raw, 'COLLECTED', 'OK', [['default', sorted([oid, one, alias])]],
+                        'COLLECTED', (aid,))
+    _r1_alias_roundtrip(slot, '{ ' + one + ', ' + one + ' } @ default\n', 'PARTIAL', 'FORMAT_GAP',
+                        [['default', [one]]], 'PARTIAL', (aid,))
+    _r1_alias_roundtrip(slot, oid + ' @ default\n', 'COLLECTED', 'OK', [['default', [oid]]], 'UNKNOWN')
+    _r1_alias_roundtrip(slot, 'unclassified-fixture @ default\n', 'COLLECTED', 'OK',
+                        [['default', ['unclassified-fixture']]], 'COLLECTED', unknown_count=1)
+    # Cap is applied to the original row, before any deduplication.
+    assert parse(slot, '{ ' + ', '.join([one] * 33) + ' } @ default\n') == H['result']('ERROR', 'ROW_LIMIT', 0)

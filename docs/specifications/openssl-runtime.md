@@ -61,7 +61,15 @@ legacy recognized version lines are metadata; the FIPS label is not proof
 of compliance. Provider blocks need exact identifiers; malformed boundaries,
 missing fields and unknown grammar are gaps. Recognized provider-attributed
 algorithm rows accept exact names and brace alias lists; known headings are
-allowed, ambiguous legacy output remains unknown. TLS groups accept the
+allowed, ambiguous legacy output remains unknown. Brace lists use the exact
+comma-plus-single-space separator and bounded TOKEN grammar for every alias.
+A malformed alias rejects its entire row, rather than retaining a subset
+that could conceal a conflicting algorithm. Other independently valid rows
+remain available; a mixed result is PARTIAL/FORMAT_GAP, and malformed-only
+output is UNKNOWN/UNRECOGNIZED_OUTPUT. Valid duplicate aliases retain the
+existing deduplication and gap behavior; valid unknown names and OIDs reach
+the unchanged classifier. The alias-count limit applies before deduplication.
+TLS groups accept the
 fixed query's colon list or explicit group heading, without inferred provider
 attribution. Unsupported names/format are not silently converted to a complete
 list. A complete empty list has no supported proof in this version.
