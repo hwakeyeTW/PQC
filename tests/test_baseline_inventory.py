@@ -70,9 +70,14 @@ def unique_object(pairs):
     return value
 
 
+def reject_json_constant(token):
+    raise ValueError("nonstandard JSON constant: " + token)
+
+
 def json_object(proc):
     assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
-    value = json.loads(proc.stdout.decode("utf-8"), object_pairs_hook=unique_object)
+    value = json.loads(proc.stdout.decode("utf-8"), object_pairs_hook=unique_object,
+                       parse_constant=reject_json_constant)
     assert type(value) is dict
     return value
 
@@ -179,6 +184,15 @@ def require_binary(isolated, name):
     return binary
 
 
+# Bounded diagnostic families from ansible-core v2.18.3 and v2.19.11
+# inventory/script.py. Matching a family is not a runtime version/support claim.
+PROFILE_FAILURE = "unable to get json decoder for inventory script result."
+VALUE_FAILURE = "value could not be parsed as json."
+DECODE_FAILURE = "inventory script result could not be parsed as json."
+EXIT_FAILURE = "inventory script returned non-zero exit code "
+OLD_JSON_FAILURE = "failed to parse executable inventory script results from "
+
+
 def inventory_json_object(proc):
     data = json_object(proc)
     stderr = proc.stderr.decode("utf-8", errors="replace")
@@ -189,6 +203,7 @@ def inventory_json_object(proc):
     parse_failures = (
         "failed to parse", "unable to parse", "no inventory was parsed",
         "failed to load inventory plugin", "no inventory plugins available",
+        PROFILE_FAILURE, DECODE_FAILURE, EXIT_FAILURE,
     )
     assert not (any(phrase in normalized for phrase in parse_failures)
                 or ("inventory script" in normalized and "had an execution error" in normalized)), (
@@ -419,22 +434,138 @@ def test_ansible_inventory_fatal_controls(isolated):
             f"effective fatal control not enabled: {setting}")
 
 
-@pytest.mark.parametrize("case,source,reason", [
-    ("malformed-json", "print('not-json')\n", "failed to parse executable inventory script results"),
-    ("nonzero-provider", "import sys\nprint('SYNTHETIC_PROVIDER_FAILURE', file=sys.stderr)\nsys.exit(7)\n",
-     "had an execution error"),
+def assert_failed_provider(proc, provider, case):
+    """Native negative-case oracle; accept only the source-proven cause families."""
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    normalized = " ".join(stderr.split())
+    lower = normalized.lower()
+    path = re.escape(" ".join(str(provider).split()))
+    assert proc.returncode != 0, "native parser accepted failed synthetic provider"
+    # Both managers append this fatal diagnostic for the explicit inventory source.
+    # Require its exact path (not just the filename or a substring of another path).
+    assert re.search(r"(?i:completely failed to parse inventory source) " + path
+                     + r"(?=\s|$)", normalized), stderr
+    old_json = re.search(r"(?i:" + OLD_JSON_FAILURE + r")" + path + r":", normalized)
+    old_exit = re.search(r"(?i:inventory script) \(" + path
+                         + r"\) (?i:had an execution error):", normalized)
+    profile_json = PROFILE_FAILURE in lower and VALUE_FAILURE in lower
+    decode_json = DECODE_FAILURE in lower
+    has_json_cause = any(phrase in lower for phrase in
+                         (OLD_JSON_FAILURE, PROFILE_FAILURE, DECODE_FAILURE))
+    has_exit_cause = EXIT_FAILURE in lower or ("inventory script" in lower
+                                               and "had an execution error" in lower)
+    if case == "malformed-json":
+        assert not has_exit_cause and (old_json or profile_json or decode_json), stderr
+    else:
+        assert case == "nonzero-provider", "unknown synthetic failure case"
+        assert not has_json_cause, stderr
+        assert re.search(r"\bsynthetic_provider_failure\b", lower), stderr
+        if EXIT_FAILURE in lower:
+            # 2.19.11 emits a numeric exit code; 7. is not 70. or any other code.
+            # Exception-chain display may repeat the same message.
+            exits = re.findall(re.escape(EXIT_FAILURE) + r"([+-]?\d+)\.(?=\s|$)", lower)
+            assert len(exits) == lower.count(EXIT_FAILURE) and set(exits) == {"7"}, stderr
+        else:
+            # 2.18.3 does not report a numeric provider rc. The native caller
+            # independently proves this exact disposable script returns 7.
+            assert old_exit, stderr
+
+
+@pytest.mark.parametrize("case,source", [
+    ("malformed-json", "print('not-json')\n"),
+    ("nonzero-provider", "import sys\nprint('SYNTHETIC_PROVIDER_FAILURE', file=sys.stderr)\nsys.exit(7)\n"),
 ], ids=["malformed-json", "nonzero-provider"])
-def test_ansible_inventory_rejects_failed_provider(isolated, case, source, reason):
+def test_ansible_inventory_rejects_failed_provider(isolated, case, source):
     cwd, _ = isolated
     require_binary(isolated, "ansible-inventory")
     provider = cwd / f"{case}.py"
     provider.write_text("#!/usr/bin/env python3\n" + source, encoding="utf-8")
     provider.chmod(0o700)
-    proc = inventory_process(isolated, provider, "--list", mode="empty")
-    stderr = " ".join(proc.stderr.decode("utf-8", errors="replace").lower().split())
-    # Prove actual inventory parse failure rather than just our own rejection.
-    assert proc.returncode != 0, "native parser accepted failed synthetic provider"
-    assert "completely failed to parse inventory source" in stderr, stderr
-    assert reason in stderr, stderr
     if case == "nonzero-provider":
-        assert "synthetic_provider_failure" in stderr, stderr
+        direct = run(isolated, [str(provider), "--list"], "empty")
+        assert direct.returncode == 7 and direct.stdout == b""
+        assert direct.stderr == b"SYNTHETIC_PROVIDER_FAILURE\n"
+    proc = inventory_process(isolated, provider, "--list", mode="empty")
+    assert_failed_provider(proc, provider, case)
+
+
+# Source-derived, controlled subprocess records, not native Ansible stderr.
+OLD_MALFORMED = "failed to parse executable inventory script results from {provider}: invalid JSON"
+OLD_NONZERO = "Inventory script ({provider}) had an execution error: SYNTHETIC_PROVIDER_FAILURE"
+NEW_PROFILE = "Unable to get JSON decoder for inventory script result.\nValue could not be parsed as JSON."
+NEW_DECODE = "Inventory script result could not be parsed as JSON."
+NEW_NONZERO = "Inventory script returned non-zero exit code 7.\nStandard error from inventory script:\nSYNTHETIC_PROVIDER_FAILURE"
+
+
+def synthetic_failure(case, detail, rc=1, fatal="{provider}"):
+    provider = Path("/synthetic") / f"{case}.py"
+    stderr = detail.format(provider=provider)
+    if fatal is not None:
+        stderr += "\n[ERROR]: Completely failed to parse inventory source " + fatal.format(provider=provider)
+    proc = synthetic_response(empty_response(), stderr.encode("utf-8"), rc)
+    return proc, provider, case
+
+
+@pytest.mark.parametrize("case,detail", [
+    ("malformed-json", OLD_MALFORMED),
+    ("nonzero-provider", OLD_NONZERO),
+    ("malformed-json", NEW_PROFILE),
+    ("malformed-json", NEW_DECODE),
+    ("nonzero-provider", NEW_NONZERO),
+], ids=["v218-malformed", "v218-nonzero", "v219-profile", "v219-decode", "v219-nonzero"])
+def test_r2_oracle_accepts_failed_provider(case, detail):
+    assert_failed_provider(*synthetic_failure(case, detail))
+
+
+@pytest.mark.parametrize("case,detail,rc,fatal", [
+    ("malformed-json", NEW_PROFILE, 0, "{provider}"),
+    ("malformed-json", NEW_PROFILE, 1, None),
+    ("malformed-json", NEW_PROFILE, 1, "{provider}.other"),
+    ("malformed-json", OLD_MALFORMED.replace("{provider}", "/synthetic/other.py"), 1, "{provider}"),
+    ("malformed-json", OLD_NONZERO, 1, "{provider}"),
+    ("nonzero-provider", NEW_PROFILE, 1, "{provider}"),
+    ("nonzero-provider", NEW_NONZERO.replace("SYNTHETIC_PROVIDER_FAILURE", "other stderr"), 1, "{provider}"),
+    ("nonzero-provider", NEW_NONZERO.replace("code 7.", "code 70."), 1, "{provider}"),
+    ("malformed-json", "Unable to get JSON decoder for inventory script result.", 1, "{provider}"),
+], ids=["rc-zero", "missing-fatal", "foreign-fatal-source", "foreign-old-cause",
+        "nonzero-not-json", "json-not-nonzero", "missing-sentinel", "exit-70", "incomplete-profile"])
+def test_r2_oracle_rejects_wrong_failure(case, detail, rc, fatal):
+    with pytest.raises(AssertionError):
+        assert_failed_provider(*synthetic_failure(case, detail, rc, fatal))
+    if detail == NEW_NONZERO.replace("code 7.", "code 70."):
+        for other in (NEW_NONZERO.replace("code 7.", "code 8."),
+                      NEW_NONZERO + "\nInventory script returned non-zero exit code 70."):
+            with pytest.raises(AssertionError):
+                assert_failed_provider(*synthetic_failure(case, other))
+
+
+def test_r2_oracle_rejects_unrelated_failure():
+    for case in ("malformed-json", "nonzero-provider"):
+        for detail in ("required ansible-inventory not installed", "Permission denied",
+                       "invalid configuration", "Failed to load inventory plugin",
+                       "SYNTHETIC_PROVIDER_FAILURE", "JSON error"):
+            with pytest.raises(AssertionError):
+                assert_failed_provider(*synthetic_failure(case, detail))
+
+
+def test_r2_oracle_rejects_new_parse_warning_rc0():
+    for detail in (NEW_PROFILE, NEW_DECODE, NEW_NONZERO):
+        proc = synthetic_response(empty_response(), detail.encode("utf-8"))
+        with pytest.raises(AssertionError, match="inventory source parse failure"):
+            effective_inventory_object(proc, "empty")
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_r2_oracle_rejects_nonstandard_json(token):
+    raw = ('{"_meta":{"hostvars":{}},"all":{"children":["ungrouped"],'
+           '"vars":{"value":' + token + '}}}').encode("utf-8")
+    proc = subprocess.CompletedProcess(["synthetic-oracle-only"], 0, raw, b"")
+    with pytest.raises(ValueError, match="nonstandard JSON constant"):
+        effective_inventory_object(proc, "empty")
+
+
+def test_r2_oracle_accepts_standard_json():
+    data = empty_response()
+    data["all"]["vars"] = {"values": [None, True, 0, -1, 1.5, "NaN", "Infinity", "-Infinity"]}
+    proc = synthetic_response(data, b"[WARNING]: unrelated JSON note\n")
+    assert effective_inventory_object(proc, "empty") == data
