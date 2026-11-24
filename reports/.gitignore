@@ -1,2 +1,3 @@
-*.json
-!.gitignore
+# All generated reports and assets are private. Keep only this policy file.
+*
+!/.gitignore

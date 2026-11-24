@@ -1,1 +1,31 @@
+# Private local data (prefer storage outside the repository).
+/.local/
+/inventory/local/
+/secrets/
+/.env
+/.env.*
+/.vault_pass*
+/vault-password*
+
+# Controller, test and Python temporary files.
+/.ansible/
+/logs/
+/tmp/
+/.pytest_cache/
+/.venv/
 __pycache__/
+*.py[cod]
+*.retry
+
+# Root-level logs and manually packaged output. Already tracked files
+# are not protected by ignore rules; see docs/development/data-handling.md.
+/*.log
+/*.zip
+/*.7z
+/*.tar
+/*.tar.gz
+/*.tgz
+/*.tar.xz
+/*.txz
+/*.tar.bz2
+/*.tbz2
