@@ -31,6 +31,8 @@
       platform_status: "{{ pqc_ssh_request.platform_status }}"
       context_refs: "{{ pqc_ssh_request.context_refs | default(['global-default']) }}"
       slots: {}
+    pqc_ssh_stopped: false
+    pqc_ssh_queries: {results: []}
     cacheable: false
   become: false
   no_log: true
@@ -74,7 +76,10 @@
   become: false
   no_log: true
 
-- name: Acquire fixed slots without shell or destination
+- &ssh_acquire_slot
+  name: Acquire fixed slot without shell or destination
+  vars:
+    ssh_slot: client-kex
   ansible.builtin.command:
     argv:
       - /usr/bin/env
@@ -128,6 +133,7 @@
         # The public-only source translation and actual native dependency closure
         # still require qualification on the supported OpenSSH implementation.
         NATIVE_T_QUALIFIED = False
+        NATIVE_Q_QUALIFIED = False
         EFFECTIVE_ALIASES = {'pubkeyacceptedkeytypes': 'pubkeyacceptedalgorithms',
                              'hostbasedacceptedkeytypes': 'hostbasedacceptedalgorithms'}
         EFFECTIVE_REQUIRED = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms',
@@ -899,6 +905,8 @@
 
         def run_slot(slot, request=None):
             if slot in CLIENTS:
+                if not NATIVE_Q_QUALIFIED:
+                    return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
                 failed = tool_error('/usr/bin/ssh')
                 if failed:
                     return failed
@@ -955,18 +963,19 @@
             if len(output) > 262144:
                 output = json.dumps(result('ERROR', 'OUTPUT_LIMIT'), separators=(',', ':'))
             print(output)
-      - "{{ item }}"
+      - "{{ ssh_slot }}"
     expand_argument_vars: false
     stdin: >-
-      {{ dict(context_ref=pqc_ssh_snapshot.context_refs[item[-1] | int],
-              context_spec=(pqc_ssh_request.context_specs | default({})).get(pqc_ssh_snapshot.context_refs[item[-1] | int])) | to_json
-         if item.startswith('native-') else '{}' }}
-  loop: "{{ ['client-kex', 'client-cipher', 'client-key', 'client-sig', 'client-mac', 'config', 'keys', 'native-0'] + (['native-1'] if pqc_ssh_snapshot.context_refs | length == 2 else []) }}"
-  register: pqc_ssh_queries
+      {{ dict(context_ref=pqc_ssh_snapshot.context_refs[ssh_slot[-1] | int],
+              context_spec=(pqc_ssh_request.context_specs | default({})).get(pqc_ssh_snapshot.context_refs[ssh_slot[-1] | int])) | to_json
+         if ssh_slot.startswith('native-') else '{}' }}
+  register: pqc_ssh_query
   when:
+    - ssh_slot != 'native-1' or pqc_ssh_snapshot.context_refs | length == 2
+    - not pqc_ssh_stopped
     - pqc_ssh_snapshot.platform_status == 'UNVERIFIED'
-    - pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if item == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd
-    - not item.startswith('native-') or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys
+    - pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if ssh_slot == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd
+    - not ssh_slot.startswith('native-') or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys
     - pqc_ssh_env.stat.isreg | default(false) and pqc_ssh_env.stat.islnk is sameas false and pqc_ssh_env.stat.executable | default(false)
     - pqc_ssh_timer.stat.isreg | default(false) and pqc_ssh_timer.stat.islnk is sameas false and pqc_ssh_timer.stat.executable | default(false)
     - pqc_ssh_python.stat.isreg | default(false) and pqc_ssh_python.stat.executable | default(false)
@@ -975,28 +984,152 @@
   become: false
   no_log: true
 
-- name: Project only bounded typed results
-  ansible.builtin.set_fact:
-    pqc_ssh_snapshot: "{{ pqc_ssh_snapshot | combine({'slots': {item.item: slot_value}}, recursive=true) }}"
-    cacheable: false
+- &ssh_project_slot
+  name: Confirm one slot before the next acquisition
   vars:
-    enabled: "{{ pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if item.item == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd }}"
-    denied: "{{ item.item.startswith('native-') and not pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys }}"
-    missing_permission: >-
-      {{ 'Permission denied' in (pqc_ssh_env.msg | default('')) or
-         'Permission denied' in (pqc_ssh_timer.msg | default('')) or
-         'Permission denied' in (pqc_ssh_python.msg | default('')) }}
-    skipped_state: >-
-      {{ 'NOT_SCANNED' if not enabled else 'NOT_APPLICABLE' if pqc_ssh_snapshot.platform_status == 'OUT_OF_SCOPE' else
-         'PERMISSION_DENIED' if pqc_ssh_snapshot.platform_status == 'UNVERIFIED' and not denied and missing_permission else 'UNKNOWN' }}
-    skipped_reason: >-
-      {{ 'DISABLED_BY_USER' if not enabled else 'PLATFORM_OUT_OF_SCOPE' if pqc_ssh_snapshot.platform_status == 'OUT_OF_SCOPE' else
-         'PLATFORM_UNRESOLVED' if pqc_ssh_snapshot.platform_status == 'UNKNOWN' else 'KEY_FLAG_REQUIRED' if denied else
-         'PERMISSION_DENIED' if missing_permission else 'TOOL_UNAVAILABLE' }}
-    slot_value: >-
-      {{ dict(state=skipped_state, reason=skipped_reason, rc=none, rows=[], gaps=[]) if item.skipped | default(false) else
-         ((item.stdout | from_json) if item.rc | default(-1) == 0 else
-          dict(state='ERROR', reason=('OUTER_DEADLINE' if item.rc | default(-1) in [124, 137] else 'HELPER_ERROR'), rc=none, rows=[], gaps=[])) }}
-  loop: "{{ pqc_ssh_queries.results }}"
+    ssh_slot: client-kex
+  when: ssh_slot != 'native-1' or pqc_ssh_snapshot.context_refs | length == 2
   become: false
   no_log: true
+  block:
+    - name: Decode only a complete bounded helper result
+      vars:
+        enabled: "{{ pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if ssh_slot == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd }}"
+        denied: "{{ ssh_slot.startswith('native-') and not pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys }}"
+        missing_permission: >-
+          {{ 'Permission denied' in (pqc_ssh_env.msg | default('')) or
+             'Permission denied' in (pqc_ssh_timer.msg | default('')) or
+             'Permission denied' in (pqc_ssh_python.msg | default('')) }}
+        skipped_reason: >-
+          {{ 'DISABLED_BY_USER' if not enabled else 'PLATFORM_OUT_OF_SCOPE' if pqc_ssh_snapshot.platform_status == 'OUT_OF_SCOPE' else
+             'PLATFORM_UNRESOLVED' if pqc_ssh_snapshot.platform_status == 'UNKNOWN' else 'KEY_FLAG_REQUIRED' if denied else
+             'ACQUISITION_STOPPED' if pqc_ssh_stopped else 'PERMISSION_DENIED' if missing_permission else 'TOOL_UNAVAILABLE' }}
+        skipped_state: >-
+          {{ 'NOT_SCANNED' if skipped_reason == 'DISABLED_BY_USER' else 'NOT_APPLICABLE' if skipped_reason == 'PLATFORM_OUT_OF_SCOPE' else
+             'PERMISSION_DENIED' if skipped_reason == 'PERMISSION_DENIED' else 'UNKNOWN' }}
+        failure: "{{ dict(state='ERROR', reason=('OUTER_DEADLINE' if pqc_ssh_query.rc | default(-1) in [124, 137, -9, -15] else 'HELPER_ERROR'), rc=none, rows=[], gaps=[]) }}"
+      ansible.builtin.set_fact:
+        pqc_ssh_slot_result: >-
+          {{ dict(state=skipped_state, reason=skipped_reason, rc=none, rows=[], gaps=[]) if pqc_ssh_query.skipped | default(false) else
+             (pqc_ssh_query.stdout | from_json if pqc_ssh_query.rc | default(-1) == 0 and not (pqc_ssh_query.failed | default(false)) and
+              pqc_ssh_query.stdout | default('') | length <= 262144 and not (pqc_ssh_query.stderr | default('')) else failure) }}
+        cacheable: false
+
+    - name: Reject a malformed or indeterminate slot envelope
+      ansible.builtin.assert:
+        that:
+          - pqc_ssh_slot_result is mapping
+          - pqc_ssh_slot_result.keys() | list | sort == ['gaps', 'rc', 'reason', 'rows', 'state']
+          - pqc_ssh_slot_result.state in ['COLLECTED', 'PARTIAL', 'UNKNOWN', 'ERROR', 'PERMISSION_DENIED', 'NOT_SCANNED', 'NOT_APPLICABLE']
+          - pqc_ssh_slot_result.reason is string
+          - pqc_ssh_slot_result.rc is none or (pqc_ssh_slot_result.rc is integer and pqc_ssh_slot_result.rc >= -255 and pqc_ssh_slot_result.rc <= 255)
+          - pqc_ssh_slot_result.rows is sequence and pqc_ssh_slot_result.rows is not string and pqc_ssh_slot_result.rows is not mapping and pqc_ssh_slot_result.rows | length <= 512
+          - pqc_ssh_slot_result.gaps is sequence and pqc_ssh_slot_result.gaps is not string and pqc_ssh_slot_result.gaps is not mapping and pqc_ssh_slot_result.gaps | length <= 16
+          - pqc_ssh_slot_result.reason in ['OK', 'FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP', 'TOOL_UNAVAILABLE', 'TOOL_UNSAFE_PATH', 'TOOL_NOT_EXECUTABLE', 'PERMISSION_DENIED', 'EXECUTION_ERROR', 'OUTER_DEADLINE', 'HELPER_ERROR', 'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT', 'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'NATIVE_SAFETY_UNPROVEN', 'NATIVE_SOURCE_REJECTED', 'NATIVE_CONTEXT_REJECTED', 'SOURCE_PERMISSION', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT', 'KEY_INVALID', 'PLATFORM_UNRESOLVED', 'KEY_FLAG_REQUIRED', 'DISABLED_BY_USER', 'PLATFORM_OUT_OF_SCOPE', 'ACQUISITION_STOPPED']
+          - pqc_ssh_slot_result.state in ['COLLECTED', 'PARTIAL'] or (not pqc_ssh_slot_result.rows and not pqc_ssh_slot_result.gaps)
+          - (pqc_ssh_slot_result.state == 'COLLECTED') == (pqc_ssh_slot_result.reason == 'OK')
+          - (pqc_ssh_slot_result.state == 'PARTIAL') == (pqc_ssh_slot_result.reason in ['FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP'])
+          - (pqc_ssh_slot_result.state == 'ERROR') == (pqc_ssh_slot_result.reason in ['CLEANUP_FAILED', 'OUTER_DEADLINE', 'HELPER_ERROR', 'EXECUTION_ERROR', 'TIMEOUT', 'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT'])
+          - (pqc_ssh_slot_result.state == 'PERMISSION_DENIED') == (pqc_ssh_slot_result.reason in ['PERMISSION_DENIED', 'SOURCE_PERMISSION'])
+          - (pqc_ssh_slot_result.state == 'NOT_SCANNED') == (pqc_ssh_slot_result.reason == 'DISABLED_BY_USER')
+          - (pqc_ssh_slot_result.state == 'NOT_APPLICABLE') == (pqc_ssh_slot_result.reason == 'PLATFORM_OUT_OF_SCOPE')
+          - pqc_ssh_slot_result.reason not in ['NATIVE_SAFETY_UNPROVEN', 'ACQUISITION_STOPPED'] or pqc_ssh_slot_result.rc is none
+          - pqc_ssh_slot_result.reason != 'ACQUISITION_STOPPED' or (pqc_ssh_stopped and pqc_ssh_query.skipped | default(false))
+        quiet: true
+  rescue:
+    - name: Discard malformed output and latch uncertain termination
+      ansible.builtin.set_fact:
+        pqc_ssh_slot_result: {state: ERROR, reason: HELPER_ERROR, rc: null, rows: [], gaps: []}
+        cacheable: false
+  always:
+    - name: Publish the slot and stop further acquisition on uncertainty
+      ansible.builtin.set_fact:
+        pqc_ssh_snapshot: "{{ pqc_ssh_snapshot | combine({'slots': {ssh_slot: pqc_ssh_slot_result}}, recursive=true) }}"
+        pqc_ssh_stopped: "{{ pqc_ssh_stopped or pqc_ssh_slot_result.reason in ['CLEANUP_FAILED', 'OUTER_DEADLINE', 'HELPER_ERROR', 'EXECUTION_ERROR', 'TIMEOUT'] }}"
+        pqc_ssh_queries: >-
+          {{ dict(results=pqc_ssh_queries.results + [dict(item=ssh_slot, rc=pqc_ssh_query.rc)
+             if not (pqc_ssh_query.skipped | default(false)) and pqc_ssh_query.rc is defined
+             else dict(item=ssh_slot, skipped=pqc_ssh_query.skipped | default(false))]) }}
+        cacheable: false
+
+# Each pair completes (including rescue/always) before the next command can
+# run. Never use a command loop whose results are examined after all slots.
+- <<: *ssh_acquire_slot
+  name: Acquire client-cipher slot
+  vars:
+    ssh_slot: client-cipher
+
+- <<: *ssh_project_slot
+  name: Confirm client-cipher slot
+  vars:
+    ssh_slot: client-cipher
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-key slot
+  vars:
+    ssh_slot: client-key
+
+- <<: *ssh_project_slot
+  name: Confirm client-key slot
+  vars:
+    ssh_slot: client-key
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-sig slot
+  vars:
+    ssh_slot: client-sig
+
+- <<: *ssh_project_slot
+  name: Confirm client-sig slot
+  vars:
+    ssh_slot: client-sig
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-mac slot
+  vars:
+    ssh_slot: client-mac
+
+- <<: *ssh_project_slot
+  name: Confirm client-mac slot
+  vars:
+    ssh_slot: client-mac
+
+- <<: *ssh_acquire_slot
+  name: Acquire config slot
+  vars:
+    ssh_slot: config
+
+- <<: *ssh_project_slot
+  name: Confirm config slot
+  vars:
+    ssh_slot: config
+
+- <<: *ssh_acquire_slot
+  name: Acquire keys slot
+  vars:
+    ssh_slot: keys
+
+- <<: *ssh_project_slot
+  name: Confirm keys slot
+  vars:
+    ssh_slot: keys
+
+- <<: *ssh_acquire_slot
+  name: Acquire native-0 slot
+  vars:
+    ssh_slot: native-0
+
+- <<: *ssh_project_slot
+  name: Confirm native-0 slot
+  vars:
+    ssh_slot: native-0
+
+- <<: *ssh_acquire_slot
+  name: Acquire native-1 slot
+  vars:
+    ssh_slot: native-1
+
+- <<: *ssh_project_slot
+  name: Confirm native-1 slot
+  vars:
+    ssh_slot: native-1

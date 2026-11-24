@@ -6,8 +6,9 @@ This is an **engineering candidate on HOLD**, not a live entry point. Developmen
 uses test-only `sshd -G` / `-G -C`; production acquisition is fixed to `sshd -T`
 / `-T -C`, without a G fallback. S02a shared effective-result projection is
 implemented; S02b has a restricted acquisition candidate but both production
-qualification gates remain false. Actual native G, T and client Q controls
-remain NOT_TESTED; no native safety or public-only parity claim is made.
+qualification gates remain false. The fixed product Q and T paths remain unqualified and hard-disabled.
+Private binary G/Q controls are development evidence only; no native safety
+or public-only parity claim is made.
 Do not merge or authorize live dispatch on the basis of synthetic results.
 #8 owns before-connect/remote termination, #9 owns private storage, and #28
 owns actual target/controller release verification.
@@ -49,7 +50,7 @@ mixed modes and unqualified native-source positives.
 
 | Slot | Flag | Scope and bounded source |
 |---|---|---|
-| `client-kex`, `client-cipher`, `client-key`, `client-sig`, `client-mac` | sshd | fixed `/usr/bin/ssh -Q kex/cipher/key/sig/mac`, respectively |
+| `client-kex`, `client-cipher`, `client-key`, `client-sig`, `client-mac` | sshd | fixed `/usr/bin/ssh -Q kex/cipher/key/sig/mac`, hard-disabled pending qualification |
 | `config` | sshd | fixed main, allowlisted Include closure, lexical metadata only |
 | `keys` | ssh_host_keys | fixed single-level public-key candidates, not private files |
 | `native-0`, optional `native-1` | sshd AND ssh_host_keys | context-bound T candidate; **hard-disabled pending qualification** |
@@ -67,14 +68,24 @@ The outer command uses the fixed system `env -i`, `timeout` and Python
 caller-selectable executable. Fixed env/timeout paths must be regular,
 non-link, executable. A client command uses fixed argv, no shell, no endpoint,
 closed stdin, and an exact minimal environment (C locale, fixed PATH, dummy
-nonexistent HOME, no agent or askpass variables). The helper verifies fixed
-client executable regular/non-link/executable status and never falls back to
-PATH. Per slot: 23 s internal monotonic deadline, direct child kill/reap up to
+nonexistent HOME, no agent or askpass variables). The helper first requires the code-only `NATIVE_Q_QUALIFIED` gate (false),
+otherwise returns UNKNOWN/NATIVE_SAFETY_UNPROVEN with no child or rc. A
+qualified path would also verify the fixed executable regular/non-link/
+executable status, never fall back to PATH. The controller rejects unqualified
+NATIVE_COLLECTOR positive Q rows; SYNTHETIC parser results remain supported. Per slot: 23 s internal monotonic deadline, direct child kill/reap up to
 1 s; outer GNU timeout 27 s plus 2 s kill grace. Combined raw stdout/stderr
 cap 16 KiB, 256 client lines; overflow discards the entire result, not a
 truncated success. Unknown flag, absent/unexecutable/unsafe executable,
 permission failure, malformed or empty output and nonzero rc retain gaps.
-There is no automatic retry. This is direct-child/local process evidence;
+There is no automatic retry. The fixed slot order is sequential command then
+projection, not an acquisition loop followed by delayed inspection. A cleanup
+failure, outer deadline, helper error (including malformed projection),
+execution error or timeout latches a host-local stop before any later command.
+Previously confirmed slots survive. Subsequent otherwise eligible slots are
+UNKNOWN/ACQUISITION_STOPPED with null rc, no rows/gaps and no acquisition;
+disabled, ineligible and key-flag conditions retain their original precedence.
+The validator rejects positives or invented attempts after this stop. This is
+direct-child/local process evidence;
 remote process group lifetime and the trusted system runtime/connection
 boundary are not solved here.
 
@@ -212,12 +223,14 @@ and native execution containment are not yet proven.
 This source transformation is a candidate, NOT proof of identical effective
 settings or safety. `-T` additionally performs key checks; even `-G` cannot
 be assumed safe across distributions, defaults, Includes, NSS and helpers.
-Current QA #7141119955 failed outside-file/exec isolation controls; this
-container has no fixed sshd or ssh binary. Real G/-C, actual T/-C public-only
-parity and dependency restrictions (private keys, agent, NSS/DNS, external
-files/programs, network, child/temporary cleanup) remain NOT_TESTED and the
-production gates must not be enabled on parser/fixture results. The test-side
-G command is separate and remains gated on a qualified existing environment.
+QA #7141119955 failed general outside-file/exec isolation controls. Per
+#7142316288 these do not require rebuilding a generic sandbox for a fixed
+non-daemon development probe. Actual private-binary results are tracked in the
+engineering report separately from the fixed product entry points; do not
+infer -G/-C compatibility from -G alone. Actual T/-C public-only parity and
+native dependency restrictions (private keys, agent, NSS/DNS, external files,
+programs, network, child/temporary cleanup) remain unqualified. Neither the
+Q nor T product gate may be enabled on parser/fixture/private-path results.
 Synthetic FS and unit capture-boundary tests prove preparation/rejection and
 cleanup logic, not the behavior of the native binary. No runtime restore or
 new isolation platform is proposed. #28 must verify actual OL T/-C and real

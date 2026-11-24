@@ -27,6 +27,8 @@ SETTINGS = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms', 'pubkeyacce
             'casignaturealgorithms', 'gssapikexalgorithms'}
 # Paired with the code-only gate in the remote helper; neither is caller-controlled.
 NATIVE_T_QUALIFIED = False
+NATIVE_Q_QUALIFIED = False
+HALT_REASONS = {'CLEANUP_FAILED', 'OUTER_DEADLINE', 'HELPER_ERROR', 'EXECUTION_ERROR', 'TIMEOUT'}
 EFFECTIVE_REQUIRED = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms',
                       'pubkeyacceptedalgorithms', 'hostbasedacceptedalgorithms', 'casignaturealgorithms'}
 EFFECTIVE_SETTINGS = EFFECTIVE_REQUIRED | {'gssapikexalgorithms'}
@@ -37,9 +39,9 @@ CONFIG_GAPS = {'SOURCE_MISSING', 'SOURCE_PERMISSION', 'SOURCE_UNSAFE', 'FORMAT_G
                'NATIVE_DEPENDENCY', 'HOSTKEY_PATH_REJECTED'}
 KEY_GAPS = {'SOURCE_MISSING', 'SOURCE_PERMISSION', 'SOURCE_UNSAFE', 'KEY_INVALID', 'KEY_TYPE_UNKNOWN'}
 TOOL_REASONS = {'TOOL_UNAVAILABLE', 'TOOL_UNSAFE_PATH', 'TOOL_NOT_EXECUTABLE'}
-COMMON_FAILURES = TOOL_REASONS | {'PERMISSION_DENIED', 'EXECUTION_ERROR', 'OUTER_DEADLINE', 'HELPER_ERROR'}
+COMMON_FAILURES = TOOL_REASONS | {'PERMISSION_DENIED', 'EXECUTION_ERROR', 'OUTER_DEADLINE', 'HELPER_ERROR', 'ACQUISITION_STOPPED'}
 CLIENT_FAILURES = COMMON_FAILURES | {'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT',
-    'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING'}
+    'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'NATIVE_SAFETY_UNPROVEN'}
 NATIVE_FAILURES = COMMON_FAILURES | {'NATIVE_SAFETY_UNPROVEN', 'NATIVE_SOURCE_REJECTED',
     'NATIVE_CONTEXT_REJECTED', 'SOURCE_PERMISSION', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT',
     'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT',
@@ -50,7 +52,7 @@ REASONS = {
     'COLLECTED': {'OK'}, 'PARTIAL': {'FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP'},
     'UNKNOWN': TOOL_REASONS | {'PLATFORM_UNRESOLVED', 'NATIVE_SAFETY_UNPROVEN', 'KEY_FLAG_REQUIRED',
         'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'KEY_INVALID',
-        'NATIVE_SOURCE_REJECTED', 'NATIVE_CONTEXT_REJECTED'},
+        'NATIVE_SOURCE_REJECTED', 'NATIVE_CONTEXT_REJECTED', 'ACQUISITION_STOPPED'},
     'ERROR': {'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'EXECUTION_ERROR',
         'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT',
         'SOURCE_DRIFT', 'OUTER_DEADLINE', 'HELPER_ERROR'},
@@ -211,6 +213,7 @@ def validate_snapshot(s):
             len(set(contexts)) == len(contexts))
     mapping(s['slots'], slots(s))
     native_modes = set()
+    halted = False
     for slot in slots(s):
         r = mapping(s['slots'][slot], {'state', 'reason', 'rc', 'rows', 'gaps'})
         state, reason, rc, rows, gaps = (r[k] for k in ('state', 'reason', 'rc', 'rows', 'gaps'))
@@ -226,6 +229,12 @@ def validate_snapshot(s):
         if forced:
             require((state, reason) == forced and rc is None and not rows and not gaps)
             continue
+        if halted:
+            require((state, reason) == ('UNKNOWN', 'ACQUISITION_STOPPED') and rc is None and not rows and not gaps,
+                    'SSH_ACQUISITION_STOPPED')
+            continue
+        require(reason != 'ACQUISITION_STOPPED', 'SSH_ACQUISITION_STOPPED')
+        halted = reason in HALT_REASONS
         require(state not in ('NOT_SCANNED', 'NOT_APPLICABLE') and reason not in ('PLATFORM_UNRESOLVED', 'KEY_FLAG_REQUIRED'))
         usable = state in ('COLLECTED', 'PARTIAL')
         if not usable:
@@ -240,7 +249,7 @@ def validate_snapshot(s):
                         (state == 'COLLECTED' or (reason == 'FORMAT_GAP' and gaps == ['FORMAT_GAP'])))
             else:
                 require(reason in CLIENT_FAILURES)
-                if reason in TOOL_REASONS:
+                if reason in TOOL_REASONS | {'NATIVE_SAFETY_UNPROVEN'}:
                     require(rc is None)
                 elif reason == 'UNSUPPORTED_QUERY':
                     require(rc is not None and rc != 0)
@@ -285,6 +294,9 @@ def _project(rid, host, snapshot, source, observed_at, rules):
             source['producer_version'] == VERSION)
     ev.SOURCE.check(source, '$ssh.source')
     for slot in slots(snapshot):
+        if slot in CLIENTS and snapshot['slots'][slot]['rows']:
+            require(source['source_kind'] == 'SYNTHETIC' or NATIVE_Q_QUALIFIED,
+                    'SSH_NATIVE_SOURCE_UNQUALIFIED')
         if slot.startswith('native-') and snapshot['slots'][slot]['rows']:
             mode = snapshot['slots'][slot]['rows'][0]['mode']
             require(source['source_kind'] == 'SYNTHETIC' or

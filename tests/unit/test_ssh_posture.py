@@ -447,6 +447,9 @@ def test_fixed_entry_native_never_dispatched_and_mirror():
 
 
 def test_actual_client_query_smoke_required():
+    assert H['NATIVE_Q_QUALIFIED'] is ssh.NATIVE_Q_QUALIFIED
+    if not H['NATIVE_Q_QUALIFIED']:
+        pytest.skip('Required fixed product ssh -Q: native safety qualification unavailable')
     if H['tool_error']('/usr/bin/ssh'):
         pytest.skip('Required real ssh -Q smoke: fixed client executable unavailable')
     actual = []
@@ -841,3 +844,220 @@ def test_r2_stage_cleanup_failure_discards_native_result(tmp_path, monkeypatch):
         os.close(fd)
     assert r == H['result']('ERROR', 'CLEANUP_FAILED', 0) and len(stages) == 1 and not stages[0].exists()
     ssh.validate_snapshot(snapshot(**{'native-0': r}))
+
+
+# F-R1-01/02: exercise the fixed role's actual command/projection order.
+# This narrow local harness evaluates the exact task conditions and projections
+# and launches the actual outer env/timeout/helper command against synthetic FS.
+# It is not an Ansible implementation or an actual transport/managed-host test.
+def correction_slot_sequence(tmp_path, scenario, keys_on=True):
+    from jinja2 import StrictUndefined
+    from jinja2.nativetypes import NativeEnvironment
+    root = tmp_path/'fixture'; native_fixture(root)
+    witness = tmp_path/'witness'
+    # Test-only fault injection into the complete fixed helper. T output is
+    # synthetic; actual sshd -T is forbidden in this test.
+    seam = r"""
+ROOT_PATH = __ROOT__
+NATIVE_T_QUALIFIED = True
+NATIVE_Q_QUALIFIED = True
+_TEST_SCENARIO = __SCENARIO__
+_TEST_WITNESS = __WITNESS__
+_TEST_SLOT = None
+
+def witness(kind):
+    with open(_TEST_WITNESS, 'a', encoding='ascii') as stream:
+        stream.write(kind + ':' + _TEST_SLOT + '\n')
+
+_real_run = run_slot
+_real_prepare = prepare_native
+_real_config = collect_config
+_real_keys = collect_keys
+_real_temp = tempfile.TemporaryDirectory
+
+def run_slot(slot, request=None):
+    global _TEST_SLOT
+    _TEST_SLOT = slot
+    witness('helper')
+    if _TEST_SCENARIO == 'outer' and slot == 'native-0':
+        time.sleep(5)
+    if _TEST_SCENARIO == 'malformed' and slot == 'client-cipher':
+        return {'unexpected': True}
+    return _real_run(slot, request)
+
+def tool_error(path):
+    assert path in ('/usr/bin/ssh', '/usr/sbin/sshd')
+    return None
+
+def prepare_native(*args):
+    witness('source')
+    return _real_prepare(*args)
+
+def collect_config(*args):
+    witness('source')
+    return _real_config(*args)
+
+def collect_keys(*args):
+    witness('source')
+    return _real_keys(*args)
+
+def capture(argv, seconds=23):
+    witness('child')
+    if _TEST_SLOT.startswith('client-'):
+        assert argv == CLIENTS[_TEST_SLOT]
+        if _TEST_SCENARIO == 'child' and _TEST_SLOT == 'client-cipher':
+            return 'CLEANUP_FAILED', None, b'', b''
+        return None, 0, b'curve25519-sha256\n', b''
+    assert argv[:3] == ['/usr/sbin/sshd', '-T', '-f']
+    return None, 0, __EFFECTIVE__, b''
+
+class FailingCleanup:
+    def __init__(self, **kw):
+        self.inner = _real_temp(**kw)
+        self.name = self.inner.name
+    def cleanup(self):
+        self.inner.cleanup()
+        if _TEST_SCENARIO == 'cleanup' and _TEST_SLOT == 'native-0':
+            raise OSError('synthetic cleanup failure')
+
+tempfile.TemporaryDirectory = FailingCleanup
+"""
+    for old, new in [('__ROOT__', repr(str(root))), ('__SCENARIO__', repr(scenario)),
+                     ('__WITNESS__', repr(str(witness))), ('__EFFECTIVE__', repr(EFFECTIVE_FIXTURE))]:
+        seam = seam.replace(old, new)
+    anchor = "if __name__ == '__main__':\n"
+    assert HELPER.count(anchor) == 1
+    injected = HELPER.replace(anchor, seam + '\n' + anchor)
+    jinja = NativeEnvironment(undefined=StrictUndefined)
+    jinja.filters.update(from_json=json.loads, to_json=json.dumps)
+    def combine(left, right, recursive=False):
+        assert recursive is True and set(right) == {'slots'}
+        return {**left, 'slots': {**left['slots'], **right['slots']}}
+    jinja.filters['combine'] = combine
+    def expression(text, values):
+        return jinja.compile_expression(text, undefined_to_none=False)(**values)
+    def template(value, values):
+        if isinstance(value, str) and value.strip().startswith('{{') and value.strip().endswith('}}'):
+            return expression(value.strip()[2:-2], values)
+        if isinstance(value, dict):
+            return {k: template(v, values) for k, v in value.items()}
+        if isinstance(value, list):
+            return [template(v, values) for v in value]
+        return value
+    env = {'pqc_ssh_request': dict(flags=dict(zip(ssh.FLAGS, (True, keys_on))), platform_status='UNVERIFIED',
+            context_refs=['global-default', NATIVE_CTX], context_specs={NATIVE_CTX: NATIVE_SPEC})}
+    # Reuse actual initialization and actual fixed outer executable metadata.
+    for var in ('pqc_ssh_env', 'pqc_ssh_timer', 'pqc_ssh_python'):
+        env[var] = {'stat': dict(isreg=True, islnk=False, executable=True)}
+    def fact(task, values):
+        local = dict(values)
+        for k, v in task.get('vars', {}).items():
+            local[k] = template(v, local)
+        values.update({k: template(v, local) for k, v in task['ansible.builtin.set_fact'].items() if k != 'cacheable'})
+    fact(TASKS[1], env)
+    pairs = TASKS[5:]
+    assert len(pairs) == 18 and tuple(x['vars']['ssh_slot'] for x in pairs[::2]) == ssh.slots(env['pqc_ssh_snapshot'])
+    for command, projection in zip(pairs[::2], pairs[1::2]):
+        slot = command['vars']['ssh_slot']
+        assert projection['vars']['ssh_slot'] == slot and 'loop' not in command
+        local = dict(env, ssh_slot=slot)
+        if all(expression(expr, local) for expr in command['when']):
+            args = command['ansible.builtin.command']
+            argv = template(args['argv'], local)
+            assert argv[-2] == HELPER and argv[-1] == slot and args['expand_argument_vars'] is False
+            argv[-2] = injected
+            if scenario == 'outer' and slot == 'native-0':
+                assert argv[8] == '27s'
+                argv[8] = '0.3s'  # bounded test-only outer timeout
+            run = subprocess.run(argv, input=template(args['stdin'], local), text=True, capture_output=True, timeout=31)
+            env['pqc_ssh_query'] = dict(rc=run.returncode, stdout=run.stdout, stderr=run.stderr, failed=run.returncode != 0)
+        else:
+            env['pqc_ssh_query'] = {'skipped': True}
+        local = dict(env, ssh_slot=slot)
+        if expression(projection['when'], local):
+            try:
+                fact(projection['block'][0], local)
+                if not all(expression(expr, local) for expr in projection['block'][1]['ansible.builtin.assert']['that']):
+                    raise ValueError('malformed envelope')
+            except (ValueError, TypeError):
+                fact(projection['rescue'][0], local)
+            fact(projection['always'][0], local)
+            for k in ('pqc_ssh_snapshot', 'pqc_ssh_stopped', 'pqc_ssh_queries'):
+                env[k] = local[k]
+    snap = env['pqc_ssh_snapshot']
+    events = witness.read_text().splitlines()
+    ssh.validate_snapshot(snap)
+    d, detail = norm(snap)
+    ssh.validate_details(assessment.evaluate_document(ev.parse_evidence_bytes(ev.canonical_bytes(d)), RULES), detail, RULES)
+    return snap, events, env['pqc_ssh_queries']['results']
+
+
+@pytest.mark.parametrize('scenario,stopped_at,reason', [
+    ('cleanup', 'native-0', 'CLEANUP_FAILED'),
+    ('outer', 'native-0', 'OUTER_DEADLINE'),
+    ('child', 'client-cipher', 'CLEANUP_FAILED'),
+    ('malformed', 'client-cipher', 'HELPER_ERROR'),
+])
+def test_r1_cross_slot_failure_stops_outer_sequence(tmp_path, scenario, stopped_at, reason):
+    snap, events, queries = correction_slot_sequence(tmp_path, scenario)
+    ordered = list(ssh.slots(snap)); at = ordered.index(stopped_at)
+    assert snap['slots'][stopped_at]['reason'] == reason
+    assert snap['slots']['client-kex']['state'] == 'COLLECTED'
+    assert [e.split(':', 1)[1] for e in events if e.startswith('helper:')] == ordered[:at+1]
+    assert [q['item'] for q in queries if 'rc' in q] == ordered[:at+1]
+    for later in ordered[at+1:]:
+        assert snap['slots'][later] == H['result']('UNKNOWN', 'ACQUISITION_STOPPED')
+        assert all(not e.endswith(':'+later) for e in events)
+    if scenario == 'cleanup':
+        assert events.count('source:native-0') == events.count('child:native-0') == 1
+        assert snap['slots']['keys']['state'] == 'COLLECTED'
+    if scenario == 'outer':
+        assert 'source:native-0' not in events and 'child:native-0' not in events
+        assert snap['slots'][stopped_at]['rc'] is None
+
+
+def test_r1_cross_slot_success_and_flag_precedence(tmp_path):
+    snap, events, queries = correction_slot_sequence(tmp_path/'normal', 'normal')
+    assert snap['slots']['native-0']['state'] == snap['slots']['native-1']['state'] == 'COLLECTED'
+    assert events.count('child:native-0') == events.count('child:native-1') == 1
+    assert events.count('source:native-0') == events.count('source:native-1') == 1
+    assert len([q for q in queries if 'rc' in q]) == 9
+    snap, events, queries = correction_slot_sequence(tmp_path/'disabled', 'child', keys_on=False)
+    assert snap['slots']['keys'] == H['result']('NOT_SCANNED', 'DISABLED_BY_USER')
+    assert snap['slots']['native-0'] == snap['slots']['native-1'] == H['result']('UNKNOWN', 'KEY_FLAG_REQUIRED')
+    assert not any(e.startswith('source:') for e in events)
+
+
+@pytest.mark.parametrize('slot', ssh.CLIENTS)
+def test_r1_unqualified_q_zero_child_and_native_positive_rejected(monkeypatch, slot):
+    assert H['NATIVE_Q_QUALIFIED'] is ssh.NATIVE_Q_QUALIFIED is False
+    monkeypatch.setitem(H, 'tool_error', lambda *a: pytest.fail('unqualified Q inspected tool'))
+    monkeypatch.setitem(H, 'capture', lambda *a, **kw: pytest.fail('unqualified Q launched child'))
+    assert H['run_slot'](slot) == H['result']('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+    p = subprocess.run([sys.executable, '-I', '-B', '-c', HELPER, slot], capture_output=True, timeout=3)
+    assert p.returncode == 0 and not p.stderr and json.loads(p.stdout) == H['run_slot'](slot)
+    s = snapshot(**{slot: parse('curve25519-sha256\n')})
+    d = document(); native = dict(SOURCE, source_kind='NATIVE_COLLECTOR'); d['run']['source'] = native
+    with pytest.raises(ev.EvidenceError, match='SSH_NATIVE_SOURCE_UNQUALIFIED'):
+        ssh.normalize_ssh(d, HOST, s, native, TIME, RULES)
+    # Keep synthetic positives and the existing parser/evaluator contract.
+    d, detail = norm(s)
+    assert any(e['evidence_kind'] == 'RUNTIME_CAPABILITY' for e in d['evidence'])
+    ssh.validate_details(assessment.evaluate_document(d, RULES), detail, RULES)
+
+
+@pytest.mark.parametrize('change', ['positive', 'rc', 'without-predecessor'])
+def test_r1_snapshot_rejects_forged_cross_slot_acquisition(change):
+    s = snapshot()
+    s['slots']['client-kex'] = H['result']('ERROR', 'CLEANUP_FAILED')
+    for slot in list(ssh.slots(s))[1:]:
+        s['slots'][slot] = H['result']('UNKNOWN', 'ACQUISITION_STOPPED')
+    ssh.validate_snapshot(s)
+    if change == 'positive':
+        s['slots']['client-cipher'] = parse('aes256-ctr\n')
+    elif change == 'rc':
+        s['slots']['client-cipher']['rc'] = 0
+    else:
+        s['slots']['client-kex'] = H['result']('UNKNOWN', 'TOOL_UNAVAILABLE')
+    with pytest.raises(ev.EvidenceError, match='SSH_ACQUISITION_STOPPED'):
+        ssh.validate_snapshot(s)
