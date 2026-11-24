@@ -1,0 +1,233 @@
+---
+# Internal tasks_from only. The trusted caller owns scope, connection and authorization.
+- name: Collect the minimal platform fact projection
+  ansible.builtin.setup:
+    gather_subset: ['!all', '!min', distribution, os_family, architecture]
+    filter:
+      - ansible_distribution
+      - ansible_os_family
+      - ansible_distribution_version
+      - ansible_distribution_major_version
+      - ansible_architecture
+  become: false
+  register: pqc_platform_fact_result
+  ignore_errors: true
+  no_log: true
+
+- name: Inspect fixed executable candidates without following links
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop:
+    - {id: rpm, path: /usr/bin/rpm}
+    - {id: openssl, path: /usr/bin/openssl}
+    - {id: ssh, path: /usr/bin/ssh}
+    - {id: sshd, path: /usr/sbin/sshd}
+    - {id: ssh-keygen, path: /usr/bin/ssh-keygen}
+    - {id: update-crypto-policies, path: /usr/bin/update-crypto-policies}
+    - {id: update-crypto-policies, path: /usr/sbin/update-crypto-policies}
+    - {id: timeout, path: /usr/bin/timeout}
+  become: false
+  register: pqc_platform_stat_result
+  ignore_errors: true
+  no_log: true
+
+- name: Initialize the bounded controller handoff
+  ansible.builtin.set_fact:
+    pqc_platform_snapshot:
+      facts_state: "{{ 'PERMISSION_DENIED' if (pqc_platform_fact_result.failed | default(false) and 'Permission denied' in (pqc_platform_fact_result.msg | default(''))) else ('ERROR' if pqc_platform_fact_result.failed | default(false) else 'OK') }}"
+      facts: >-
+        {{ {} if pqc_platform_fact_result.failed | default(false) else
+           dict(distribution=pqc_platform_fact_result.ansible_facts.ansible_distribution | default(none),
+                os_family=pqc_platform_fact_result.ansible_facts.ansible_os_family | default(none),
+                distribution_version=pqc_platform_fact_result.ansible_facts.ansible_distribution_version | default(none),
+                distribution_major_version=pqc_platform_fact_result.ansible_facts.ansible_distribution_major_version | default(none),
+                architecture=pqc_platform_fact_result.ansible_facts.ansible_architecture | default(none)) }}
+      tools: {}
+      rpms: {}
+    cacheable: false
+  no_log: true
+
+- name: Project only fixed tool metadata
+  ansible.builtin.set_fact:
+    pqc_platform_snapshot: >-
+      {{ pqc_platform_snapshot | combine({'tools': {item.item.id:
+         (pqc_platform_snapshot.tools[item.item.id] | default([])) + [projected]}}, recursive=true) }}
+    cacheable: false
+  vars:
+    st: "{{ item.stat | default({}) }}"
+    failed: "{{ item.failed | default(false) }}"
+    projected: >-
+      {{ dict(state=('PERMISSION_DENIED' if 'Permission denied' in (item.msg | default('')) else 'ERROR'))
+         if failed else dict(state='OK', exists=st.exists | default(none),
+         isreg=st.isreg | default(none), islnk=st.islnk | default(none), executable=st.executable | default(none)) }}
+  loop: "{{ pqc_platform_stat_result.results }}"
+  no_log: true
+
+# Bounded target-side stdlib helper: no shell, file output or arbitrary caller argv.
+# GNU timeout is the outer process-group deadline; the inner reader caps BOTH pipes.
+- name: Query the two fixed Oracle Linux release RPMs with bounded output
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - --signal=TERM
+      - --kill-after=2s
+      - 27s
+      - /usr/bin/python3
+      - -I
+      - -B
+      - -c
+      - |
+        import json
+        import os
+        import re
+        import selectors
+        import subprocess
+        import sys
+        import time
+
+        LIMIT = 16384
+        NAMES = ('oraclelinux-release', 'oraclelinux-release-el9')
+
+        def result(state, reason, rows=()):
+            return dict(state=state, reason=reason, rows=list(rows))
+
+        def capture(argv):
+            deadline = time.monotonic() + 23
+            try:
+                p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env=dict(os.environ, LC_ALL='C'))
+            except PermissionError:
+                return result('PERMISSION_DENIED', 'PERMISSION_DENIED')
+            except FileNotFoundError:
+                return result('UNKNOWN', 'TOOL_UNAVAILABLE')
+            except OSError:
+                return result('ERROR', 'COMMAND_FAILED')
+            buffers = [bytearray(), bytearray()]
+            failure = None
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for index, pipe in enumerate((p.stdout, p.stderr)):
+                        sel.register(pipe, selectors.EVENT_READ, index)
+                    while sel.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            failure = 'TIMEOUT'
+                            break
+                        for key, _ in sel.select(remaining):
+                            room = LIMIT - sum(map(len, buffers))
+                            chunk = os.read(key.fd, min(4096, room + 1))
+                            if len(chunk) > room:
+                                failure = 'OUTPUT_LIMIT'
+                                break
+                            if chunk:
+                                buffers[key.data].extend(chunk)
+                            else:
+                                sel.unregister(key.fileobj)
+                        if failure:
+                            break
+                if failure is None:
+                    p.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                failure = 'TIMEOUT'
+            except (OSError, ValueError):
+                failure = 'COMMAND_FAILED'
+            finally:
+                if p.poll() is None:
+                    try:
+                        p.kill()
+                        p.wait(timeout=1)
+                    except (OSError, subprocess.TimeoutExpired):
+                        # Do not exit ahead of the outer group deadline if cleanup is unconfirmed.
+                        time.sleep(30)
+                        failure = 'CLEANUP_FAILED'
+                p.stdout.close()
+                p.stderr.close()
+            if failure:
+                return result('ERROR', failure)
+            return p.returncode, bytes(buffers[0]), bytes(buffers[1])
+
+        def parse(name, rc, out, err):
+            if len(out) + len(err) > LIMIT:
+                return result('ERROR', 'OUTPUT_LIMIT')
+            absent = ('package ' + name + ' is not installed\n').encode('ascii')
+            if rc == 1 and ((out == absent and not err) or (err == absent and not out)):
+                return result('ABSENT', 'PACKAGE_ABSENT')
+            if rc != 0 or err:
+                if b'Permission denied' in err:
+                    return result('PERMISSION_DENIED', 'PERMISSION_DENIED')
+                return result('ERROR', 'COMMAND_FAILED')
+            if not out:
+                return result('UNKNOWN', 'NO_DATA')
+            lines = out.splitlines(keepends=True)
+            if len(lines) > 32:
+                return result('ERROR', 'OUTPUT_LIMIT')
+            good, gap = set(), False
+            for line in lines:
+                try:
+                    row = tuple(line[:-1].decode('ascii').split('\t')) if line.endswith(b'\n') else ()
+                except UnicodeError:
+                    row = ()
+                if (len(row) != 4 or row[0] != name or
+                        not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+~^-]{0,127}', row[1]) or
+                        not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}', row[2]) or
+                        not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', row[3]) or row in good):
+                    gap = True
+                else:
+                    good.add(row)
+            if not good:
+                return result('ERROR', 'MALFORMED_OUTPUT')
+            return result('PARTIAL' if gap else 'COLLECTED', 'INCOMPLETE_RPM_ROWS' if gap else 'OK', sorted(good))
+
+        if __name__ == '__main__':
+            if len(sys.argv) != 2 or sys.argv[1] not in NAMES:
+                sys.exit(2)
+            name = sys.argv[1]
+            response = capture(['/usr/bin/rpm', '-q', '--queryformat',
+                                '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n', name])
+            print(json.dumps(response if isinstance(response, dict) else parse(name, *response),
+                             ensure_ascii=True, separators=(',', ':')))
+      - "{{ item }}"
+  environment:
+    LC_ALL: C
+  loop:
+    - oraclelinux-release
+    - oraclelinux-release-el9
+  become: false
+  register: pqc_platform_rpm_result
+  changed_when: false
+  ignore_errors: true
+  no_log: true
+  vars:
+    facts: "{{ pqc_platform_snapshot.facts }}"
+    rpm: "{{ pqc_platform_snapshot.tools.rpm[0] }}"
+    timer: "{{ pqc_platform_snapshot.tools.timeout[0] }}"
+  when:
+    - pqc_platform_snapshot.facts_state == 'OK'
+    - facts.distribution is string and facts.distribution | lower in ['oraclelinux', 'oracle linux', 'oracle-linux']
+    - facts.os_family is none or (facts.os_family is string and facts.os_family | lower == 'redhat')
+    - facts.distribution_version is string and facts.distribution_version is match('^9\\.(?:0|[1-9][0-9]{0,15})(?:\\.(?:0|[1-9][0-9]{0,15}))?\\Z')
+    - facts.distribution_version.split('.')[1] | int <= 9007199254740991
+    - facts.distribution_version.split('.')[-1] | int <= 9007199254740991
+    - facts.distribution_major_version is none or (facts.distribution_major_version is string and facts.distribution_major_version == '9') or (facts.distribution_major_version is integer and facts.distribution_major_version == 9)
+    - rpm.state == 'OK' and rpm.exists is sameas true and rpm.isreg is sameas true and rpm.islnk is sameas false and rpm.executable is sameas true
+    - timer.state == 'OK' and timer.exists is sameas true and timer.isreg is sameas true and timer.islnk is sameas false and timer.executable is sameas true
+
+- name: Project only bounded typed RPM results
+  ansible.builtin.set_fact:
+    pqc_platform_snapshot: >-
+      {{ pqc_platform_snapshot | combine({'rpms': {item.item: projected}}, recursive=true) }}
+    cacheable: false
+  vars:
+    projected: >-
+      {{ (dict(state='UNKNOWN', reason='TOOL_UNAVAILABLE', rows=[]) if item.rc | default(-1) == 127 else
+          dict(state='PERMISSION_DENIED', reason='PERMISSION_DENIED', rows=[]) if item.rc | default(-1) == 126 and
+          'Permission denied' in (item.stderr | default('')) else
+          dict(state='ERROR', reason=('TIMEOUT' if item.rc | default(-1) in [124, 137] else 'COMMAND_FAILED'), rows=[]))
+         if item.failed | default(false) else item.stdout | from_json }}
+  loop: "{{ pqc_platform_rpm_result.results | default([]) }}"
+  when: not item.skipped | default(false)
+  no_log: true
