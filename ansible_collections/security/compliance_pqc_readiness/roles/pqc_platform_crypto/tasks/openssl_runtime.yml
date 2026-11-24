@@ -1,0 +1,329 @@
+---
+# Internal tasks_from only. Caller supplies trusted #7 flags and #14 platform proof.
+# No public entry point; #8/#9 live dispatch remains unavailable.
+- name: Validate trusted OpenSSL runtime request
+  ansible.builtin.assert:
+    that:
+      - pqc_openssl_request is mapping
+      - pqc_openssl_request.keys() | list | sort == ['flags', 'platform_status']
+      - pqc_openssl_request.flags is mapping
+      - pqc_openssl_request.flags.keys() | list | sort == ['pqc_collect_openssl', 'pqc_collect_packages']
+      - pqc_openssl_request.flags.pqc_collect_openssl is boolean
+      - pqc_openssl_request.flags.pqc_collect_packages is boolean
+      - pqc_openssl_request.platform_status in ['UNVERIFIED', 'UNKNOWN', 'OUT_OF_SCOPE']
+  no_log: true
+  become: false
+
+- name: Initialize closed snapshot
+  ansible.builtin.set_fact:
+    pqc_openssl_snapshot:
+      flags: "{{ pqc_openssl_request.flags }}"
+      platform_status: "{{ pqc_openssl_request.platform_status }}"
+      slots: {}
+    cacheable: false
+  no_log: true
+  become: false
+
+- name: Check fixed timeout executable
+  ansible.builtin.stat:
+    path: /usr/bin/timeout
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: pqc_openssl_timer
+  ignore_errors: true
+  when: pqc_openssl_request.platform_status == 'UNVERIFIED' and (pqc_openssl_request.flags.pqc_collect_openssl or pqc_openssl_request.flags.pqc_collect_packages)
+  no_log: true
+  become: false
+
+- name: Check fixed system Python executable
+  ansible.builtin.stat:
+    path: /usr/bin/python3
+    follow: true
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: pqc_openssl_python
+  ignore_errors: true
+  when: pqc_openssl_request.platform_status == 'UNVERIFIED' and (pqc_openssl_request.flags.pqc_collect_openssl or pqc_openssl_request.flags.pqc_collect_packages)
+  no_log: true
+  become: false
+
+- name: Acquire fixed query slots with outer deadline
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - --signal=TERM
+      - --kill-after=2s
+      - 27s
+      - /usr/bin/python3
+      - -I
+      - -B
+      - -c
+      - |
+        import json
+        import os
+        import re
+        import selectors
+        import stat
+        import subprocess
+        import sys
+        import time
+
+        LIMIT = 16384
+        TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}\Z', re.ASCII)
+        ARCH = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}\Z', re.ASCII)
+        VERSION = re.compile(r'[0-9][A-Za-z0-9_.+-]{0,63}\Z', re.ASCII)
+        COMMANDS = {
+            'rpm-openssl': ['/usr/bin/rpm', '-q', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n', 'openssl'],
+            'rpm-openssl-libs': ['/usr/bin/rpm', '-q', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n', 'openssl-libs'],
+            'version': ['/usr/bin/openssl', 'version'],
+            'providers': ['/usr/bin/openssl', 'list', '-providers'],
+            'kem': ['/usr/bin/openssl', 'list', '-kem-algorithms'],
+            'signature': ['/usr/bin/openssl', 'list', '-signature-algorithms'],
+            'tls-groups': ['/usr/bin/openssl', 'list', '-tls-groups', '-tls1_3'],
+        }
+
+
+        def result(state, reason, rc=None, rows=None):
+            return dict(state=state, reason=reason, rc=rc, rows=[] if rows is None else rows)
+
+
+        def capture(argv, seconds=23):
+            # Private primitive; the entry point only accepts a fixed COMMANDS slot.
+            end = time.monotonic() + seconds
+            p = None
+            reason = None
+            output = [bytearray(), bytearray()]
+            try:
+                p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, shell=False, close_fds=True,
+                                     cwd='/', env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+                with selectors.DefaultSelector() as sel:
+                    for i, pipe in enumerate((p.stdout, p.stderr)):
+                        sel.register(pipe, selectors.EVENT_READ, i)
+                    while sel.get_map():
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            reason = 'TIMEOUT'
+                            break
+                        for key, _ in sel.select(remaining):
+                            room = LIMIT - sum(map(len, output))
+                            data = os.read(key.fd, min(4096, room + 1))
+                            if not data:
+                                sel.unregister(key.fileobj)
+                            elif len(data) > room:
+                                reason = 'OUTPUT_LIMIT'
+                                break
+                            else:
+                                output[key.data].extend(data)
+                        if reason:
+                            break
+                if reason is None:
+                    p.wait(timeout=max(0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                reason = 'TIMEOUT'
+            except PermissionError:
+                reason = 'PERMISSION_DENIED'
+            except FileNotFoundError:
+                reason = 'TOOL_UNAVAILABLE'
+            except OSError:
+                reason = 'EXECUTION_ERROR'
+            finally:
+                if p is not None:
+                    try:
+                        if p.poll() is None:
+                            p.kill()
+                        p.wait(timeout=1)
+                    except (OSError, subprocess.TimeoutExpired):
+                        # Do not allow another slot to begin after unconfirmed cleanup.
+                        # The enclosing GNU timeout kills the helper/process group.
+                        time.sleep(30)
+                        reason = 'CLEANUP_UNCONFIRMED'
+                    finally:
+                        p.stdout.close()
+                        p.stderr.close()
+            return reason, p.returncode if p is not None else None, bytes(output[0]), bytes(output[1])
+
+
+        def parse(slot, rc, out, err):
+            if len(out) + len(err) > LIMIT:
+                return result('ERROR', 'OUTPUT_LIMIT', rc)
+            if slot.startswith('rpm-') and rc == 1:
+                absent = ('package ' + slot[4:] + ' is not installed\n').encode('ascii')
+                if (out, err) in ((absent, b''), (b'', absent)):
+                    return result('COLLECTED', 'PACKAGE_ABSENT', rc, [[slot[4:], None, None, None]])
+            if rc != 0 or err:
+                if b'Permission denied' in err:
+                    return result('PERMISSION_DENIED', 'PERMISSION_DENIED', rc)
+                if slot not in ('version', 'rpm-openssl', 'rpm-openssl-libs') and any(
+                        err.startswith(p) for p in (b'list: Unknown option:', b'list: Unrecognized option:', b'list: Use -help')):
+                    return result('UNKNOWN', 'UNSUPPORTED_FLAG', rc)
+                return result('ERROR', 'COMMAND_FAILED', rc)
+            if not out:
+                return result('UNKNOWN', 'NO_OUTPUT', rc)
+            if not out.endswith(b'\n'):
+                return result('ERROR', 'INCOMPLETE_OUTPUT', rc)
+            try:
+                lines = out.decode('ascii').split('\n')[:-1]
+            except UnicodeError:
+                return result('ERROR', 'INVALID_ENCODING', rc)
+            if any(any(ord(c) < 32 and c != '\t' or ord(c) == 127 for c in line) for line in lines):
+                return result('ERROR', 'INVALID_ENCODING', rc)
+            cap = 32 if slot.startswith('rpm-') else 256
+            if len(lines) > (cap if slot.startswith('rpm-') else cap * 5 + 1 if slot == 'providers' else cap + 2):
+                return result('ERROR', 'ROW_LIMIT', rc)
+            rows = []
+            gap = False
+            if slot.startswith('rpm-'):
+                for line in lines:
+                    parts = line.split('\t')
+                    if len(parts) == 4 and parts[0] == slot[4:] and all(TOKEN.fullmatch(x) for x in parts[:3]) and ARCH.fullmatch(parts[3]):
+                        rows.append(parts)
+                    else:
+                        gap = True
+            elif slot == 'version':
+                m = re.fullmatch(r'OpenSSL ([0-9][A-Za-z0-9_.+-]{0,63})(?: +FIPS)?(?: +[0-9]{1,2} [A-Za-z]{3} [0-9]{4})?(?: \(Library: OpenSSL ([0-9][A-Za-z0-9_.+-]{0,63})(?: +FIPS)?(?: +[0-9]{1,2} [A-Za-z]{3} [0-9]{4})?\))?', '\n'.join(lines))
+                if m:
+                    rows = [[m[1], m[2]]]
+                else:
+                    gap = True
+            elif slot == 'providers':
+                if not lines or lines[0] != 'Providers:':
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                blocks = []
+                current = None
+                for line in lines[1:]:
+                    m = re.fullmatch(r'  ([A-Za-z0-9][A-Za-z0-9_.+-]{0,127})', line)
+                    if m:
+                        current = {}
+                        blocks.append([m[1], current])
+                    elif current is not None and (m := re.fullmatch(r'    (name|version|status|build info): (.{1,512})', line)):
+                        fields = current
+                        if m[1] in fields:
+                            fields['invalid'] = True
+                        fields[m[1]] = m[2]
+                    else:
+                        gap = True
+                        if current is not None and line.startswith('    '):
+                            current['invalid'] = True
+                        current = None
+                counts = {}
+                for name, fields in blocks:
+                    counts[name] = counts.get(name, 0) + 1
+                for name, fields in blocks:
+                    ver, status = fields.get('version'), fields.get('status')
+                    if counts[name] != 1 or fields.get('invalid') or (ver is not None and not VERSION.fullmatch(ver)) or status not in (None, 'active', 'inactive'):
+                        gap = True
+                        continue
+                    if ver is None or status is None:
+                        gap = True
+                    rows.append([name, ver, status])
+            elif slot in ('kem', 'signature'):
+                # Provider-attributed forms only. Legacy/unknown headers are gaps, not proof.
+                header = {'kem': ('KEM Algorithms:', 'Provided:'), 'signature': ('Signature Algorithms:', 'Provided:')}[slot]
+                for line in lines:
+                    line = line.strip()
+                    if not line or line in header:
+                        continue
+                    m = re.fullmatch(r'(\{ [^{}]{1,4096} \}|[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}) @ ([A-Za-z0-9][A-Za-z0-9_.+-]{0,127})', line)
+                    if not m:
+                        gap = True
+                        continue
+                    aliases = m[1][2:-2].split(', ') if m[1].startswith('{') else [m[1]]
+                    if len(aliases) > 32:
+                        return result('ERROR', 'ROW_LIMIT', rc)
+                    # Alias rows are atomic: removing malformed names can hide
+                    # ambiguity and turn another alias into false L2 evidence.
+                    if not all(TOKEN.fullmatch(x) for x in aliases):
+                        gap = True
+                        continue
+                    good = sorted(set(aliases))
+                    if len(good) != len(aliases):
+                        gap = True
+                    rows.append([m[2], good])
+            else:
+                # OpenSSL -tls-groups -tls1_3 emits a colon list; accept explicit headers too.
+                if lines[0] in ('TLS 1.3 groups:', 'TLS1.3 groups:', 'TLS groups:'):
+                    lines = lines[1:]
+                for line in lines:
+                    names = line.strip().split(':')
+                    if all(TOKEN.fullmatch(x) for x in names):
+                        rows.extend([[None, [x]] for x in names])
+                    else:
+                        gap = True
+            if len(rows) > cap:
+                return result('ERROR', 'ROW_LIMIT', rc)
+            unique = {json.dumps(row, sort_keys=True, separators=(',', ':')): row for row in rows}
+            if len(unique) != len(rows):
+                gap = True
+            if sum(len(k) for k in unique) > 32768:
+                return result('ERROR', 'OUTPUT_LIMIT', rc)
+            if not unique:
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT' if gap else 'NO_OUTPUT', rc)
+            return result('PARTIAL' if gap else 'COLLECTED', 'FORMAT_GAP' if gap else 'OK', rc,
+                          [unique[k] for k in sorted(unique)])
+
+
+        def run_slot(slot):
+            argv = COMMANDS[slot]
+            try:
+                mode = os.stat(argv[0], follow_symlinks=False).st_mode
+                if not stat.S_ISREG(mode) or not os.access(argv[0], os.X_OK):
+                    return result('UNKNOWN', 'TOOL_UNAVAILABLE')
+            except FileNotFoundError:
+                return result('UNKNOWN', 'TOOL_UNAVAILABLE')
+            except PermissionError:
+                return result('PERMISSION_DENIED', 'PERMISSION_DENIED')
+            except OSError:
+                return result('ERROR', 'EXECUTION_ERROR')
+            reason, rc, out, err = capture(argv)
+            if reason:
+                state = 'PERMISSION_DENIED' if reason == 'PERMISSION_DENIED' else 'UNKNOWN' if reason == 'TOOL_UNAVAILABLE' else 'ERROR'
+                return result(state, reason, rc)
+            return parse(slot, rc, out, err)
+
+
+        if __name__ == '__main__':
+            if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+                sys.exit(2)
+            print(json.dumps(run_slot(sys.argv[1]), ensure_ascii=True, separators=(',', ':')))
+      - "{{ item.slot }}"
+    expand_argument_vars: false
+  loop:
+    - {slot: rpm-openssl, flag: pqc_collect_packages}
+    - {slot: rpm-openssl-libs, flag: pqc_collect_packages}
+    - {slot: version, flag: pqc_collect_openssl}
+    - {slot: providers, flag: pqc_collect_openssl}
+    - {slot: kem, flag: pqc_collect_openssl}
+    - {slot: signature, flag: pqc_collect_openssl}
+    - {slot: tls-groups, flag: pqc_collect_openssl}
+  register: pqc_openssl_queries
+  when:
+    - pqc_openssl_request.flags[item.flag]
+    - pqc_openssl_request.platform_status == 'UNVERIFIED'
+    - pqc_openssl_timer.stat.isreg | default(false)
+    - pqc_openssl_timer.stat.executable | default(false)
+    - pqc_openssl_python.stat.isreg | default(false)
+    - pqc_openssl_python.stat.executable | default(false)
+  changed_when: false
+  ignore_errors: true
+  no_log: true
+  become: false
+
+- name: Project each fixed slot without raw output
+  ansible.builtin.set_fact:
+    pqc_openssl_snapshot: "{{ pqc_openssl_snapshot | combine({'slots': {item.item.slot: slot_value}}, recursive=true) }}"
+    cacheable: false
+  vars:
+    skipped_state: "{{ 'NOT_SCANNED' if not pqc_openssl_request.flags[item.item.flag] else ('NOT_APPLICABLE' if pqc_openssl_request.platform_status == 'OUT_OF_SCOPE' else 'UNKNOWN') }}"
+    skipped_reason: "{{ 'DISABLED_BY_USER' if not pqc_openssl_request.flags[item.item.flag] else ('PLATFORM_OUT_OF_SCOPE' if pqc_openssl_request.platform_status == 'OUT_OF_SCOPE' else ('PLATFORM_UNRESOLVED' if pqc_openssl_request.platform_status == 'UNKNOWN' else 'TOOL_UNAVAILABLE')) }}"
+    slot_value: >-
+      {{ {'state': skipped_state, 'reason': skipped_reason, 'rc': none, 'rows': []}
+         if item.skipped | default(false) else
+         ((item.stdout | from_json) if item.rc | default(-1) == 0 else
+          {'state': 'ERROR', 'reason': 'OUTER_DEADLINE' if item.rc | default(-1) in [124, 137] else 'HELPER_ERROR', 'rc': none, 'rows': []}) }}
+  loop: "{{ pqc_openssl_queries.results }}"
+  no_log: true
+  become: false
