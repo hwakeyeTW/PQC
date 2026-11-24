@@ -4,16 +4,11 @@ name: Collection Tests
 on:
   push:
     branches: [main]
-    paths:
-      - 'ansible_collections/**'
-      - 'plugins/**'
-      - 'roles/**'
   pull_request:
     branches: [main]
-    paths:
-      - 'ansible_collections/**'
-      - 'plugins/**'
-      - 'roles/**'
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,33 +16,394 @@ concurrency:
 
 jobs:
   tests:
-    name: "Tests (ansible-core ${{ matrix.ansible }})"
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.lane }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        ansible: ['2.17', '2.18']
+        include:
+          - lane: legacy-217
+            python: '3.11.15'
+            python_minor: '3.11'
+            core: '2.17.14'
+            pytest: '9.0.2'
+            lint: ''
+            requirements: collections/requirements-ci-legacy.yml
+          - lane: legacy-218
+            python: '3.11.15'
+            python_minor: '3.11'
+            core: '2.18.15'
+            pytest: '9.0.2'
+            lint: ''
+            requirements: collections/requirements-ci-legacy.yml
+          - lane: maintained-221
+            python: '3.12.14'
+            python_minor: '3.12'
+            core: '2.21.5'
+            pytest: '9.0.2'
+            lint: '26.8.0'
+            requirements: collections/requirements-ci.yml
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_PYTHON: ${{ matrix.python }}
+      CI_PYTHON_MINOR: ${{ matrix.python_minor }}
+      CI_CORE: ${{ matrix.core }}
+      CI_PYTEST: ${{ matrix.pytest }}
+      CI_LINT: ${{ matrix.lint }}
+      CI_REQUIREMENTS: ${{ github.workspace }}/${{ matrix.requirements }}
+      CI_EXPECTED_SHA: ${{ github.sha }}
+      CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      CI_COLLECTION: ansible_collections/security/compliance_pqc_readiness
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_TERMINAL_PROMPT: '0'
+      GIT_LFS_SKIP_SMUDGE: '1'
+      PYTHONNOUSERSITE: '1'
+      PYTHONPATH: ''
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PIP_CONFIG_FILE: /dev/null
+      PIP_EXTRA_INDEX_URL: ''
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PIP_NO_CACHE_DIR: '1'
+      ANSIBLE_COLLECTIONS_SCAN_SYS_PATH: 'False'
+      ANSIBLE_COLLECTIONS_ON_ANSIBLE_VERSION_MISMATCH: error
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install ansible-core and test deps
+      - name: Preflight Git and isolated runner
         run: |
-          pip install "ansible-core~=${{ matrix.ansible }}.0" pytest community.crypto
-          pip install ansible-lint
+          set -euo pipefail
+          umask 077
+          git --no-lazy-fetch --version
+          command -v python3
+          test ! -e .git
+          ci_root=$(mktemp -d "$RUNNER_TEMP/pqc-ci.XXXXXX")
+          mkdir "$ci_root/home" "$ci_root/xdg-config" "$ci_root/xdg-cache"
+          touch "$ci_root/gitconfig"
+          export GIT_CONFIG_GLOBAL="$ci_root/gitconfig"
+          export HOME="$ci_root/home"
+          # Check protocol v2 filter support before a fetch can transfer blobs.
+          # The repository is public. Do not print the packet trace.
+          GIT_TRACE_PACKET="$ci_root/protocol.log" git -c protocol.version=2 ls-remote \
+            --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" HEAD >/dev/null
+          grep -Eq 'fetch=.*[[:space:]]filter([[:space:]]|$)' "$ci_root/protocol.log"
+          {
+            printf 'CI_ROOT=%s\nHOME=%s\nGIT_CONFIG_GLOBAL=%s\n' "$ci_root" "$HOME" "$GIT_CONFIG_GLOBAL"
+            printf 'XDG_CONFIG_HOME=%s\nXDG_CACHE_HOME=%s\n' "$ci_root/xdg-config" "$ci_root/xdg-cache"
+          } >> "$GITHUB_ENV"
+          printf 'image=%s %s event=%s tested=%s head=%s base=%s\n' \
+            "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$GITHUB_EVENT_NAME" \
+            "$CI_EXPECTED_SHA" "$CI_HEAD_SHA" "$CI_BASE_SHA"
 
-      - name: Run ansible-test sanity
-        working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-test sanity --docker --python 3.11 plugins/ 2>&1 || true
+      # checkout v6.0.2: sparse-checkout alone selects a blob:none fetch.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          fetch-tags: false
+          lfs: false
+          submodules: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/workflows/collection-tests.yml
+            /.gitignore
+            /README.md
+            /ansible.cfg
+            /reports/.gitignore
+            /roles/
+            /plugins/
+            /playbooks/
+            /ansible_collections/security/compliance_pqc_readiness/
+            /tools/
+            /tests/
+            /schema/
+            /schemas/
+            /docs/development/
+            /collections/requirements-ci-legacy.yml
+            /collections/requirements-ci.yml
 
-      - name: Run unit tests
-        working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-test units --docker --python 3.11 2>&1 || pytest tests/unit/ -v
+      - name: Verify sparse checkout and absent private objects
+        id: checkout_guard
+        run: |
+          set -euo pipefail
+          cat > "$CI_ROOT/verify-checkout.py" <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
 
-      - name: Run ansible-lint
+          def git(*args, data=None):
+              return subprocess.run(
+                  ["git", "--no-lazy-fetch", *args], input=data,
+                  stdout=subprocess.PIPE, check=True,
+              ).stdout
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          def config(key, default=None):
+              args = ["config", "--local"]
+              if default is not None:
+                  args += ["--default", default]
+              return git(*args, "--get", key).decode().strip()
+
+          require(git("rev-parse", "HEAD").decode().strip() == os.environ["CI_EXPECTED_SHA"],
+                  "unexpected tested SHA")
+          require(config("remote.origin.promisor") == "true", "not a partial checkout")
+          require(config("remote.origin.partialclonefilter") == "blob:none", "wrong filter")
+          require(config("core.sparseCheckout") == "true", "sparse checkout disabled")
+          require(config("core.sparseCheckoutCone", "false") == "false", "cone mode forbidden")
+          exact = {".github/workflows/collection-tests.yml", ".gitignore", "README.md",
+                   "ansible.cfg", "reports/.gitignore", "collections/requirements-ci-legacy.yml",
+                   "collections/requirements-ci.yml"}
+          collection = os.environ["CI_COLLECTION"] + "/"
+          prefixes = ("roles/", "plugins/", "playbooks/", collection, "tools/", "tests/",
+                      "schema/", "schemas/", "docs/development/")
+          required = exact | {"docs/development/qa.md", "playbooks/crypto_posture_snapshot.yml",
+                              "playbooks/pqc_pipeline.yml", collection + "playbooks/pqc_pipeline.yml",
+                              collection + "galaxy.yml", collection + "meta/runtime.yml"}
+          domains = ("roles/", "plugins/", collection + "roles/", collection + "plugins/",
+                     collection + "tests/unit/")
+          index = {}
+          for record in git("ls-files", "-t", "-z").split(b"\0"):
+              if record:
+                  flag, path = os.fsdecode(record).split(" ", 1)
+                  index[path] = flag
+          included, private_objects = set(), set()
+          for record in git("ls-tree", "-r", "-z", "HEAD").split(b"\0"):
+              if not record:
+                  continue
+              meta, path = os.fsdecode(record).split("\t", 1)
+              mode, kind, oid = meta.split()
+              if path in exact or path.startswith(prefixes):
+                  require(kind == "blob" and mode in {"100644", "100755"}, "non-regular source")
+                  require(index.get(path) == "H" and Path(path).is_file() and not Path(path).is_symlink(),
+                          "required source is not materialized")
+                  included.add(path)
+              else:
+                  require(index.get(path) == "S" and not os.path.lexists(path),
+                          "excluded path is materialized")
+                  if path == "reports.tar.xz" or path.startswith("inventory/"):
+                      private_objects.add(oid)
+          require(required <= included, "required input missing")
+          require(all(any(p.startswith(d) for p in included) for d in domains), "incomplete source domain")
+          require(not os.path.lexists("reports.tar.xz") and not os.path.lexists("inventory"),
+                  "private path exists")
+          # Batch metadata queries explicitly disable lazy fetch; missing is the oracle.
+          if private_objects:
+              ids = sorted(private_objects)
+              output = git("cat-file", "--batch-check=%(objectname) %(objecttype)",
+                           data=("\n".join(ids) + "\n").encode()).decode().splitlines()
+              require(output == [oid + " missing" for oid in ids], "private blob present or lookup failed")
+          print(f"checkout verified: {len(included)} source files; {len(private_objects)} private objects absent")
+          PY
+          python3 "$CI_ROOT/verify-checkout.py"
+          printf 'GIT_NO_LAZY_FETCH=1\n' >> "$GITHUB_ENV"
+
+      # setup-python v6.2.0; the exact patch is part of the lane contract.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python }}
+          check-latest: false
+
+      - name: Create isolated test environment
+        run: |
+          set -euo pipefail
+          umask 077
+          python -c 'import os, platform; v = platform.python_version(); print(v); raise SystemExit(v != os.environ["CI_PYTHON"])'
+          python -m venv "$CI_ROOT/venv"
+          mkdir "$CI_ROOT/collections" "$CI_ROOT/ansible-tmp"
+          printf '[pqc_targets]\nlocalhost ansible_connection=local\n' > "$CI_ROOT/inventory.ini"
+          printf '%s\n' "$CI_ROOT/venv/bin" >> "$GITHUB_PATH"
+          {
+            printf 'CI_COLLECTIONS=%s\n' "$CI_ROOT/collections"
+            printf 'SYNTHETIC_INVENTORY=%s\nANSIBLE_INVENTORY=%s\n' "$CI_ROOT/inventory.ini" "$CI_ROOT/inventory.ini"
+            printf 'ANSIBLE_CONFIG=%s\n' "$GITHUB_WORKSPACE/ansible.cfg"
+            printf 'ANSIBLE_COLLECTIONS_PATH=%s:%s\n' "$GITHUB_WORKSPACE" "$CI_ROOT/collections"
+            printf 'ANSIBLE_ROLES_PATH=%s\nANSIBLE_LIBRARY=%s\n' "$GITHUB_WORKSPACE/roles" "$GITHUB_WORKSPACE/plugins/modules"
+            printf 'ANSIBLE_LOCAL_TEMP=%s\n' "$CI_ROOT/ansible-tmp"
+          } >> "$GITHUB_ENV"
+          cat > "$CI_ROOT/verify-junit.py" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          cases = root.findall(".//testcase")
+          if root.tag not in {"testsuite", "testsuites"} or not suites or not cases:
+              raise SystemExit("empty or invalid JUnit report")
+          if sum(int(s.attrib["tests"]) for s in suites) != len(cases):
+              raise SystemExit("JUnit case count mismatch")
+          for suite in suites:
+              if any(int(suite.attrib[k]) != 0 for k in ("failures", "errors", "skipped")):
+                  raise SystemExit("required unit case failed, errored or skipped")
+          if any(c.find(k) is not None for c in cases for k in ("failure", "error", "skipped")):
+              raise SystemExit("required unit case did not pass")
+          print(f"JUnit verified: {len(cases)} cases passed, no failures/errors/skips")
+          PY
+
+      - name: Install and verify pinned CI dependencies
+        id: install
+        run: |
+          set -euo pipefail
+          packages=("ansible-core==$CI_CORE" "pytest==$CI_PYTEST")
+          if [[ -n "$CI_LINT" ]]; then
+            packages+=("ansible-lint==$CI_LINT")
+          fi
+          python -m pip install --index-url https://pypi.org/simple "${packages[@]}"
+          python -m pip check
+          python -m pip freeze
+          ansible-galaxy collection install -r "$CI_REQUIREMENTS" -p "$CI_COLLECTIONS" \
+            --server https://galaxy.ansible.com/
+          python - <<'PY'
+          from importlib.metadata import version
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          import yaml
+          from packaging.specifiers import SpecifierSet
+          from ansible import constants as C
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          root = Path.cwd().resolve()
+          deps = Path(os.environ["CI_COLLECTIONS"])
+          pins = {"ansible-core": os.environ["CI_CORE"], "pytest": os.environ["CI_PYTEST"]}
+          if os.environ["CI_LINT"]:
+              pins["ansible-lint"] = os.environ["CI_LINT"]
+          require(platform.python_version() == os.environ["CI_PYTHON"], "wrong Python")
+          for name, pin in pins.items():
+              require(version(name) == pin, f"wrong version: {name}")
+          requirements = yaml.safe_load(Path(os.environ["CI_REQUIREMENTS"]).read_text())["collections"]
+          expected = {r["name"]: r["version"] for r in requirements}
+          installed = {}
+          for manifest in (deps / "ansible_collections").glob("*/*/MANIFEST.json"):
+              info = json.loads(manifest.read_text())["collection_info"]
+              name = info["namespace"] + "." + info["name"]
+              require(name not in installed, "duplicate collection")
+              installed[name] = info["version"]
+              runtime = yaml.safe_load((manifest.parent / "meta/runtime.yml").read_text())
+              require(pins["ansible-core"] in SpecifierSet(runtime["requires_ansible"]),
+                      f"incompatible collection: {name}")
+              print(f"Galaxy: {name} {info['version']} dependencies={info.get('dependencies', {})}")
+          require(installed == expected, "installed collections differ from CI pins")
+          require(C.COLLECTIONS_PATHS == [str(root), str(deps)], "wrong collection search path")
+          require(not C.COLLECTIONS_SCAN_SYS_PATH, "system collection search enabled")
+          require(C.DEFAULT_ROLES_PATH == [str(root / "roles")], "wrong role path")
+          require(C.DEFAULT_MODULE_PATH == [str(root / "plugins/modules")], "wrong module path")
+          require(C.DEFAULT_HOST_LIST == [os.environ["SYNTHETIC_INVENTORY"]], "wrong inventory")
+          text = subprocess.check_output(["ansible", "--version"], text=True)
+          require(f"config file = {root / 'ansible.cfg'}" in text, "wrong config file")
+          print(text.strip())
+          collection = "security.compliance_pqc_readiness"
+          files = subprocess.check_output(["ansible-doc", "-t", "module", "-F", collection], text=True)
+          found = dict(line.split(None, 1) for line in files.splitlines() if line.strip())
+          for module in ("normalize_pqc", "generate_cbom"):
+              expected_path = root / os.environ["CI_COLLECTION"] / "plugins/modules" / (module + ".py")
+              require(Path(found.get(collection + "." + module, "")).resolve() == expected_path,
+                      "candidate module loader mismatch")
+          print("candidate config, inventory and collection loader verified")
+          PY
+
+      - name: Synthetic failure-oracle checks
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          root = Path(os.environ["CI_ROOT"]) / "oracle"
+          root.mkdir()
+          guard = root.parent / "verify-junit.py"
+          cases = {
+              "pass": ("def test_ok():\n    assert True\n", 0, 0),
+              "fail": ("def test_bad():\n    assert False\n", 1, 1),
+              "skip": ("import pytest\n@pytest.mark.skip\ndef test_skip():\n    pass\n", 0, 1),
+              "empty": ("# intentionally no tests\n", 5, 5),
+          }
+          for label, (source, pytest_rc, gate_rc) in cases.items():
+              folder = root / label
+              folder.mkdir()
+              test = folder / "test_synthetic.py"
+              test.write_text(source)
+              xml = folder / "unit.xml"
+              result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs",
+                                       f"--junitxml={xml}", str(test)], cwd=folder)
+              if result.returncode != pytest_rc:
+                  raise SystemExit(f"unexpected pytest rc for {label}: {result.returncode}")
+              actual = result.returncode
+              if actual == 0:
+                  actual = subprocess.run([sys.executable, str(guard), str(xml)]).returncode
+              if actual != gate_rc:
+                  raise SystemExit(f"unexpected gate rc for {label}: {actual}")
+              print(f"synthetic {label}: pytest={pytest_rc} gate={actual}")
+          good = root / "good.yml"
+          bad = root / "bad.yml"
+          good.write_text("---\n- name: Synthetic play\n  hosts: pqc_targets\n  gather_facts: false\n"
+                          "  tasks:\n    - name: Display synthetic text\n      ansible.builtin.debug:\n        msg: synthetic\n")
+          bad.write_text("---\n- hosts: [\n")
+          cmd = ["ansible-playbook", "-i", os.environ["SYNTHETIC_INVENTORY"], "--syntax-check"]
+          subprocess.run(cmd + [str(good)], check=True, cwd=root)
+          rc = subprocess.run(cmd + [str(bad)], cwd=root).returncode
+          if rc <= 0:
+              raise SystemExit("invalid YAML did not produce a normal nonzero exit")
+          print(f"synthetic invalid YAML: syntax rc={rc}")
+          if os.environ["CI_LINT"]:
+              unnamed = root / "unnamed.yml"
+              unnamed.write_text("---\n- hosts: pqc_targets\n  gather_facts: false\n"
+                                 "  tasks:\n    - ansible.builtin.debug:\n        msg: synthetic\n")
+              subprocess.run(["ansible-lint", "--offline", str(good)], check=True, cwd=root)
+              result = subprocess.run(["ansible-lint", "--offline", str(unnamed)], cwd=root,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout)
+              if result.returncode <= 0 or "name[" not in result.stdout:
+                  raise SystemExit("expected lint naming violation not observed")
+              print(f"synthetic naming violation: lint rc={result.returncode}")
+          PY
+
+      # Status-function conditions keep independent checks running after another
+      # check fails; a failed step still fails its job. Never swallow failures.
+      - name: Collection unit tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs --junitxml="$CI_ROOT/collection-unit.xml" "$CI_COLLECTION/tests/unit/"
+          python "$CI_ROOT/verify-junit.py" "$CI_ROOT/collection-unit.xml"
+
+      - name: Standalone snapshot syntax
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ansible-playbook -i "$SYNTHETIC_INVENTORY" --syntax-check playbooks/crypto_posture_snapshot.yml
+
+      - name: Standalone pipeline syntax
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ansible-playbook -i "$SYNTHETIC_INVENTORY" --syntax-check playbooks/pqc_pipeline.yml
+
+      - name: Collection pipeline syntax
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ansible-playbook -i "$SYNTHETIC_INVENTORY" --syntax-check ansible_collections/security/compliance_pqc_readiness/playbooks/pqc_pipeline.yml
+
+      - name: Collection plugin sanity
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-lint playbooks/ roles/ 2>&1 || true
+        run: |
+          set -euo pipefail
+          docker version --format '{{.Server.Version}}'
+          ansible-test sanity --docker --python "$CI_PYTHON_MINOR" plugins/
+
+      - name: Collection lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.lane == 'maintained-221' }}
+        working-directory: ansible_collections/security/compliance_pqc_readiness
+        run: ansible-lint --offline playbooks/ roles/
+
+      - name: Recheck data boundary
+        if: ${{ !cancelled() && steps.checkout_guard.outcome == 'success' }}
+        run: python3 "$CI_ROOT/verify-checkout.py"
