@@ -305,3 +305,80 @@ fixture parsing and baseline runtime checks are BLOCKED in this environment.
 No product runtime source, Controller setting, production inventory or original
 report is changed. Review all staged bytes under #2; owner approval of this
 copy is not approval of arbitrary original data. Issue #3 remains HOLD.
+
+## Review R1 correction: fixture-specific effective inventory oracle
+
+FORMAL_REQUIREMENT for #3 tests only: a successful raw process rc is not
+proof that inventory parsing succeeded. The isolated Ansible subprocess
+enables ANSIBLE_INVENTORY_ANY_UNPARSED_IS_FAILED=true and
+ANSIBLE_INVENTORY_UNPARSED_FAILED=true, with explicit candidate config,
+script-only plugin, temporary HOME/XDG, UTF-8, bounded timeout and no inherited
+caller parse flags or package Proxy variables. Reject targeted parse-failure
+diagnostics even at rc0; unrelated warnings need not be fatal. Retain actual
+stderr evidence in the isolated test logs; do not suppress warnings or invent
+native output. Neither the production configuration nor provider is changed.
+
+For effective --list, require explicit _meta and hostvars objects, expected
+hostvars keys, group objects and typed hosts/children (and vars when present).
+Validate fixture group names, references, reachability/cycles and the union
+of hosts across every group, not only pqc_targets. Zero-host mode requires
+empty hostvars and a zero global host union, including ungrouped or unlinked
+entries. It rejects {} and unexpected groups/hosts, including implicit
+localhost as a target. The ansible-core v2.18.3 JSON formatter removes empty
+keys and entries, and the inventory data initializes all -> ungrouped;
+therefore known empty group entries may be absent even when referenced.
+Bounded synthetic empty variants permit all with ungrouped and optional
+pqc_targets, with only consistent empty group entries/references. Native
+version-specific output remains to be verified; no claim that every synthetic
+variant was emitted by Ansible. Nonempty effective results must preserve the
+original topology, overlap and host/group precedence checks. Raw unknown
+--host={} is still valid; this is not a production inventory parser/schema.
+
+Native negative checks use disposable synthetic executable providers in temp
+storage only, not extra repository files: invalid JSON and nonzero --list
+must give an actual nonzero ansible-inventory rc and parse-failure diagnostics.
+Actual fatal configuration, legal empty and all required native tests remain
+BLOCKED in the correction environment; see baseline.md. QA must verify
+inline _meta and lookup per-host fallback invocation trace using a synthetic
+wrapper only. No change to either fixture or the historical PoC/Legacy samples.
+
+## FORMAL_REQUIREMENT: offline-first deployment and runtime (R2)
+
+Source: [Owner deployment-source supplement R2](https://github.com/hwakeyeTW/PQC/issues/1#issuecomment-7125166664).
+This is a formal product boundary, not OBSERVED_POC behavior. Keep development,
+CI, authorized deployment and production runtime separate. Prefer existing
+verified compatible dependencies. Necessary Controller Python/RPM dependencies
+may be obtained only in a separately approved deployment phase using the
+existing approved Proxy to PyPI/official Oracle Linux RPM sources or approved
+local artifacts; do not change existing settings or trust. Collections must
+support local offline installation with fixed necessary transitive closure,
+verified artifact provenance/checksums and actual loader/compatibility checks,
+without Galaxy resolution or downloads. Missing packages stop the relevant
+approved deployment; no external fallback or automatic installation/update.
+Source permission does not prove availability or successful installation.
+Full wheels/RPM bundles or new mirror services are not mandatory.
+
+Runtime scan, plan-only, collector, evidence evaluation, legacy import,
+report generation, CBOM, Schema validation (including transitive references),
+Portal and historical analysis must not depend on public DNS/HTTP(S), public
+Internet, external assets, package Proxy, automatic downloads/installs/updates,
+external fallback or telemetry. The existence of Proxy configuration does not
+authorize runtime use. Preserve existing authorized internal Inventory, DB,
+SSH/ProxyJump and explicitly authorized service endpoints; do not overwrite
+operational configuration or block legitimate internal traffic. Necessary
+Controller capability/loader missing -> preflight BLOCKED; optional managed
+host tool missing -> explicit Coverage/Evidence state, never install RPMs
+on managed hosts. Baseline/Extended/Active authorization and budgets remain.
+
+PLANNED_DESIGN (not implemented in #3): #6 verifies actual local capabilities
+and loader during preflight; #7 enforces profiles/network boundary; #8 retains
+terminal states; #19/#26/#27 use local Portal resources/Schema and offline
+browser validation; #28 performs separate deployment and zero-public-egress
+runtime acceptance. #5 owns development CI and offline regression integration;
+OFFLINE-DELIVERY remains proposed/pending approval (no new installer, bundle,
+manifest, issue or dependency changes here). #41/#45 retain the same release
+boundary. Test permitted deployment sources and local Collection installation
+with full dependency closure in an authorized isolated environment; verify
+runtime with blocked direct/Proxy public egress and no product-originated
+public requests while permitted internal connections still work. Neither the
+source capability nor actual offline runtime has been tested in this correction.

@@ -187,3 +187,100 @@ results; do not make them green by skipping requirements or changing source.
 #5 owns CI integration and safe acquisition. B07/B11 and full B10 are not
 complete. #3 remains HOLD pending required tests, independent review/QA,
 CI gate and Owner decision; neither intake nor a Draft PR proves readiness.
+
+## Review R1 correction and deployment-source contract (2026-11-24)
+
+Authority: [F-R1-01 review](https://github.com/hwakeyeTW/PQC/pull/49#pullrequestreview-6035267423),
+[correction dispatch](https://github.com/hwakeyeTW/PQC/issues/3#issuecomment-7125234125),
+[offline source policy R2](https://github.com/hwakeyeTW/PQC/issues/1#issuecomment-7125166664).
+The earlier source and test records above remain historical evidence. Fixed
+R1 parent is f87ef0ebd83e89dedea888bfd5cac9dbc4c92088 (tree
+8d7a0adad607c24ace6f1692a3649f4f8122f3fb); original base B remains
+95c0d6512c69cadf8b0cd3131d88a043b4885425. Actual main M is
+596c5c7fae7ee0b2d3874a59c25e073cdbb0735d (tree
+73f2c4691d814008c7a154b8a721d6e071283578), with #4 merged. B to M adds
+three nonoverlapping paths; B to R1 adds five. No rebase or main merge
+into this branch. A new native integration test merge and its QA remain
+required; the old test merge is not evidence for M.
+
+### Deployment source classes (FORMAL_REQUIREMENT, not tested availability)
+
+| Class | Meaning and observed state |
+|---|---|
+| INSTALLED | Prefer already installed, compatible dependencies. Owner-attested listing above is installed evidence only; actual resolved versions and loader/closure remain UNKNOWN. |
+| APPROVED_PROXY_PACKAGE_SOURCE | During separately authorized deployment only, existing approved Proxy may supply necessary Controller Python dependencies from PyPI and RPMs from official Oracle Linux repositories, if available. Authorization is not reachability or package availability; both NOT_TESTED. |
+| LOCAL_COLLECTION_ARTIFACT | Collections must support local offline installation of versioned tarballs and complete necessary transitive Collection dependencies, with trusted source, integrity/checksum manifest and verified loader. Actual local artifacts, closure and offline install are UNKNOWN/NOT_TESTED. No required public Galaxy access. |
+| UNAVAILABLE | An identified dependency/source absent or inaccessible in the tested environment; do not substitute an unapproved source. The isolated test environment lacks Ansible; this is not evidence of a missing Owner Controller dependency. |
+| UNKNOWN | No sufficient approved evidence about availability, installed or resolved version, source, or actual compatibility. Do not treat declarations as installed or available. |
+
+Approved local wheels/RPMs are optional deployment alternatives, not a
+mandatory full bundle on every release. Verify versions, platform, complete
+necessary dependencies and trust; preserve TLS/GPG validation. Do not change
+Proxy, CA, pip/DNF/repository settings, add mirrors, bypass restrictions,
+install/update automatically or modify the Controller/managed hosts. Do not
+blindly install development CI, AAP, Vault or optional PDF dependencies.
+Prepare local Collection artifacts separately in an approved environment;
+verify actual offline flags and dependency order, and do not use --no-deps
+to conceal missing dependencies or resolve/fetch from Galaxy. Runtime
+(scan, evaluate, import and render) must not use the package Proxy or public
+Internet. Existing authorized internal Inventory/DB/SSH/ProxyJump remains
+unchanged. See compatibility.md; actual deployment and offline runtime QA
+are NOT_TESTED here. OFFLINE-DELIVERY is a separate proposed work package,
+not implemented or authorized by this correction.
+
+### B04 remaining necessary effective-setting evidence
+
+No new Owner Controller measurements were supplied in this correction.
+Retain PARTIAL/BLOCKED for the following gaps; obtain only approved minimal
+local summaries, with effective source/precedence, or an explicit Owner
+acceptance decision. Actual paths, credentials and network values stay private.
+
+| Gap (UNKNOWN unless noted) | Downstream impact |
+|---|---|
+| Effective script plugin/inventory source class | #6 actual provider selection, without invoking the real script |
+| Role/collection/library origin, lookup precedence, resolved versions and necessary installed dependency closure | #6/#7 local capability/loader preflight; #14 compatibility |
+| HOST_KEY_CHECKING/forks/timeout effective values or REDACTED with origin | #6/#7/#8 trust, execution bounds and failure handling |
+| SSH/ProxyJump/become and host/group override presence and origin | #6/#7 preserve authorized internal settings; no privilege assumptions |
+| Actual provider unknown-host/error semantics | #6 failure/zero-host classification; synthetic fixture is not proof |
+
+### ISOLATED_TEST: correction evidence
+
+Exact fixed seven-file local projection (five candidate blobs, ansible.cfg
+and .gitignore) was recovered and verified by Git hash-object; no complete
+checkout, archive bytes or real inventory. Same Debian 13 x86_64, Python
+3.13.5, Git 2.47.3, pytest 9.0.2, Jinja2 3.1.6, PyYAML 6.0.3, C.UTF-8.
+Python 3.12 and Ansible tools/cache still unavailable; no install, deployment,
+Controller access or native inventory/loader/Ansible syntax/unit result.
+
+F-R1-01: old empty oracle accepted rc0 parse-failure warnings, missing
+structure {} and an orphan group with an extra host; all three were
+reproduced using controlled synthetic subprocess responses, not Ansible.
+The new oracle rejects all three and retains valid empty, rejects nonzero
+rc and absent binary. Both fatal controls are enabled in isolated test env
+only, with targeted parse-warning rejection even at rc0. Static version
+basis: ansible-core v2.18.3 config/base.yml (445fd4540a10c2fc92568012538145258bbcb2de),
+inventory/manager.py (96df1f46477a436c2d5c6619ebc46d68b5c71d0b),
+cli/inventory.py (6a4ee9241f7eed5a386d97db6e2b0491c7cc5487),
+inventory/data.py (7282d6fb751ab43b2698d9b8e4f9aa24a52fac9f) and
+plugins/inventory/script.py (9b4c316ebdd3aa3e64888ed4006ad41a8b1a8ca7).
+These source declarations/formatting rules are not runtime verification.
+
+- Focused collection: 54 unique nodes, all 22 original nodes retained,
+  32 new (29 pure oracle regressions, 3 required native checks).
+- Full focused pytest: 45 passed, 9 failed, 0 skipped, rc=1, 22.96s.
+  Original 16 CLI and all 29 new oracle cases passed. Original six native
+  cases and new fatal-config plus two failed-provider cases failed only at
+  the explicit missing-tool guard. B07/B10 remain BLOCKED/PARTIAL.
+- Both Python files py_compile rc=0. Original two fixture blobs and modes
+  unchanged. No historical YAML execution. B11 remains BLOCKED/NOT_TESTED.
+- R2 QA must actually check both effective fatal settings with ansible-config,
+  legitimate empty and nonempty lists/hosts, inline vs lookup invocation trace,
+  and nonzero native parser rc plus diagnostics for disposable malformed JSON
+  and nonzero providers. Then run the required full suite, loader, original
+  snapshot syntax-only and Collection unit checks in an authorized isolated
+  environment. No mock or skip substitutes for the native checks.
+
+This correction is implementation evidence only. B09 delta review, independent
+Review R2, Focused QA R2, refreshed integration and required CI are pending;
+#3 remains HOLD. No actual package acquisition, install or offline release
+verification was performed.
