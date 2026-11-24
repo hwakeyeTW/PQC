@@ -1,9 +1,10 @@
 # Execution scope and plan-only preflight (SCOPE-R1)
 
 Issue #6 / PQC-M0-05, approved specification R1 and Owner dispatch
-7131072762 / 7131941041. V2.0 controller-side scope contract, not a live
-scanner, profile evaluator, authorization token, or Oracle Linux support
-assertion. No existing Inventory, configuration, Collection, standalone
+7131072762 / 7131941041, with Issue #7 S3 integration (7133748151 /
+7134089219). V2.0 controller-side scope and profile planning contract, not
+a live scanner, authorization token, or Oracle Linux support assertion.
+See [scan profiles](scan-profiles.md) for the profile decision contract. No existing Inventory, configuration, Collection, standalone
 mirror or deployment setting is modified.
 
 ## Entry point and migration
@@ -81,11 +82,14 @@ pqc_active_endpoints: []
   `pqc_collect_nginx_certs`, `pqc_collect_tls_services`. Boolean or exact
   case-insensitive true/false strings normalize to bool. Missing is not
   false. Unknown collector keys are rejected.
-- `pqc_scan_profile`: optional exact baseline/extended; missing defers the
-  default to #7. No profile ceiling or readiness decision here.
-- `pqc_active_opt_in: false` and `pqc_active_endpoints: []` are compatible
-  no-intent inputs. Active profile or nonempty/true intent is rejected
-  with `PROFILE_INTEGRATION_REQUIRED` pending #7 S3. No probes.
+- `pqc_scan_profile`: optional exact baseline/extended/active; only absence
+  selects baseline. No profile name or collector request grants execution.
+- `pqc_active_opt_in`: bool or exact case-insensitive true/false string;
+  default false. `pqc_active_endpoints`: list, default empty, at most 200
+  rows. Passive profiles reject true opt-in or a nonempty list. Active
+  requires explicit true opt-in and nonempty valid endpoint intent; the
+  launcher still only supports plan-only and never probes. Full validation
+  uses the fixed resolver after the target set is known.
 - Report paths, `pqc_write_*`, probe controls, internal decision fields and
   all other scope keys are unsupported; never silently broaden permissions.
 
@@ -159,9 +163,11 @@ no exported plan is a live token. Private in-memory result has
 `plan_only=true`, `execution_allowed=false`, `active_dispatch_allowed=false`,
 sorted unique `target_ids`, `target_count`,
 `limits={max_hosts, forks, serial:2, ssh_timeout_s:15, command_timeout_s:30}`,
-optional profile/run_id, separate `run_flags`, per-target `inventory_flags`,
+optional run_id, separate `run_flags`, per-target `inventory_flags`,
 `inventory_flags_source=INVENTORY_EFFECTIVE`, `connection_status`, and
-false/empty active intent. Serial and timing values are planned #8 limits,
+normalized `active_opt_in`. S3 adds `profile_decision_version=1`, `profile`,
+`profile_status` and `profile_decisions`; the raw endpoint list is not
+retained in the plan. See [scan profiles](scan-profiles.md). Serial and timing values are planned #8 limits,
 not executed operations. Inventory flags are projected only from the eight
 keys; missing values remain absent. Run-only/reserved decision fields and
 unknown collector/write flags in selected effective hostvars fail closed.
@@ -169,17 +175,21 @@ No Inventory variable authorizes dispatch. No template evaluation, arbitrary
 hostvars or connection values are returned in the plan. Caller must not
 retain raw effective Inventory or publish it; use only necessary projection.
 
-CLI emits minimal JSON (version, status, reason, plan-only and both
-dispatch booleans, exact target aliases and count). No run_id, flags,
-addresses, credentials, paths, raw stderr or config. A denial emits no
-plan and only a constant reason on stderr. Exit codes (help excepted):
+CLI emits the original eight fields (version, status, reason, plan-only,
+both dispatch booleans, target aliases and count) plus the four S3 profile
+fields above. Every host has a closed resolver decision with eight
+NOT_SCANNED rows and false dispatch booleans. The separate raw run and
+inventory flags, endpoint list, run_id, addresses, credentials, paths,
+raw stderr and config are not output. Existing exact-key consumers must
+accept the four additive fields. A denial emits no partial plan and only
+a constant reason on stderr. Exit codes (help excepted):
 
 | Code | Meaning |
 |---|---|
-| 0 | READY target plan, never a successful scan |
-| 2 | Invalid CLI/scope syntax/fields/limits or profile integration required |
-| 3 | Tool/config/provider, timeout/output/cleanup, JSON or structure failure |
-| 4 | Unsafe/untrusted source or unknown/empty/over-cap/unsafe scope |
+| 0 | READY target plan, profile VALIDATED or Active DEFERRED; never a successful scan |
+| 2 | Invalid CLI/scope syntax/fields/limits or run-level profile/endpoint conflict |
+| 3 | Tool/config/provider, timeout/output/cleanup, JSON/structure, fixed policy or resolver failure |
+| 4 | Unsafe/untrusted source, unknown/empty/over-cap/unsafe scope, foreign endpoint source or effective host conflict |
 
 Keep target aliases private to Owner. Do not upload real stdout, logs,
 Inventory, reports or credentials. No report or run directory is generated.
@@ -187,10 +197,12 @@ Plan data is not a public evidence schema.
 
 ## Downstream handoff and verification
 
-#7 S3 constructs its request (`profile`, `plan_only`, `run_flags`,
+#7 S3 now constructs its request (`profile`, `plan_only`, `run_flags`,
 `inventory_flags`, `target_ids`, `active_opt_in`, `active_endpoints`) from
-a trusted invocation and applies the approved resolver before execution.
-#6 does not import the resolver or decide profile policy. #8 must fix the
+a trusted invocation and applies the existing canonical pure resolver,
+first for run-level policy and then once per fixed target. Any denial
+rejects the whole plan. It does not launch another Ansible play or reload
+the Inventory. #8 must fix the
 same native Inventory/Variable context (or proven equivalent snapshot)
 with exact identities and effective connection context, revalidate scope/
 profile before managed connection and use the expected target manifest
@@ -199,7 +211,7 @@ reports. A saved plan or second drifted provider is not a safe dispatch
 contract. Live remains unavailable until these contracts are implemented
 and reviewed. #9 owns private run_id/storage; #10 stable namespace/target_id
 to host_id (never substitute address/path for literal identity). No reports,
-CBOM, IDs, collectors or active validation here.
+CBOM, IDs, collectors or actual active service validation here.
 
 R4 focused development checks (trusted isolated synthetic source and
 prepared runtime, no production data):
@@ -215,8 +227,9 @@ python3 -m pytest -q -rs -p no:cacheprovider tests/integration/test_scope.py
 
 The suite traces actual native tools and provider invocations, retains
 fixture/config bytes and modes, checks literal scope/precedence/flag
-projection, input/source/diagnostic/process failures and tripwire controls
-for forbidden execution. Synthetic tests require no actual SSH. Use a
+projection, input/source/diagnostic/process failures, fixed policy and
+per-host decisions, whole-batch profile refusals and tripwire controls for
+forbidden execution. Synthetic tests require no actual SSH. Use a
 disposable offline environment without production credentials/agent/mounts;
 do not impose universal socket denial on the legitimate DB provider.
 Actual Controller ansible-core 2.18.3/Python 3.12.15, OL9.7/9.8/9.9, actual
