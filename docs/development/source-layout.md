@@ -65,10 +65,26 @@ Requires Python 3 standard library and Git CLI (pytest for tests); no Ansible,
 network or synchronization is needed. Default root is relative to the script,
 not cwd. Explicit root must be the actual Git worktree root (linked worktrees
 are supported). The checker does not change index, refs, config or files.
+Git must support the read-only options used here (including `--no-lazy-fetch`
+and both intent-to-add visibility options); unsupported Git fails closed with
+exit 2. All Git subprocesses discard caller `GIT_*` variables, including
+config injection, alternate index/repository/object paths and trace targets;
+explicit overrides of Git config-file locations are not inherited. Normal
+file-based repo/user/system configuration and standard ignore sources remain
+available. Per-invocation overrides disable fsmonitor, untracked cache and
+case folding; tracing (including file-configured Trace2), paging, replacement
+objects, optional locks and lazy fetch are disabled, and no transport protocol
+is allowed. Diff commands disable external diff/textconv and rename detection.
+This is a bounded checker for a trusted Git installation and ordinary checkout,
+not a sandbox for arbitrary malicious repository configuration or executables.
 
 The Git index (`ls-files --stage -z`) is compared by union of paths, including
-blob IDs and index modes. Unsupported types (including symlinks and gitlinks),
-unmerged stages, missing files/anchors and mode or content drift fail. Separately
+blob IDs and index modes. Every regular stage-0 OID, including unpaired paths,
+is checked using a bounded `cat-file --batch-check` metadata query (no object
+contents, object-store enumeration or lazy fetch). Missing objects are
+`MISSING_INDEX_OBJECT`/ERROR; non-blob objects are `UNSUPPORTED_INDEX_OBJECT`/FAIL.
+Unsupported types (including symlinks and gitlinks), unmerged stages, missing
+files/anchors and mode or content drift fail. Separately
 hash actual paired regular files without newline/whitespace normalization;
 inspect every relative directory node and reject symlinks/junctions/reparse
 points. Git mode is authoritative, not OS permissions. Do not concurrently
@@ -76,9 +92,18 @@ mutate the checkout; this is not a filesystem security boundary against an
 attacker racing inspection (especially on systems without dir_fd support).
 
 Nonignored untracked source within the domain is a violation, even if present
-on both sides. Ignored files (e.g. caches) and domain-external files are not
-covered. Do not add broad ignores for executable source. The check is not a
-complete loader proof or arbitrary ignored-file injection detector. Equal
+on both sides. Exact case-sensitive path enumeration does not inherit
+`core.ignorecase=true`; ignore patterns are evaluated with that case-sensitive
+setting. Case-insensitive filesystems/Windows junctions require platform-specific
+validation (case variants may not be representable). A legal nested-repository
+directory record is `UNTRACKED_SOURCE`, not a parse error; do not traverse it.
+Intent-to-add (`git add -N`) is `INTENT_TO_ADD`/FAIL, even for an empty file.
+Compare NUL-delimited cached name listings against the virtual empty tree with
+ITA visible/invisible, validate the visible listing against the index, and reject
+any ITA entry; a genuinely staged empty blob remains valid. Ignored files (e.g.
+caches) and domain-external files are not covered. Do not add broad ignores for
+executable source. The check is not a complete loader proof or arbitrary
+ignored-file injection detector. Equal
 unstaged bytes on both sides can pass the checkout comparison; index parity
 is independent and does not establish that worktree bytes are staged. CI/QA
 must use a clean fixed checkout and inspect the approved staged diff.

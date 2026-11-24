@@ -33,18 +33,26 @@ class Violation(Exception):
     """A path violates the mirror contract."""
 
 
-def git(root, *args):
-    env = os.environ.copy()
-    # Do not allow a caller's alternate Git index/worktree to redirect the check.
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
-                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_NAMESPACE", "GIT_PREFIX", "GIT_QUARANTINE_PATH"):
-        env.pop(key, None)
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1")
+def git(root, *args, data=b""):
+    # Ignore caller Git config injection, alternate repositories/objects, tracing,
+    # and other Git-specific environment controls. Keep ordinary HOME/XDG config
+    # discovery so standard repo/user ignore rules still apply.
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
+               GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="",
+               GIT_TRACE="0", GIT_TRACE2="0", GIT_TRACE2_EVENT="0",
+               GIT_TRACE2_PERF="0")
+    # Command-line config overrides repository/user config without writing it.
+    # --no-lazy-fetch must be supported; older Git fails closed before inspection.
+    command = ["git", "--no-pager", "--no-replace-objects", "--no-lazy-fetch",
+               "--literal-pathspecs", "-c", "core.fsmonitor=false",
+               "-c", "core.ignorecase=false", "-c", "core.untrackedCache=false",
+               *args]
     try:
-        result = subprocess.run(["git", "--literal-pathspecs", *args], cwd=root,
-                                env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, check=False)
+        result = subprocess.run(command, cwd=root, env=env, input=data,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False)
     except OSError:
         raise CheckError("GIT_ERROR") from None
     if result.returncode or result.stderr:
@@ -78,7 +86,11 @@ def records(data):
     return data[:-1].split(b"\0")
 
 
-def split_path(raw):
+def split_path(raw, allow_directory=False):
+    # Git may report an untracked embedded repository as a directory record.
+    # Only the untracked listing permits a single trailing slash.
+    if allow_directory and raw.endswith(b"/"):
+        raw = raw[:-1]
     path = os.fsdecode(raw)
     parts = path.split("/")
     if any(p in ("", ".", "..") for p in parts):
@@ -108,6 +120,59 @@ def index_entries(data):
             raise CheckError("INVALID_GIT_OUTPUT")
         sides[side][relative] = (mode, oid)
     return sides
+
+
+def verify_objects(root, entries, result):
+    """Query only regular index OIDs, without reading object contents or fetching."""
+    by_oid = {}
+    for path, (mode, oid) in entries.items():
+        if mode in REGULAR:
+            by_oid.setdefault(oid, []).append(path)
+    if not by_oid:
+        return
+    oids = sorted(by_oid)
+    data = b"".join(oid + b"\n" for oid in oids)
+    output = git(root, "cat-file", "--batch-check=%(objectname) %(objecttype)", data=data)
+    if not output.endswith(b"\n"):
+        raise CheckError("INVALID_GIT_OUTPUT")
+    lines = output[:-1].split(b"\n")
+    if len(lines) != len(oids):
+        raise CheckError("INVALID_GIT_OUTPUT")
+    for oid, line in zip(oids, lines):
+        name, sep, kind = line.partition(b" ")
+        if not sep or name != oid or kind not in (b"blob", b"tree", b"commit", b"tag", b"missing"):
+            raise CheckError("INVALID_GIT_OUTPUT")
+        for path in by_oid[oid]:
+            if kind == b"missing":
+                result.errors.add((path, "MISSING_INDEX_OBJECT"))
+            elif kind != b"blob":
+                result.failures.add((path, "UNSUPPORTED_INDEX_OBJECT"))
+
+
+def staged_paths(root, entries):
+    """Identify ITA without confusing it with a genuinely staged empty blob."""
+    # Git's empty tree is virtual; hash-object without -w never writes it.
+    empty = git(root, "hash-object", "-t", "tree", "--stdin")
+    if not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\n", empty):
+        raise CheckError("INVALID_GIT_OUTPUT")
+    common = ("diff", "--cached", "--name-only", "-z", "--no-renames",
+              "--no-ext-diff", "--no-textconv", "--no-relative", "--ignore-submodules=none")
+    def listing(option):
+        paths = set()
+        for raw in records(git(root, *common, option, empty[:-1].decode("ascii"), "--", *PATHS)):
+            side, relative = split_path(raw)
+            path = (COLLECTION if side else "") + relative
+            if path in paths:
+                raise CheckError("INVALID_GIT_OUTPUT")
+            paths.add(path)
+        return paths
+    visible = listing("--ita-visible-in-index")
+    staged = listing("--ita-invisible-in-index")
+    # With an empty baseline every index path must be visible; reject unexpected
+    # output rather than guessing intent flags or silently accepting missing rows.
+    if visible != set(entries) or not staged <= visible:
+        raise CheckError("INVALID_GIT_OUTPUT")
+    return staged
 
 
 def require_type(info, directory):
@@ -175,6 +240,10 @@ def inspect(root, result):
     root = validate_root(root)
     legacy, canonical = index_entries(git(root, "ls-files", "--stage", "-z", "--", *PATHS))
     result.pairs = len(legacy.keys() & canonical.keys())
+    entries = {**legacy, **{COLLECTION + path: entry for path, entry in canonical.items()}}
+    verify_objects(root, entries, result)
+    for path in entries.keys() - staged_paths(root, entries):
+        result.failures.add((path, "INTENT_TO_ADD"))
     for side, prefix in ((legacy, ""), (canonical, COLLECTION)):
         for anchor in ANCHORS:
             if anchor not in side:
@@ -208,7 +277,7 @@ def inspect(root, result):
         if len(hashes) == 2 and hashes[0] != hashes[1]:
             result.failures.add((path, "WORKTREE_CONTENT_MISMATCH"))
     for raw in records(git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *PATHS)):
-        side, relative = split_path(raw)
+        side, relative = split_path(raw, allow_directory=True)
         result.failures.add(((COLLECTION if side else "") + relative, "UNTRACKED_SOURCE"))
 
 

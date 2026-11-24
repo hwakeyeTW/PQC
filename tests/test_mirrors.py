@@ -337,3 +337,210 @@ def test_m12_alternate_index_not_used(repo, monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "nonexistent-index"))
     expect(repo, 0)
     assert not (tmp_path / "nonexistent-index").exists()
+
+
+# Review R1 regressions: actual Git index mutations only in synthetic repos.
+@pytest.mark.parametrize("kind,rc,reason", [
+    ("missing", 2, "MISSING_INDEX_OBJECT"),
+    ("commit", 1, "UNSUPPORTED_INDEX_OBJECT"),
+    ("tree", 1, "UNSUPPORTED_INDEX_OBJECT"),
+])
+@pytest.mark.parametrize("prefixes", [("",), (C,), ("", C)])
+def test_r1_01_regular_index_object_type(repo, kind, rc, reason, prefixes):
+    if kind == "missing":
+        oid = git(repo, "hash-object", "--stdin", data=b"missing-index-object-sentinel").decode().strip()
+        p = subprocess.run(["git", "cat-file", "-e", oid], cwd=repo, capture_output=True)
+        assert p.returncode != 0
+    else:
+        oid = git(repo, "rev-parse", "HEAD" if kind == "commit" else "HEAD^{tree}").decode().strip()
+        assert git(repo, "cat-file", "-t", oid).strip() == kind.encode()
+    for prefix in prefixes:
+        git(repo, "update-index", "--cacheinfo", f"100644,{oid},{prefix + FILE}")
+    out = expect(repo, rc, reason)
+    for prefix in prefixes:
+        assert f'{"ERROR" if rc == 2 else "FAIL"} {reason} "{prefix + FILE}"' in out.splitlines()
+
+
+def test_r1_01_unpaired_missing_object_is_error(repo):
+    path = "plugins/modules/unpaired.py"
+    oid = git(repo, "hash-object", "--stdin", data=b"unpaired-missing-sentinel").decode().strip()
+    put(repo, path)
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{oid},{path}")
+    out = expect(repo, 2, "MISSING_INDEX_OBJECT", "MISSING_CANONICAL")
+    assert f'ERROR MISSING_INDEX_OBJECT "{path}"' in out.splitlines()
+
+
+def test_r1_01_valid_staged_empty_blob(repo):
+    path = "plugins/modules/empty.py"
+    pair(repo, path, b"")
+    git(repo, "add", "--", path, C + path)
+    oid = git(repo, "rev-parse", ":" + path).strip().decode()
+    assert git(repo, "cat-file", "-t", oid) == b"blob\n"
+    assert expect(repo, 0) == "PASS pairs=12\n"
+
+
+@pytest.mark.parametrize("data", [b"", b"synthetic intent\n"])
+@pytest.mark.parametrize("prefixes", [("",), (C,), ("", C)])
+def test_r1_02_intent_to_add_requires_real_stage(repo, data, prefixes):
+    path = "plugins/modules/intent.py"
+    for prefix in prefixes:
+        put(repo, prefix + path, data)
+    git(repo, "add", "-N", "--", *(prefix + path for prefix in prefixes))
+    assert git(repo, "diff", "--cached", "--ita-invisible-in-index", "--name-only") == b""
+    out = expect(repo, 1, "INTENT_TO_ADD")
+    for prefix in prefixes:
+        assert f'FAIL INTENT_TO_ADD "{prefix + path}"' in out.splitlines()
+    pair(repo, path, data)
+    git(repo, "add", "--", path, C + path)
+    assert expect(repo, 0) == "PASS pairs=12\n"
+
+
+def test_r1_02_intent_after_removing_committed_empty_pair(repo):
+    path = "plugins/modules/committed_empty.py"
+    pair(repo, path, b"")
+    git(repo, "add", "--", path, C + path)
+    git(repo, "commit", "-qm", "synthetic empty pair")
+    git(repo, "rm", "--cached", "--", path, C + path)
+    git(repo, "add", "-N", "--", path, C + path)
+    expect(repo, 1, "INTENT_TO_ADD", path, C + path)
+    git(repo, "add", "--", path, C + path)
+    expect(repo, 0)
+
+
+@pytest.mark.parametrize("prefix", ["", C])
+def test_r1_03_case_variant_not_hidden(repo, prefix):
+    tracked = repo / (prefix + "plugins/modules/normalize_pqc.py")
+    path = prefix + "plugins/modules/normalize_PQC.py"
+    if (repo / path).exists():
+        pytest.skip("case-insensitive filesystem cannot represent this counterexample")
+    git(repo, "config", "core.ignorecase", "true")
+    expect(repo, 0)
+    variant = put(repo, path)
+    assert not tracked.samefile(variant)
+    p = subprocess.run(["git", "check-ignore", "--no-index", "--", path],
+                       cwd=repo, capture_output=True)
+    assert p.returncode == 1
+    assert f'FAIL UNTRACKED_SOURCE "{path}"' in expect(repo, 1, "UNTRACKED_SOURCE").splitlines()
+    # Exact-case ignore rule still works; configuration must not be changed.
+    put(repo, ".gitignore", b"normalize_PQC.py\n")
+    expect(repo, 0)
+    assert git(repo, "config", "--local", "core.ignorecase") == b"true\n"
+
+
+def test_r1_03_standard_ignore_sources(repo):
+    home = Path(os.environ["HOME"])
+    put(home, ".gitconfig", b"[core]\n\texcludesFile = ~/standard-excludes\n")
+    put(home, "standard-excludes", b"global-cache.pyc\n")
+    put(repo, ".git/info/exclude", b"local-cache.pyc\n")
+    put(repo, ".gitignore", b"root-cache.pyc\n")
+    for prefix in ("", C):
+        for name in ("global-cache.pyc", "local-cache.pyc", "root-cache.pyc"):
+            put(repo, prefix + "plugins/modules/" + name)
+    expect(repo, 0)
+    put(repo, "plugins/modules/not-ignored.py")
+    expect(repo, 1, "UNTRACKED_SOURCE", "not-ignored.py")
+
+
+def all_files(root):
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def marker_hook(tmp_path):
+    hook = put(tmp_path, "fsmonitor-hook", b"#!/bin/sh\n: > \"$0.marker\"\nprintf 'synthetic-token\\000'\n")
+    hook.chmod(0o700)
+    return hook, Path(str(hook) + ".marker")
+
+
+def test_r1_04_fsmonitor_and_traces_are_disabled(repo, tmp_path, monkeypatch):
+    hook, marker = marker_hook(tmp_path)
+    git(repo, "config", "core.fsmonitor", str(hook))
+    trace_paths = []
+    for name in ("GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE_PACK_ACCESS",
+                 "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"):
+        path = tmp_path / name
+        trace_paths.append(path)
+        monkeypatch.setenv(name, str(path))
+    assert not marker.exists() and all(not p.exists() for p in trace_paths)
+    before = all_files(repo)
+    expect(repo, 0)
+    assert not marker.exists() and all(not p.exists() for p in trace_paths)
+    assert all_files(repo) == before
+
+
+def test_r1_04_file_config_trace2_disabled(repo, tmp_path):
+    home = Path(os.environ["HOME"])
+    paths = [tmp_path / name for name in ("normal-trace", "event-trace", "perf-trace")]
+    put(home, ".gitconfig", ("[trace2]\n" + "".join(
+        f'\t{key} = "{path.as_posix()}"\n'
+        for key, path in zip(("normalTarget", "eventTarget", "perfTarget"), paths)
+    )).encode())
+    before = all_files(repo), all_files(home)
+    expect(repo, 0)
+    assert all(not p.exists() for p in paths)
+    assert (all_files(repo), all_files(home)) == before
+
+
+@pytest.mark.parametrize("injection", ["count", "parameters", "config-files", "redirect"])
+def test_r1_04_inherited_git_config_and_redirects_ignored(repo, tmp_path, monkeypatch, injection):
+    hook, marker = marker_hook(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    poison = put(tmp_path, "poison-config", (
+        f'[core]\n\tfsmonitor = "{hook.as_posix()}"\n\tworktree = "{other.as_posix()}"\n'
+    ).encode())
+    if injection == "count":
+        values = {"core.fsmonitor": str(hook), "core.worktree": str(other), "core.ignorecase": "true"}
+        monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(values)))
+        for i, (key, value) in enumerate(values.items()):
+            monkeypatch.setenv(f"GIT_CONFIG_KEY_{i}", key)
+            monkeypatch.setenv(f"GIT_CONFIG_VALUE_{i}", value)
+    elif injection == "parameters":
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.fsmonitor={hook}' 'core.worktree={other}'")
+    elif injection == "config-files":
+        for key in ("GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            monkeypatch.setenv(key, str(poison))
+    else:
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"):
+            monkeypatch.setenv(key, str(other))
+    before = all_files(repo)
+    expect(repo, 0)
+    assert not marker.exists()
+    assert not list(other.iterdir())
+    assert all_files(repo) == before
+
+
+def test_r1_04_injected_ignorecase_cannot_hide_source(repo, monkeypatch):
+    path = "plugins/modules/normalize_PQC.py"
+    if (repo / path).exists():
+        pytest.skip("case-insensitive filesystem cannot represent this counterexample")
+    put(repo, path)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.ignorecase")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.ignorecase=true'")
+    expect(repo, 1, "UNTRACKED_SOURCE", path)
+
+
+def test_r1_05_nested_repository_is_untracked_source(repo):
+    path = "plugins/embedded"
+    embedded = repo / path
+    embedded.mkdir()
+    git(embedded, "init", "-q")
+    put(embedded, "inner.py", b"nested-private-sentinel")
+    assert (path + "/").encode() + b"\0" in git(
+        repo, "ls-files", "--others", "--exclude-standard", "-z", "--", "plugins")
+    out = expect(repo, 1, "UNTRACKED_SOURCE", path)
+    assert f'FAIL UNTRACKED_SOURCE "{path}"' in out.splitlines()
+    assert "inner.py" not in out and "nested-private-sentinel" not in out
+
+
+@pytest.mark.parametrize("raw", [b"plugins/embedded//", b"plugins/../outside/", b"/plugins/embedded/"])
+def test_r1_05_malformed_directory_record_rejected(raw):
+    with pytest.raises(checker.CheckError, match="INVALID_GIT_OUTPUT"):
+        checker.split_path(raw, allow_directory=True)
+
+
+def test_r1_05_directory_record_not_valid_index_path():
+    with pytest.raises(checker.CheckError, match="INVALID_GIT_OUTPUT"):
+        checker.index_entries(b"100644 " + b"a" * 40 + b" 0\tplugins/embedded/\0")
