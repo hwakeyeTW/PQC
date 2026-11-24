@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 
 import pytest
@@ -162,17 +163,110 @@ def test_repo_config_has_no_host_key_override():
     assert "host_key_checking" not in config["defaults"]
 
 
+def utf8_locale_available(env, name):
+    # Probe in a child, not by changing the pytest process's locale. Disable
+    # Python UTF-8 mode so a C/ASCII locale cannot appear to be UTF-8.
+    probe = subprocess.run(
+        [sys.executable, "-I", "-X", "utf8=0", "-c", """
+import codecs
+import locale
+try:
+    locale.setlocale(locale.LC_ALL, "")
+    encoding = codecs.lookup(locale.nl_langinfo(locale.CODESET)).name
+except (locale.Error, LookupError):
+    raise SystemExit(1)
+raise SystemExit(0 if encoding == "utf-8" else 1)
+"""],
+        env={**env, "LC_ALL": name}, capture_output=True, timeout=30,
+    )
+    assert probe.returncode in (0, 1), "UTF-8 locale probe failed"
+    return probe.returncode == 0
+
+
+def select_utf8_locale(env):
+    preferred = ("C.UTF-8", "C.utf8")
+    for name in preferred:
+        if utf8_locale_available(env, name):
+            return name
+    # Other POSIX controllers may have a different installed UTF-8 locale.
+    executable = shutil.which("locale", path=env["PATH"])
+    if executable is not None:
+        result = subprocess.run(
+            [executable, "-a"], env=env, capture_output=True,
+            encoding="utf-8", timeout=30,
+        )
+        assert result.returncode == 0, "locale enumeration failed"
+        for name in sorted(set(result.stdout.splitlines()) - set(preferred)):
+            if utf8_locale_available(env, name):
+                return name
+    pytest.fail("BLOCKED: no usable UTF-8 locale for Ansible subprocess")
+
+
+def ansible_env(home, config, override=None):
+    env = clean_env(home)
+    env["LC_ALL"] = select_utf8_locale(env)
+    env["ANSIBLE_CONFIG"] = str(config)
+    if override is not None:
+        env["ANSIBLE_HOST_KEY_CHECKING"] = override
+    return env
+
+
+@pytest.mark.parametrize("outer_locale", ["C", "C.UTF-8"])
+def test_ansible_env_isolated(tmp_path, monkeypatch, outer_locale):
+    # Deliberately contaminate only the parent with synthetic values.
+    for key, value in {
+        "LC_ALL": outer_locale, "LANG": "C", "LC_CTYPE": "C",
+        "HOME": str(tmp_path / "outer-home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "outer-config"),
+        "ANSIBLE_CONFIG": str(tmp_path / "outer.cfg"),
+        "ANSIBLE_HOST_KEY_CHECKING": "False",
+        "ANSIBLE_INVENTORY": str(tmp_path / "outer-inventory"),
+        "ANSIBLE_COLLECTIONS_PATH": str(tmp_path / "outer-collections"),
+        "PYTHONUTF8": "1", "PYTHONPATH": str(tmp_path / "outer-python"),
+    }.items():
+        monkeypatch.setenv(key, value)
+    home = tmp_path / "home"
+    config = tmp_path / "candidate.cfg"
+    shutil.copyfile(ROOT / "ansible.cfg", config)
+    git_env = clean_env(home)
+    env = ansible_env(home, config)
+    assert git_env == {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(home), "XDG_CONFIG_HOME": str(home / "config"),
+        "LC_ALL": "C",
+    }
+    assert env == {**git_env, "LC_ALL": env["LC_ALL"],
+                   "ANSIBLE_CONFIG": str(config)}
+    assert utf8_locale_available(env, env["LC_ALL"])
+    assert home.is_dir()
+    assert ansible_env(home, config, "True") == {
+        **env, "ANSIBLE_HOST_KEY_CHECKING": "True",
+    }
+
+
+@pytest.mark.parametrize("name", ["C", "POSIX", "pqc_invalid_locale"])
+def test_utf8_locale_rejects_non_utf8_or_missing(tmp_path, name):
+    assert not utf8_locale_available(clean_env(tmp_path / "home"), name)
+
+
+def test_utf8_locale_unavailable_fails(tmp_path, monkeypatch):
+    # Exercise the no-locale branch synthetically; no Ansible output is mocked.
+    env = clean_env(tmp_path / "home")
+    env["PATH"] = str(tmp_path / "empty-bin")
+    monkeypatch.setattr(sys.modules[__name__], "utf8_locale_available",
+                        lambda env, name: False)
+    with pytest.raises(pytest.fail.Exception, match="no usable UTF-8 locale"):
+        select_utf8_locale(env)
+
+
 def host_key_checking(tmp_path, config, override=None):
     executable = shutil.which("ansible-config")
     if executable is None:
         pytest.skip("NOT_TESTED: ansible-config is unavailable")
-    env = clean_env(tmp_path / "home")
-    env["ANSIBLE_CONFIG"] = str(config)
-    if override is not None:
-        env["ANSIBLE_HOST_KEY_CHECKING"] = override
+    env = ansible_env(tmp_path / "home", config, override)
     result = subprocess.run(
         [executable, "dump"], cwd=tmp_path, env=env, capture_output=True,
-        text=True, timeout=30,
+        encoding="utf-8", timeout=30,
     )
     assert result.returncode == 0, "isolated ansible-config dump failed"
     matches = re.findall(
