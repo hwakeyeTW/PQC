@@ -1,0 +1,1135 @@
+---
+# Internal tasks_from only; trusted caller owns #7 flags, #14 eligibility and scope.
+# S02: production -T/-C candidate is hard-disabled until native qualification.
+- name: Validate trusted SSH posture request
+  ansible.builtin.assert:
+    that:
+      - pqc_ssh_request is mapping
+      - pqc_ssh_request.keys() | list | sort in [['flags', 'platform_status'], ['context_refs', 'flags', 'platform_status'], ['context_refs', 'context_specs', 'flags', 'platform_status']]
+      - pqc_ssh_request.flags is mapping
+      - pqc_ssh_request.flags.keys() | list | sort == ['pqc_collect_ssh_host_keys', 'pqc_collect_sshd']
+      - pqc_ssh_request.flags.pqc_collect_sshd is boolean
+      - pqc_ssh_request.flags.pqc_collect_ssh_host_keys is boolean
+      - pqc_ssh_request.platform_status in ['UNVERIFIED', 'UNKNOWN', 'OUT_OF_SCOPE']
+      - contexts is sequence and contexts is not string and contexts is not mapping
+      - contexts | length >= 1 and contexts | length <= 2
+      - contexts | select('string') | list | length == contexts | length
+      - contexts | select('match', '^(global-default|ctx-[0-9a-f]{64})\\Z') | list | length == contexts | length
+      - contexts | unique | list | length == contexts | length
+      - context_specs is mapping
+      - context_specs.keys() | list | difference(contexts | reject('equalto', 'global-default') | list) | length == 0
+  vars:
+    contexts: "{{ pqc_ssh_request.context_refs | default(['global-default']) }}"
+    context_specs: "{{ pqc_ssh_request.context_specs | default({}) }}"
+  become: false
+  no_log: true
+
+- name: Initialize closed SSH posture snapshot
+  ansible.builtin.set_fact:
+    pqc_ssh_snapshot:
+      flags: "{{ pqc_ssh_request.flags }}"
+      platform_status: "{{ pqc_ssh_request.platform_status }}"
+      context_refs: "{{ pqc_ssh_request.context_refs | default(['global-default']) }}"
+      slots: {}
+    pqc_ssh_stopped: false
+    pqc_ssh_queries: {results: []}
+    cacheable: false
+  become: false
+  no_log: true
+
+- name: Inspect fixed outer environment executable
+  ansible.builtin.stat:
+    path: /usr/bin/env
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: pqc_ssh_env
+  ignore_errors: true
+  when: pqc_ssh_snapshot.platform_status == 'UNVERIFIED' and (pqc_ssh_snapshot.flags.pqc_collect_sshd or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys)
+  become: false
+  no_log: true
+
+- name: Inspect fixed timeout executable
+  ansible.builtin.stat:
+    path: /usr/bin/timeout
+    follow: false
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: pqc_ssh_timer
+  ignore_errors: true
+  when: pqc_ssh_snapshot.platform_status == 'UNVERIFIED' and (pqc_ssh_snapshot.flags.pqc_collect_sshd or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys)
+  become: false
+  no_log: true
+
+- name: Inspect trusted system Python executable
+  ansible.builtin.stat:
+    path: /usr/bin/python3
+    follow: true
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: pqc_ssh_python
+  ignore_errors: true
+  when: pqc_ssh_snapshot.platform_status == 'UNVERIFIED' and (pqc_ssh_snapshot.flags.pqc_collect_sshd or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys)
+  become: false
+  no_log: true
+
+- &ssh_acquire_slot
+  name: Acquire fixed slot without shell or destination
+  vars:
+    ssh_slot: client-kex
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -i
+      - PATH=/usr/bin:/usr/sbin
+      - LC_ALL=C
+      - HOME=/nonexistent
+      - /usr/bin/timeout
+      - --signal=TERM
+      - --kill-after=2s
+      - 27s
+      - /usr/bin/python3
+      - -I
+      - -B
+      - -c
+      - |
+        import base64
+        import binascii
+        import hashlib
+        import ipaddress
+        import json
+        import os
+        import re
+        import selectors
+        import stat
+        import struct
+        import subprocess
+        import sys
+        import tempfile
+        import time
+
+        LIMIT = 16384
+        MAX_ROWS = 256
+        MAX_CONFIG_ROWS = 512
+        TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+@-]{0,127}\Z', re.ASCII)
+        KEY_FILE = re.compile(r'ssh_host_[A-Za-z0-9_-]{1,64}_key\.pub\Z', re.ASCII)
+        DROPIN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.conf\Z', re.ASCII)
+        CLIENTS = {f'client-{q}': ['/usr/bin/ssh', '-Q', q] for q in ('kex', 'cipher', 'key', 'sig', 'mac')}
+        SETTINGS = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms', 'pubkeyacceptedalgorithms',
+                    'pubkeyacceptedkeytypes', 'hostbasedacceptedalgorithms', 'hostbasedacceptedkeytypes',
+                    'casignaturealgorithms', 'gssapikexalgorithms'}
+        HAZARDS = {'hostkeyagent', 'authorizedkeyscommand', 'authorizedkeyscommanduser',
+                   'authorizedprincipalscommand', 'authorizedprincipalscommanduser', 'hostcertificate',
+                   'authorizedkeysfile', 'authorizedprincipalsfile', 'revokedkeys', 'trustedusercakeys',
+                   'forcecommand', 'subsystem', 'chrootdirectory', 'modulifile', 'banner', 'usepam'}
+        GAPS = {'SOURCE_MISSING', 'SOURCE_PERMISSION', 'SOURCE_UNSAFE', 'FORMAT_GAP', 'INCLUDE_REJECTED',
+                'INCLUDE_REPEATED', 'INCLUDE_EMPTY', 'MATCH_UNRESOLVED', 'NATIVE_DEPENDENCY',
+                'HOSTKEY_PATH_REJECTED', 'KEY_INVALID', 'KEY_TYPE_UNKNOWN'}
+        ROOT_PATH = '/'
+        # Code-only release boundary: no Inventory, env, role or CLI override.
+        # The public-only source translation and actual native dependency closure
+        # still require qualification on the supported OpenSSH implementation.
+        NATIVE_T_QUALIFIED = False
+        NATIVE_Q_QUALIFIED = False
+        EFFECTIVE_ALIASES = {'pubkeyacceptedkeytypes': 'pubkeyacceptedalgorithms',
+                             'hostbasedacceptedkeytypes': 'hostbasedacceptedalgorithms'}
+        EFFECTIVE_REQUIRED = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms',
+                              'pubkeyacceptedalgorithms', 'hostbasedacceptedalgorithms', 'casignaturealgorithms'}
+        EFFECTIVE_SETTINGS = EFFECTIVE_REQUIRED | {'gssapikexalgorithms'}
+
+
+        def result(state, reason, rc=None, rows=None, gaps=None):
+            return dict(state=state, reason=reason, rc=rc, rows=[] if rows is None else rows,
+                        gaps=[] if gaps is None else sorted(set(gaps)))
+
+
+        def digest(prefix, parts):
+            wire = json.dumps(parts, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+            return prefix + '-' + hashlib.sha256(wire).hexdigest()
+
+
+        def key_ref(name):
+            return digest('key', ['ssh-host-public-source-v1', name])
+
+
+        def capture(argv, seconds=23):
+            # Called only with fixed argv by the production entry. Test primitive is not an API.
+            end = time.monotonic() + seconds
+            p = None
+            reason = None
+            out = [bytearray(), bytearray()]
+            try:
+                p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C',
+                                                                  'HOME': '/nonexistent'}, close_fds=True)
+                with selectors.DefaultSelector() as sel:
+                    for i, f in enumerate((p.stdout, p.stderr)):
+                        sel.register(f, selectors.EVENT_READ, i)
+                    while sel.get_map():
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            reason = 'TIMEOUT'
+                            break
+                        for k, _ in sel.select(left):
+                            room = LIMIT - sum(map(len, out))
+                            chunk = os.read(k.fd, min(4096, room + 1))
+                            if len(chunk) > room:
+                                reason = 'OUTPUT_LIMIT'
+                                break
+                            if chunk:
+                                out[k.data].extend(chunk)
+                            else:
+                                sel.unregister(k.fileobj)
+                        if reason:
+                            break
+                if reason is None:
+                    p.wait(timeout=max(0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                reason = 'TIMEOUT'
+            except PermissionError:
+                reason = 'PERMISSION_DENIED'
+            except FileNotFoundError:
+                reason = 'TOOL_UNAVAILABLE'
+            except (OSError, ValueError):
+                reason = 'EXECUTION_ERROR'
+            finally:
+                if p is not None:
+                    if p.poll() is None:
+                        try:
+                            p.kill()
+                            p.wait(timeout=1)
+                        except (OSError, subprocess.TimeoutExpired):
+                            # Do not report success or exit ahead of the outer group deadline.
+                            time.sleep(30)
+                            reason = 'CLEANUP_FAILED'
+                    p.stdout.close()
+                    p.stderr.close()
+            return reason, None if p is None else p.returncode, bytes(out[0]), bytes(out[1])
+
+
+        def tool_error(path):
+            try:
+                st = os.stat(path, follow_symlinks=False)
+                if not stat.S_ISREG(st.st_mode):
+                    return result('UNKNOWN', 'TOOL_UNSAFE_PATH')
+                if not os.access(path, os.X_OK):
+                    return result('UNKNOWN', 'TOOL_NOT_EXECUTABLE')
+            except FileNotFoundError:
+                return result('UNKNOWN', 'TOOL_UNAVAILABLE')
+            except PermissionError:
+                return result('PERMISSION_DENIED', 'PERMISSION_DENIED')
+            except OSError:
+                return result('ERROR', 'EXECUTION_ERROR')
+            return None
+
+
+        def parse_client(rc, out, err):
+            if len(out) + len(err) > LIMIT:
+                return result('ERROR', 'OUTPUT_LIMIT', rc)
+            if rc != 0 or err:
+                if b'Permission denied' in err:
+                    return result('PERMISSION_DENIED', 'PERMISSION_DENIED', rc)
+                if rc != 0 and (b'Unsupported query' in err or b'unknown query' in err.lower()):
+                    return result('UNKNOWN', 'UNSUPPORTED_QUERY', rc)
+                return result('ERROR', 'COMMAND_FAILED', rc)
+            if not out:
+                return result('UNKNOWN', 'NO_OUTPUT', rc)
+            if not out.endswith(b'\n'):
+                return result('ERROR', 'INCOMPLETE_OUTPUT', rc)
+            try:
+                lines = out.decode('ascii').split('\n')[:-1]
+            except UnicodeError:
+                return result('ERROR', 'INVALID_ENCODING', rc)
+            if len(lines) > MAX_ROWS:
+                return result('ERROR', 'ROW_LIMIT', rc)
+            rows = sorted(set(x for x in lines if TOKEN.fullmatch(x)))
+            if not rows:
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+            gap = len(rows) != len(lines)
+            return result('PARTIAL' if gap else 'COLLECTED', 'FORMAT_GAP' if gap else 'OK', rc, rows,
+                          ['FORMAT_GAP'] if gap else [])
+
+
+        def parse_effective(mode, rc, out, err):
+            """Common bounded G/T output parser; G is used only by test callers.
+
+            No raw stdout/stderr, non-crypto directive, address or account is emitted.
+            A missing required list, repeated alias, modifier, malformed value or
+            incomplete capture invalidates the whole effective result.
+            """
+            if mode not in ('G', 'T'):
+                return result('ERROR', 'EXECUTION_ERROR')
+            if len(out) + len(err) > LIMIT:
+                return result('ERROR', 'OUTPUT_LIMIT', rc)
+            if rc != 0 or err:
+                if b'Permission denied' in err:
+                    return result('PERMISSION_DENIED', 'PERMISSION_DENIED', rc)
+                return result('ERROR', 'COMMAND_FAILED', rc)
+            if not out:
+                return result('UNKNOWN', 'NO_OUTPUT', rc)
+            if not out.endswith(b'\n'):
+                return result('ERROR', 'INCOMPLETE_OUTPUT', rc)
+            try:
+                text = out.decode('ascii')
+            except UnicodeError:
+                return result('ERROR', 'INVALID_ENCODING', rc)
+            if any(ord(c) < 32 and c not in '\n\t' or ord(c) == 127 for c in text):
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+            lists = {}
+            for line in text.splitlines():
+                fields = line.split(None, 1)
+                if not fields:
+                    continue
+                if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', fields[0], re.ASCII):
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                setting = EFFECTIVE_ALIASES.get(fields[0].lower(), fields[0].lower())
+                if setting not in EFFECTIVE_SETTINGS:
+                    continue
+                if len(fields) != 2 or setting in lists:
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                values = fields[1].split(',')
+                if (not all(TOKEN.fullmatch(v) and v.lower() != 'none' for v in values)
+                        or len(values) != len(set(values))):
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                lists[setting] = values
+                if sum(map(len, lists.values())) > MAX_ROWS:
+                    return result('ERROR', 'ROW_LIMIT', rc)
+            if not EFFECTIVE_REQUIRED <= lists.keys():
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+            rows = [dict(mode=mode, setting=setting, token=token)
+                    for setting in sorted(lists) for token in lists[setting]]
+            return result('COLLECTED', 'OK', rc, rows)
+
+
+        class ReadFailure(Exception):
+            def __init__(self, code):
+                self.code = code
+                super().__init__(code)
+
+
+        class LimitFailure(ReadFailure):
+            pass
+
+
+        def signature(st):
+            return (st.st_dev, st.st_ino, st.st_mode, st.st_nlink, st.st_uid, st.st_gid,
+                    st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+        class Reader:
+            """Linux descriptor-anchored bounded read. No arbitrary paths from a caller.
+
+            O_PATH pins the inode before opening for data; reject links, special files,
+            hard links and drift before any read. /proc/self/fd refers only to our FD.
+            Directory and file identities are checked again after the whole traversal.
+            """
+            def __init__(self, root, aggregate, purpose):
+                self.purpose = purpose
+                self.root = root
+                self.aggregate = aggregate
+                self.total = 0
+                self.dirs = {(): (root, None)}
+                self.files = {}
+                self.listings = {}
+                self.end = time.monotonic() + 23
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                for parts, (fd, _) in reversed(list(self.dirs.items())):
+                    if parts:
+                        os.close(fd)
+
+            def deadline(self):
+                if time.monotonic() >= self.end:
+                    raise LimitFailure('TIMEOUT')
+
+            def directory(self, parts):
+                allowed = {(), ('etc',), ('etc', 'ssh')}
+                if self.purpose == 'config':
+                    allowed.update({('etc', 'ssh', 'sshd_config.d'), ('etc', 'crypto-policies'),
+                                    ('etc', 'crypto-policies', 'back-ends')})
+                if parts not in allowed:
+                    raise ReadFailure('SOURCE_UNSAFE')
+                self.deadline()
+                if parts in self.dirs:
+                    return self.dirs[parts][0]
+                parent = self.directory(parts[:-1])
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=parent)
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISDIR(st.st_mode) or signature(os.stat(parts[-1], dir_fd=parent,
+                                                                          follow_symlinks=False)) != signature(st):
+                        raise LimitFailure('SOURCE_DRIFT')
+                    self.dirs[parts] = (fd, signature(st))
+                    return fd
+                except BaseException:
+                    os.close(fd)
+                    raise
+
+            def names(self, parts):
+                if parts not in self.listings:
+                    fd = self.directory(parts)
+                    names = []
+                    with os.scandir(fd) as entries:
+                        for entry in entries:
+                            self.deadline()
+                            if len(names) >= 256:
+                                raise LimitFailure('DIRECTORY_LIMIT')
+                            names.append(entry.name)
+                    self.listings[parts] = sorted(names)
+                return self.listings[parts]
+
+            def read(self, parts, name):
+                self.deadline()
+                if self.purpose == 'keys':
+                    allowed = parts == ('etc', 'ssh') and KEY_FILE.fullmatch(name)
+                else:
+                    allowed = ((parts == ('etc', 'ssh') and name == 'sshd_config') or
+                               (parts == ('etc', 'ssh', 'sshd_config.d') and DROPIN.fullmatch(name)) or
+                               (parts == ('etc', 'crypto-policies', 'back-ends') and name == 'opensshserver.config'))
+                if not allowed:
+                    raise ReadFailure('SOURCE_UNSAFE')
+                fd = self.directory(parts)
+                pin = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                try:
+                    st = os.fstat(pin)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                        raise ReadFailure('SOURCE_UNSAFE')
+                    if st.st_size > LIMIT or self.total + st.st_size > self.aggregate:
+                        raise LimitFailure('INPUT_LIMIT')
+                    expected = signature(st)
+                    try:
+                        path_signature = signature(os.stat(name, dir_fd=fd, follow_symlinks=False))
+                    except OSError:
+                        raise LimitFailure('SOURCE_DRIFT') from None
+                    if path_signature != expected:
+                        raise LimitFailure('SOURCE_DRIFT')
+                    data_fd = os.open('/proc/self/fd/' + str(pin), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                    try:
+                        if signature(os.fstat(data_fd)) != expected:
+                            raise LimitFailure('SOURCE_DRIFT')
+                        data = bytearray()
+                        while len(data) <= st.st_size:
+                            self.deadline()
+                            chunk = os.read(data_fd, min(4096, st.st_size + 1 - len(data)))
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                        if len(data) != st.st_size or signature(os.fstat(data_fd)) != expected:
+                            raise LimitFailure('SOURCE_DRIFT')
+                    finally:
+                        os.close(data_fd)
+                    self.total += len(data)
+                    self.files[(parts, name)] = expected
+                    return bytes(data)
+                finally:
+                    os.close(pin)
+
+            def verify(self):
+                try:
+                    for parts, (fd, expected) in self.dirs.items():
+                        self.deadline()
+                        if parts and (signature(os.fstat(fd)) != expected or
+                                      signature(os.stat(parts[-1], dir_fd=self.dirs[parts[:-1]][0],
+                                                        follow_symlinks=False)) != expected):
+                            raise LimitFailure('SOURCE_DRIFT')
+                    for (parts, name), expected in self.files.items():
+                        self.deadline()
+                        if signature(os.stat(name, dir_fd=self.dirs[parts][0], follow_symlinks=False)) != expected:
+                            raise LimitFailure('SOURCE_DRIFT')
+                except OSError:
+                    raise LimitFailure('SOURCE_DRIFT') from None
+
+
+        def read_gap(exc):
+            if isinstance(exc, ReadFailure):
+                return exc.code
+            if isinstance(exc, FileNotFoundError):
+                return 'SOURCE_MISSING'
+            if isinstance(exc, PermissionError):
+                return 'SOURCE_PERMISSION'
+            return 'SOURCE_UNSAFE'
+
+
+        def collect_config(root):
+            ssh = ('etc', 'ssh')
+            drop = ssh + ('sshd_config.d',)
+            backend = ('etc', 'crypto-policies', 'back-ends')
+            rows, gaps, seen = [], set(), set()
+            with Reader(root, 65536, 'config') as reader:
+                def emit(kind, src, line, ctx, **payload):
+                    if len(rows) >= MAX_CONFIG_ROWS:
+                        raise LimitFailure('ROW_LIMIT')
+                    rows.append(dict(kind=kind, order=len(rows), source_ref=src, line=line,
+                                     context_ref=ctx, **payload))
+
+                def visit(parts, name, kind, parent, include_line, depth, ctx):
+                    if depth > 4 or len(seen) >= 32:
+                        raise LimitFailure('SOURCE_LIMIT')
+                    identity = (parts, name)
+                    if identity in seen:
+                        gaps.add('INCLUDE_REPEATED')
+                        return ctx
+                    seen.add(identity)
+                    try:
+                        raw = reader.read(parts, name)
+                    except LimitFailure:
+                        raise
+                    except (ReadFailure, OSError) as exc:
+                        gaps.add(read_gap(exc))
+                        return ctx
+                    if b'PRIVATE KEY-----' in raw or b'\x00' in raw:
+                        gaps.add('SOURCE_UNSAFE')
+                        return ctx
+                    raw = raw.replace(b'\r\n', b'\n')
+                    if any(x < 32 and x not in (9, 10) or x == 127 for x in raw):
+                        gaps.add('FORMAT_GAP')
+                        return ctx
+                    try:
+                        lines = raw.decode('utf-8').split('\n')
+                    except UnicodeError:
+                        gaps.add('FORMAT_GAP')
+                        return ctx
+                    ref = digest('src', ['ssh-config-v1', list(parts), name])
+                    emit('SOURCE', ref, 0, ctx, source_kind=kind, parent_ref=parent,
+                         include_line=include_line, depth=depth)
+                    for number, raw_line in enumerate(lines, 1):
+                        reader.deadline()
+                        line = raw_line.strip(' \t')
+                        if not line or line.startswith('#'):
+                            continue
+                        match = re.fullmatch(r'([A-Za-z][A-Za-z0-9]*)(?:[ \t]*=[ \t]*|[ \t]+)(.*)', line)
+                        if not match:
+                            gaps.add('FORMAT_GAP')
+                            continue
+                        setting, value = match[1].lower(), match[2].strip(' \t')
+                        if setting == 'match':
+                            ctx = digest('ctx', [ref, number])
+                            emit('MATCH', ref, number, ctx, match_kind='ALL' if value.lower() == 'all' else 'CONDITIONAL')
+                            if value.lower() != 'all':
+                                gaps.add('MATCH_UNRESOLVED')
+                        elif setting == 'include':
+                            # No shlex, glob expansion or arbitrary path evaluation. Only exact approved forms.
+                            args = value.split()
+                            if not args or any(x not in ('/etc/ssh/sshd_config.d/*.conf', 'sshd_config.d/*.conf',
+                                '/etc/crypto-policies/back-ends/opensshserver.config') for x in args):
+                                emit('INCLUDE', ref, number, ctx, outcome='REJECTED')
+                                gaps.add('INCLUDE_REJECTED')
+                                continue
+                            emit('INCLUDE', ref, number, ctx, outcome='ALLOWLISTED')
+                            for arg in args:
+                                if arg.endswith('/*.conf'):
+                                    try:
+                                        names = reader.names(drop)
+                                    except LimitFailure:
+                                        raise
+                                    except (ReadFailure, OSError) as exc:
+                                        gaps.add(read_gap(exc))
+                                        continue
+                                    candidates = [n for n in names if n.endswith('.conf') and not n.startswith('.')]
+                                    if not candidates:
+                                        gaps.add('INCLUDE_EMPTY')
+                                    for candidate in candidates:
+                                        if not DROPIN.fullmatch(candidate):
+                                            gaps.add('SOURCE_UNSAFE')
+                                            continue
+                                        ctx = visit(drop, candidate, 'DROPIN', ref, number, depth + 1, ctx)
+                                else:
+                                    ctx = visit(backend, 'opensshserver.config', 'POLICY_BACKEND', ref, number, depth + 1, ctx)
+                        elif setting in SETTINGS:
+                            op = value[0] if value and value[0] in '+-^' else ''
+                            names = (value[1:] if op else value).split(',')
+                            # Preserve operator/wildcard as declarations only; no evaluation.
+                            if len(names) > MAX_ROWS:
+                                raise LimitFailure('ROW_LIMIT')
+                            if not all(re.fullmatch(r'[A-Za-z0-9*?][A-Za-z0-9_.+@*?-]{0,127}', n, re.ASCII) for n in names):
+                                gaps.add('FORMAT_GAP')
+                                continue
+                            if len(set(names)) != len(names):
+                                gaps.add('FORMAT_GAP')
+                                continue
+                            emit('DIRECTIVE', ref, number, ctx, setting=setting, operator=op or 'EXACT', values=names)
+                        elif setting == 'hostkey':
+                            name = value.removeprefix('/etc/ssh/') + '.pub'
+                            if value.startswith('/etc/ssh/') and KEY_FILE.fullmatch(name):
+                                emit('KEY_REFERENCE', ref, number, ctx, key_source_ref=key_ref(name))
+                            else:
+                                emit('HAZARD', ref, number, ctx, hazard='HOSTKEY_PATH_REJECTED')
+                                gaps.add('HOSTKEY_PATH_REJECTED')
+                        elif setting in HAZARDS:
+                            emit('HAZARD', ref, number, ctx, hazard='NATIVE_DEPENDENCY')
+                            gaps.add('NATIVE_DEPENDENCY')
+                    return ctx
+
+                try:
+                    visit(ssh, 'sshd_config', 'MAIN', None, None, 0, 'global-default')
+                    reader.verify()
+                except LimitFailure as exc:
+                    return result('ERROR', exc.code)
+                except OSError:
+                    return result('ERROR', 'SOURCE_DRIFT')
+            if not rows:
+                code = 'SOURCE_PERMISSION' if 'SOURCE_PERMISSION' in gaps else 'SOURCE_MISSING' if 'SOURCE_MISSING' in gaps else 'SOURCE_UNSAFE' if 'SOURCE_UNSAFE' in gaps else 'UNRECOGNIZED_OUTPUT'
+                return result('PERMISSION_DENIED' if code == 'SOURCE_PERMISSION' else 'UNKNOWN', code)
+            return result('PARTIAL' if gaps else 'COLLECTED', 'CONFIG_GAP' if gaps else 'OK', rows=rows, gaps=gaps)
+
+
+        def parse_public(raw):
+            # No PEM, private-key marker, comments, raw base64 or wire bytes are exported.
+            if b'PRIVATE KEY-----' in raw or b'\x00' in raw or len(raw) > LIMIT:
+                raise ReadFailure('KEY_INVALID')
+            line = raw[:-1] if raw.endswith(b'\n') else raw
+            if raw.endswith(b'\r\n'):
+                line = line[:-1]
+            if any(x < 32 and x != 9 or x == 127 for x in line):
+                raise ReadFailure('KEY_INVALID')
+            fields = re.split(rb'[ \t]+', line, maxsplit=2)
+            try:
+                if len(fields) < 2:
+                    raise ValueError
+                name = fields[0].decode('ascii')
+                if not TOKEN.fullmatch(name) or not name.startswith(('ssh-', 'ecdsa-', 'sk-')) or 'private' in name.lower():
+                    raise ValueError
+                wire = base64.b64decode(fields[1], validate=True)
+                if base64.b64encode(wire) != fields[1]:
+                    raise ValueError
+                offset = 0
+
+                def string():
+                    nonlocal offset
+                    if offset + 4 > len(wire):
+                        raise ValueError
+                    length = struct.unpack_from('>I', wire, offset)[0]
+                    offset += 4
+                    if length > LIMIT or offset + length > len(wire):
+                        raise ValueError
+                    item = wire[offset:offset + length]
+                    offset += length
+                    return item
+
+                def positive():
+                    item = string()
+                    if not item or item[0] & 128 or (item[0] == 0 and (len(item) == 1 or not item[1] & 128)):
+                        raise ValueError
+                    return int.from_bytes(item, 'big').bit_length()
+
+                if string() != fields[0]:
+                    raise ValueError
+                bits = None
+                if name == 'ssh-rsa':
+                    positive()
+                    bits = positive()
+                elif name == 'ssh-dss':
+                    bits = positive()
+                    for _ in range(3):
+                        positive()
+                elif name == 'ssh-ed25519':
+                    if len(string()) != 32:
+                        raise ValueError
+                    bits = 256
+                elif name in ('ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521'):
+                    curve = name.removeprefix('ecdsa-sha2-')
+                    bits = int(curve[5:])
+                    if string() != curve.encode('ascii'):
+                        raise ValueError
+                    point = string()
+                    if len(point) != 1 + 2 * ((bits + 7) // 8) or point[:1] != b'\x04':
+                        raise ValueError
+                else:
+                    # Unknown layout: validate only the type envelope and nonempty payload;
+                    # this remains a partial syntactic observation, not proof of key validity.
+                    if offset == len(wire):
+                        raise ValueError
+                if bits is not None and (offset != len(wire) or not 1 <= bits <= 16384):
+                    raise ValueError
+            except (ValueError, UnicodeError, binascii.Error, struct.error):
+                raise ReadFailure('KEY_INVALID') from None
+            return dict(key_type=name, bits=bits, fingerprint_sha256=hashlib.sha256(wire).hexdigest(),
+                        grammar='KNOWN' if bits is not None else 'UNKNOWN_TYPE')
+
+
+        def collect_keys(root):
+            rows, gaps = [], set()
+            parts = ('etc', 'ssh')
+            with Reader(root, 524288, 'keys') as reader:
+                try:
+                    names = reader.names(parts)
+                    candidates = [name for name in names if name.startswith('ssh_host_') and name.endswith('_key.pub')]
+                    if len(candidates) > 32:
+                        raise LimitFailure('SOURCE_LIMIT')
+                    for name in candidates:
+                        if not KEY_FILE.fullmatch(name):
+                            gaps.add('SOURCE_UNSAFE')
+                            continue
+                        try:
+                            value = parse_public(reader.read(parts, name))
+                        except LimitFailure:
+                            raise
+                        except (OSError, ReadFailure) as exc:
+                            gaps.add(read_gap(exc))
+                            continue
+                        if value['grammar'] == 'UNKNOWN_TYPE':
+                            gaps.add('KEY_TYPE_UNKNOWN')
+                        rows.append(dict(source_ref=key_ref(name), **value))
+                    reader.verify()
+                except LimitFailure as exc:
+                    return result('ERROR', exc.code)
+                except (OSError, ReadFailure) as exc:
+                    code = read_gap(exc)
+                    return result('PERMISSION_DENIED' if code == 'SOURCE_PERMISSION' else 'UNKNOWN', code)
+            if not rows and gaps:
+                code = 'SOURCE_PERMISSION' if 'SOURCE_PERMISSION' in gaps else 'KEY_INVALID' if 'KEY_INVALID' in gaps else 'SOURCE_UNSAFE'
+                return result('PERMISSION_DENIED' if code == 'SOURCE_PERMISSION' else 'UNKNOWN', code)
+            return result('PARTIAL' if gaps else 'COLLECTED', 'KEY_GAP' if gaps else 'OK',
+                          rows=sorted(rows, key=lambda r: r['source_ref']), gaps=gaps)
+
+
+        def native_context(ref, spec):
+            # The trusted caller owns authorization. Refs alone never invent values.
+            if ref == 'global-default' and spec is None:
+                return None
+            fields = ('user', 'host', 'addr', 'laddr', 'lport')
+            if (type(spec) is not dict or spec.keys() != set(fields)
+                    or not all(type(spec[k]) is str for k in fields[:-1])
+                    or type(spec['lport']) is not int or not 1 <= spec['lport'] <= 65535
+                    or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', spec['user'], re.ASCII)
+                    or len(spec['host']) > 253
+                    or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', part, re.ASCII)
+                               for part in spec['host'].split('.'))):
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED')
+            try:
+                for k in ('addr', 'laddr'):
+                    if '%' in spec[k] or str(ipaddress.ip_address(spec[k])) != spec[k]:
+                        raise ValueError
+            except ValueError:
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED') from None
+            if ref != digest('ctx', ['ssh-native-context-v1', *(spec[k] for k in fields)]):
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED')
+            return ','.join(f'{k}={spec[k]}' for k in fields)
+
+
+        def native_argv(config, ref, spec):
+            context_arg = native_context(ref, spec)
+            return ['/usr/sbin/sshd', '-T', '-f', config] + ([] if context_arg is None else ['-C', context_arg])
+
+
+        def prepare_native(root, directory, deadline):
+            """Build a narrow, private public-only candidate closure, not a parity proof.
+
+            Preserve Include boundaries and order; reject everything outside the
+            explicit subset, rather than drop directives or guess default HostKeys.
+            The caller owns the freshly created 0700 directory. No native process is
+            allowed until this construction AND the runtime have been qualified.
+            """
+            ssh = ('etc', 'ssh')
+            drop = ssh + ('sshd_config.d',)
+            backend = ('etc', 'crypto-policies', 'back-ends')
+            if (not re.fullmatch(r'/[A-Za-z0-9_./-]+', directory, re.ASCII) or
+                    not stat.S_ISDIR(os.stat(directory, follow_symlinks=False).st_mode) or
+                    stat.S_IMODE(os.stat(directory, follow_symlinks=False).st_mode) != 0o700 or
+                    os.stat(directory, follow_symlinks=False).st_uid != os.geteuid() or os.listdir(directory)):
+                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+            sources, keys = {}, {}
+            with Reader(root, 65536, 'config') as cfg, Reader(root, 524288, 'keys') as pubs:
+                cfg.end = pubs.end = deadline
+
+                def write(name, data):
+                    if len(data) > 65536:
+                        raise LimitFailure('INPUT_LIMIT')
+                    cfg.deadline()
+                    path = os.path.join(directory, name)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                    try:
+                        with os.fdopen(fd, 'wb', closefd=False) as f:
+                            f.write(data)
+                    finally:
+                        os.close(fd)
+                    return path
+
+                def visit(parts, name, depth):
+                    if depth > 4 or len(sources) >= 32:
+                        raise LimitFailure('SOURCE_LIMIT')
+                    identity = (parts, name)
+                    if identity in sources:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    dest = f'config-{len(sources)}'
+                    sources[identity] = dest
+                    try:
+                        raw = cfg.read(parts, name).decode('ascii')
+                    except UnicodeError:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED') from None
+                    if any(ord(c) < 32 and c not in '\t\n' or ord(c) == 127 for c in raw) or 'PRIVATE KEY-----' in raw:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    lines = []
+                    before_include_match = depth == 0
+                    for raw_line in raw.split('\n'):
+                        cfg.deadline()
+                        line = raw_line.strip(' \t')
+                        if not line or line.startswith('#'):
+                            continue
+                        m = re.fullmatch(r'([A-Za-z][A-Za-z0-9]*)[ \t]+([^#]+)', line)
+                        if not m:
+                            raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                        setting, value = m[1].lower(), m[2].strip(' \t')
+                        if setting == 'include':
+                            # Require an explicit, unconditional HostKey before any
+                            # Include/Match in the main file; never use default key paths.
+                            if depth == 0 and not keys:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            before_include_match = False
+                            paths = []
+                            for arg in value.split():
+                                if arg in ('/etc/ssh/sshd_config.d/*.conf', 'sshd_config.d/*.conf'):
+                                    names = [n for n in cfg.names(drop) if n.endswith('.conf') and not n.startswith('.')]
+                                    if not names or not all(DROPIN.fullmatch(n) for n in names):
+                                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                    paths.extend(visit(drop, n, depth+1) for n in names)
+                                elif arg == '/etc/crypto-policies/back-ends/opensshserver.config':
+                                    paths.append(visit(backend, 'opensshserver.config', depth+1))
+                                else:
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            if not paths:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            lines.append('Include ' + ' '.join(paths))
+                        elif setting == 'hostkey':
+                            name = value.removeprefix('/etc/ssh/') + '.pub'
+                            if (not before_include_match or not value.startswith('/etc/ssh/')
+                                    or not KEY_FILE.fullmatch(name)):
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            if name not in keys:
+                                if len(keys) >= 32:
+                                    raise LimitFailure('SOURCE_LIMIT')
+                                raw_key = pubs.read(ssh, name)
+                                if parse_public(raw_key)['grammar'] != 'KNOWN':
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                # Only the validated public key wire representation; no comment.
+                                fields = raw_key.split(None, 2)
+                                keys[name] = write(f'public-{len(keys)}.pub', b' '.join(fields[:2])+b'\n')
+                            lines.append('HostKey ' + keys[name])
+                        elif setting in SETTINGS:
+                            op = value[:1] if value[:1] in ('+', '-', '^') else ''
+                            names = value[len(op):].split(',')
+                            if (not 1 <= len(names) <= MAX_ROWS or len(set(names)) != len(names)
+                                    or not all(re.fullmatch(r'[A-Za-z0-9*?][A-Za-z0-9_.+@*?-]{0,127}', n, re.ASCII) for n in names)):
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            lines.append(line)
+                        elif setting == 'match':
+                            if depth == 0 and not keys:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            before_include_match = False
+                            # Deliberately no User/Group/Host/exec/NSS predicates. Preserve
+                            # exact supported Address/LocalAddress/LocalPort or all.
+                            words = value.split()
+                            if value.lower() != 'all':
+                                if len(words) != 2 or words[0].lower() not in ('address', 'localaddress', 'localport'):
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                try:
+                                    for item in words[1].split(','):
+                                        if words[0].lower() == 'localport':
+                                            if not re.fullmatch(r'[1-9][0-9]{0,4}', item) or int(item) > 65535:
+                                                raise ValueError
+                                        elif '%' in item:
+                                            raise ValueError
+                                        else:
+                                            ipaddress.ip_network(item, strict=False)
+                                except ValueError:
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED') from None
+                            lines.append(line)
+                        elif setting in ('passwordauthentication', 'pubkeyauthentication') and value.lower() in ('yes', 'no'):
+                            lines.append(line)
+                        else:
+                            # No implicit acceptance of unknown, command, agent, path,
+                            # NSS-dependent or vendor-specific configuration directives.
+                            raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    return write(dest, ('\n'.join(lines)+'\n').encode('ascii'))
+
+                main = visit(ssh, 'sshd_config', 0)
+                if not keys:
+                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                cfg.verify()
+                pubs.verify()
+            return main
+
+
+        def evaluate_native_t(root, request):
+            # Internal acquisition path, not a public API. Qualification is checked
+            # here as well as at the entry so no request can bypass it.
+            if not NATIVE_T_QUALIFIED:
+                return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+            if os.geteuid() == 0:
+                return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+            if type(request) is not dict or request.keys() != {'context_ref', 'context_spec'}:
+                return result('UNKNOWN', 'NATIVE_CONTEXT_REJECTED')
+            try:
+                native_context(request['context_ref'], request['context_spec'])
+            except ReadFailure:
+                return result('UNKNOWN', 'NATIVE_CONTEXT_REJECTED')
+            deadline = time.monotonic()+23
+            rc = None
+            try:
+                # Only a private transient closure containing allowlisted config and
+                # validated public bytes; no original private key path reaches sshd.
+                tmp = tempfile.TemporaryDirectory(prefix='pqc-ssh-native-', dir='/tmp')
+                try:
+                    main = prepare_native(root, tmp.name, deadline)
+                    argv = native_argv(main, request['context_ref'], request['context_spec'])
+                    left = deadline-time.monotonic()
+                    if left <= 0:
+                        raise LimitFailure('TIMEOUT')
+                    reason, rc, out, err = capture(argv, seconds=left)
+                finally:
+                    try:
+                        tmp.cleanup()
+                    except OSError:
+                        raise LimitFailure('CLEANUP_FAILED') from None
+            except LimitFailure as exc:
+                return result('ERROR', exc.code, rc)
+            except (OSError, ReadFailure) as exc:
+                code = read_gap(exc)
+                if code == 'SOURCE_PERMISSION':
+                    return result('PERMISSION_DENIED', code)
+                return result('UNKNOWN', 'NATIVE_SOURCE_REJECTED')
+            if reason:
+                state = 'PERMISSION_DENIED' if reason == 'PERMISSION_DENIED' else 'UNKNOWN' if reason == 'TOOL_UNAVAILABLE' else 'ERROR'
+                return result(state, reason, rc)
+            if time.monotonic() > deadline+1:
+                return result('ERROR', 'TIMEOUT', rc)
+            return parse_effective('T', rc, out, err)
+
+
+        def run_slot(slot, request=None):
+            if slot in CLIENTS:
+                if not NATIVE_Q_QUALIFIED:
+                    return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+                failed = tool_error('/usr/bin/ssh')
+                if failed:
+                    return failed
+                reason, rc, out, err = capture(CLIENTS[slot])
+                if reason:
+                    state = 'PERMISSION_DENIED' if reason == 'PERMISSION_DENIED' else 'UNKNOWN' if reason == 'TOOL_UNAVAILABLE' else 'ERROR'
+                    return result(state, reason, rc)
+                return parse_client(rc, out, err)
+            if slot in ('native-0', 'native-1'):
+                failed = tool_error('/usr/sbin/sshd')
+                if failed:
+                    return failed
+                if not NATIVE_T_QUALIFIED:
+                    return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+                try:
+                    root = os.open(ROOT_PATH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try:
+                        return evaluate_native_t(root, request)
+                    finally:
+                        os.close(root)
+                except OSError:
+                    return result('ERROR', 'EXECUTION_ERROR')
+            if slot not in ('config', 'keys'):
+                return result('ERROR', 'INVALID_SLOT')
+            try:
+                root = os.open(ROOT_PATH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    return collect_config(root) if slot == 'config' else collect_keys(root)
+                finally:
+                    os.close(root)
+            except (OSError, ReadFailure):
+                return result('ERROR', 'EXECUTION_ERROR')
+
+
+        if __name__ == '__main__':
+            if len(sys.argv) != 2 or sys.argv[1] not in (*CLIENTS, 'config', 'keys', 'native-0', 'native-1'):
+                sys.exit(2)
+            request = None
+            if sys.argv[1].startswith('native-') and NATIVE_T_QUALIFIED:
+                try:
+                    raw_request = sys.stdin.read(4097)
+                    def unique_pairs(pairs):
+                        value = {}
+                        for k, v in pairs:
+                            if k in value:
+                                raise ValueError
+                            value[k] = v
+                        return value
+                    if len(raw_request) <= 4096:
+                        request = json.loads(raw_request, object_pairs_hook=unique_pairs)
+                except (ValueError, RecursionError):
+                    pass
+            output = json.dumps(run_slot(sys.argv[1], request), ensure_ascii=True, separators=(',', ':'))
+            if len(output) > 262144:
+                output = json.dumps(result('ERROR', 'OUTPUT_LIMIT'), separators=(',', ':'))
+            print(output)
+      - "{{ ssh_slot }}"
+    expand_argument_vars: false
+    stdin: >-
+      {{ dict(context_ref=pqc_ssh_snapshot.context_refs[ssh_slot[-1] | int],
+              context_spec=(pqc_ssh_request.context_specs | default({})).get(pqc_ssh_snapshot.context_refs[ssh_slot[-1] | int])) | to_json
+         if ssh_slot.startswith('native-') else '{}' }}
+  register: pqc_ssh_query
+  when:
+    - ssh_slot != 'native-1' or pqc_ssh_snapshot.context_refs | length == 2
+    - not pqc_ssh_stopped
+    - pqc_ssh_snapshot.platform_status == 'UNVERIFIED'
+    - pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if ssh_slot == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd
+    - not ssh_slot.startswith('native-') or pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys
+    - pqc_ssh_env.stat.isreg | default(false) and pqc_ssh_env.stat.islnk is sameas false and pqc_ssh_env.stat.executable | default(false)
+    - pqc_ssh_timer.stat.isreg | default(false) and pqc_ssh_timer.stat.islnk is sameas false and pqc_ssh_timer.stat.executable | default(false)
+    - pqc_ssh_python.stat.isreg | default(false) and pqc_ssh_python.stat.executable | default(false)
+  changed_when: false
+  ignore_errors: true
+  become: false
+  no_log: true
+
+- &ssh_project_slot
+  name: Confirm one slot before the next acquisition
+  vars:
+    ssh_slot: client-kex
+  when: ssh_slot != 'native-1' or pqc_ssh_snapshot.context_refs | length == 2
+  become: false
+  no_log: true
+  block:
+    - name: Decode only a complete bounded helper result
+      vars:
+        enabled: "{{ pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys if ssh_slot == 'keys' else pqc_ssh_snapshot.flags.pqc_collect_sshd }}"
+        denied: "{{ ssh_slot.startswith('native-') and not pqc_ssh_snapshot.flags.pqc_collect_ssh_host_keys }}"
+        missing_permission: >-
+          {{ 'Permission denied' in (pqc_ssh_env.msg | default('')) or
+             'Permission denied' in (pqc_ssh_timer.msg | default('')) or
+             'Permission denied' in (pqc_ssh_python.msg | default('')) }}
+        skipped_reason: >-
+          {{ 'DISABLED_BY_USER' if not enabled else 'PLATFORM_OUT_OF_SCOPE' if pqc_ssh_snapshot.platform_status == 'OUT_OF_SCOPE' else
+             'PLATFORM_UNRESOLVED' if pqc_ssh_snapshot.platform_status == 'UNKNOWN' else 'KEY_FLAG_REQUIRED' if denied else
+             'ACQUISITION_STOPPED' if pqc_ssh_stopped else 'PERMISSION_DENIED' if missing_permission else 'TOOL_UNAVAILABLE' }}
+        skipped_state: >-
+          {{ 'NOT_SCANNED' if skipped_reason == 'DISABLED_BY_USER' else 'NOT_APPLICABLE' if skipped_reason == 'PLATFORM_OUT_OF_SCOPE' else
+             'PERMISSION_DENIED' if skipped_reason == 'PERMISSION_DENIED' else 'UNKNOWN' }}
+        failure: "{{ dict(state='ERROR', reason=('OUTER_DEADLINE' if pqc_ssh_query.rc | default(-1) in [124, 137, -9, -15] else 'HELPER_ERROR'), rc=none, rows=[], gaps=[]) }}"
+      ansible.builtin.set_fact:
+        pqc_ssh_slot_result: >-
+          {{ dict(state=skipped_state, reason=skipped_reason, rc=none, rows=[], gaps=[]) if pqc_ssh_query.skipped | default(false) else
+             (pqc_ssh_query.stdout | from_json if pqc_ssh_query.rc | default(-1) == 0 and not (pqc_ssh_query.failed | default(false)) and
+              pqc_ssh_query.stdout | default('') | length <= 262144 and not (pqc_ssh_query.stderr | default('')) else failure) }}
+        cacheable: false
+
+    - name: Reject a malformed or indeterminate slot envelope
+      ansible.builtin.assert:
+        that:
+          - pqc_ssh_slot_result is mapping
+          - pqc_ssh_slot_result.keys() | list | sort == ['gaps', 'rc', 'reason', 'rows', 'state']
+          - pqc_ssh_slot_result.state in ['COLLECTED', 'PARTIAL', 'UNKNOWN', 'ERROR', 'PERMISSION_DENIED', 'NOT_SCANNED', 'NOT_APPLICABLE']
+          - pqc_ssh_slot_result.reason is string
+          - pqc_ssh_slot_result.rc is none or (pqc_ssh_slot_result.rc is integer and pqc_ssh_slot_result.rc >= -255 and pqc_ssh_slot_result.rc <= 255)
+          - pqc_ssh_slot_result.rows is sequence and pqc_ssh_slot_result.rows is not string and pqc_ssh_slot_result.rows is not mapping and pqc_ssh_slot_result.rows | length <= 512
+          - pqc_ssh_slot_result.gaps is sequence and pqc_ssh_slot_result.gaps is not string and pqc_ssh_slot_result.gaps is not mapping and pqc_ssh_slot_result.gaps | length <= 16
+          - pqc_ssh_slot_result.reason in ['OK', 'FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP', 'TOOL_UNAVAILABLE', 'TOOL_UNSAFE_PATH', 'TOOL_NOT_EXECUTABLE', 'PERMISSION_DENIED', 'EXECUTION_ERROR', 'OUTER_DEADLINE', 'HELPER_ERROR', 'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT', 'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'NATIVE_SAFETY_UNPROVEN', 'NATIVE_SOURCE_REJECTED', 'NATIVE_CONTEXT_REJECTED', 'SOURCE_PERMISSION', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT', 'KEY_INVALID', 'PLATFORM_UNRESOLVED', 'KEY_FLAG_REQUIRED', 'DISABLED_BY_USER', 'PLATFORM_OUT_OF_SCOPE', 'ACQUISITION_STOPPED']
+          - pqc_ssh_slot_result.state in ['COLLECTED', 'PARTIAL'] or (not pqc_ssh_slot_result.rows and not pqc_ssh_slot_result.gaps)
+          - (pqc_ssh_slot_result.state == 'COLLECTED') == (pqc_ssh_slot_result.reason == 'OK')
+          - (pqc_ssh_slot_result.state == 'PARTIAL') == (pqc_ssh_slot_result.reason in ['FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP'])
+          - (pqc_ssh_slot_result.state == 'ERROR') == (pqc_ssh_slot_result.reason in ['CLEANUP_FAILED', 'OUTER_DEADLINE', 'HELPER_ERROR', 'EXECUTION_ERROR', 'TIMEOUT', 'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT'])
+          - (pqc_ssh_slot_result.state == 'PERMISSION_DENIED') == (pqc_ssh_slot_result.reason in ['PERMISSION_DENIED', 'SOURCE_PERMISSION'])
+          - (pqc_ssh_slot_result.state == 'NOT_SCANNED') == (pqc_ssh_slot_result.reason == 'DISABLED_BY_USER')
+          - (pqc_ssh_slot_result.state == 'NOT_APPLICABLE') == (pqc_ssh_slot_result.reason == 'PLATFORM_OUT_OF_SCOPE')
+          - pqc_ssh_slot_result.reason not in ['NATIVE_SAFETY_UNPROVEN', 'ACQUISITION_STOPPED'] or pqc_ssh_slot_result.rc is none
+          - pqc_ssh_slot_result.reason != 'ACQUISITION_STOPPED' or (pqc_ssh_stopped and pqc_ssh_query.skipped | default(false))
+        quiet: true
+  rescue:
+    - name: Discard malformed output and latch uncertain termination
+      ansible.builtin.set_fact:
+        pqc_ssh_slot_result: {state: ERROR, reason: HELPER_ERROR, rc: null, rows: [], gaps: []}
+        cacheable: false
+  always:
+    - name: Publish the slot and stop further acquisition on uncertainty
+      ansible.builtin.set_fact:
+        pqc_ssh_snapshot: "{{ pqc_ssh_snapshot | combine({'slots': {ssh_slot: pqc_ssh_slot_result}}, recursive=true) }}"
+        pqc_ssh_stopped: "{{ pqc_ssh_stopped or pqc_ssh_slot_result.reason in ['CLEANUP_FAILED', 'OUTER_DEADLINE', 'HELPER_ERROR', 'EXECUTION_ERROR', 'TIMEOUT'] }}"
+        pqc_ssh_queries: >-
+          {{ dict(results=pqc_ssh_queries.results + [dict(item=ssh_slot, rc=pqc_ssh_query.rc)
+             if not (pqc_ssh_query.skipped | default(false)) and pqc_ssh_query.rc is defined
+             else dict(item=ssh_slot, skipped=pqc_ssh_query.skipped | default(false))]) }}
+        cacheable: false
+
+# Each pair completes (including rescue/always) before the next command can
+# run. Never use a command loop whose results are examined after all slots.
+- <<: *ssh_acquire_slot
+  name: Acquire client-cipher slot
+  vars:
+    ssh_slot: client-cipher
+
+- <<: *ssh_project_slot
+  name: Confirm client-cipher slot
+  vars:
+    ssh_slot: client-cipher
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-key slot
+  vars:
+    ssh_slot: client-key
+
+- <<: *ssh_project_slot
+  name: Confirm client-key slot
+  vars:
+    ssh_slot: client-key
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-sig slot
+  vars:
+    ssh_slot: client-sig
+
+- <<: *ssh_project_slot
+  name: Confirm client-sig slot
+  vars:
+    ssh_slot: client-sig
+
+- <<: *ssh_acquire_slot
+  name: Acquire client-mac slot
+  vars:
+    ssh_slot: client-mac
+
+- <<: *ssh_project_slot
+  name: Confirm client-mac slot
+  vars:
+    ssh_slot: client-mac
+
+- <<: *ssh_acquire_slot
+  name: Acquire config slot
+  vars:
+    ssh_slot: config
+
+- <<: *ssh_project_slot
+  name: Confirm config slot
+  vars:
+    ssh_slot: config
+
+- <<: *ssh_acquire_slot
+  name: Acquire keys slot
+  vars:
+    ssh_slot: keys
+
+- <<: *ssh_project_slot
+  name: Confirm keys slot
+  vars:
+    ssh_slot: keys
+
+- <<: *ssh_acquire_slot
+  name: Acquire native-0 slot
+  vars:
+    ssh_slot: native-0
+
+- <<: *ssh_project_slot
+  name: Confirm native-0 slot
+  vars:
+    ssh_slot: native-0
+
+- <<: *ssh_acquire_slot
+  name: Acquire native-1 slot
+  vars:
+    ssh_slot: native-1
+
+- <<: *ssh_project_slot
+  name: Confirm native-1 slot
+  vars:
+    ssh_slot: native-1
