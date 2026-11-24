@@ -853,6 +853,163 @@ def test_r03_index_enforces_core_and_slot_bounds_before_io(root):
         error('CORE_SIZE_LIMIT',store.open,'many')
 
 
+
+# R1 correction: real Evidence validation and private filesystem round trips.
+@pytest.mark.parametrize('states,rc,bad_reason', (
+    (('COMPLETE',), 0, 'INTERRUPTED'),
+    (('COMPLETE', 'ERROR'), 5, 'INTERRUPTED'),
+    (('ERROR',), 6, 'INTERRUPTED'),
+    (('COMPLETE',), 7, 'RUN_INCOMPLETE'),
+    (('ERROR',), 7, 'RUN_INCOMPLETE'),
+))
+def test_r1_01_batch_reason_both_directions(root, schema, states, rc, bad_reason):
+    with m.RunStore(root) as store:
+        with store.begin(**kwargs(targets=TARGETS[:len(states)])) as w:
+            s, ds, rs = record(w, list(zip(TARGETS, states)))
+            doc = combined(s, ds, interrupted=rc == 7)
+            b = batch(s, doc, rs, rc)
+            bad_doc, bad_batch = deepcopy(doc), deepcopy(b)
+            bad_doc['run']['coverage_reason'] = bad_batch['reason_code'] = bad_reason
+            e.validate_document(bad_doc)  # the Evidence shape alone permits this
+            bad_raw = raw(bad_batch)
+            error('BATCH_RC', w.finalize, bad_doc, batch_raw=bad_raw, batch_rc=rc)
+            assert bad_doc['run']['coverage_reason'] == bad_reason and raw(bad_batch) == bad_raw
+            assert not (root / RID / 'prepared.json').exists()
+            assert not (root / RID / 'run_manifest.json').exists()
+            original = json.dumps(b, indent=2).encode()
+            result = w.finalize(doc, batch_raw=original, batch_rc=rc)
+        assert result.manifest['batch_rc'] == rc
+        assert result.manifest['run_state'] == doc['run']['run_state']
+        assert result.manifest['reason_code'] == doc['run']['coverage_reason'] == b['reason_code']
+        assert result.artifacts['batch_manifest.json'] == original
+        schema.validate(result.manifest)
+        assert store.open(RID) == result
+        # Rewrite the synthetic publication coherently, not just a hash or a
+        # missing file: a reader must reject the actual semantic contradiction.
+        directory = root / RID
+        changed = deepcopy(result.manifest)
+        changed['reason_code'] = bad_reason
+        changed['batch_canonical_sha256'] = digest(bad_raw)
+        altered = {'batch_manifest.json': bad_raw, 'evidence.json': e.canonical_bytes(bad_doc)}
+        for row in changed['artifacts']:
+            if row['path'] in altered:
+                value = altered[row['path']]
+                row.update(size=len(value), sha256=digest(value))
+                (directory / row['path']).write_bytes(value)
+        schema.validate(changed)
+        marker = directory / 'run_manifest.json'
+        marker.write_bytes(raw(changed))
+        error('BATCH_RC', store.open, RID)
+        assert marker.read_bytes() == raw(changed)
+        assert all((directory / p).read_bytes() == value for p, value in altered.items())
+
+
+def test_r1_01_interrupted_complete_state_rejected(root):
+    with m.RunStore(root) as store:
+        with store.begin(**kwargs()) as w:
+            s, ds, rs = record(w, [(TARGETS[0], 'COMPLETE')])
+            doc = combined(s, ds)
+            doc['run']['coverage_reason'] = 'INTERRUPTED'
+            b = batch(s, doc, rs, 7)
+            e.validate_document(doc)
+            error('BATCH_RUN_STATE', w.finalize, doc, batch_raw=raw(b), batch_rc=7)
+            assert not (root / RID / 'run_manifest.json').exists()
+
+
+def _r1_02_mixed_requirements():
+    ids = [e.host_id(None, target, run_id=RID, identity_key=target) for target in TARGETS[:2]]
+    req = {'assessment': False, 'cff': False,
+           'details': [{'host_id': hid, 'slot': 'platform'} for hid in ids]}
+    return ids, kwargs(targets=TARGETS[:2], requirements=req)
+
+
+def _r1_02_omit_complete_detail(directory, manifest, hid):
+    changed = deepcopy(manifest)
+    path = f'details/{hid}/platform.json'
+    (directory / path).unlink()
+    (directory / path).parent.rmdir()
+    (directory / 'details').rmdir()
+    changed['artifacts'] = [row for row in changed['artifacts'] if row['path'] != path]
+    changed['missing_artifacts'].append({'path': path, 'reason_code': 'REQUIRED_DETAIL_MISSING'})
+    changed['missing_artifacts'].sort(key=lambda row: row['path'])
+    return changed
+
+
+@pytest.mark.parametrize('prepared', (False, True), ids=('reader', 'recovery'))
+def test_r1_02_mixed_run_required_detail(root, schema, monkeypatch, prepared):
+    ids, args = _r1_02_mixed_requirements()
+    directory = root / RID
+    with m.RunStore(root) as store:
+        with store.begin(**args) as w:
+            # COMPLETE A must include its detail. ERROR B legitimately cannot.
+            s = w.scope
+            good = make_host(s, TARGETS[0]); t = terminal(s, good)
+            w.dispatch_intent(ids[0])
+            error('REQUIRED_DETAIL_MISSING', w.record_host, good, attempted=True, terminal=t)
+            assert not (directory / 'checkpoints' / (ids[0] + '.json')).exists()
+            w.record_host(good, attempted=True, terminal=t, details=[detail(s, good)])
+            bad = make_host(s, TARGETS[1], 'ERROR'); u = terminal(s, bad)
+            w.dispatch_intent(ids[1]); w.record_host(bad, attempted=True, terminal=u)
+            doc = combined(s, [good, bad]); b = raw(batch(s, doc, [t, u], 5))
+            if prepared:
+                original_write = m._write
+                def stop_at_marker(parent, name, data, device, **options):
+                    if name == 'run_manifest.json':
+                        raise m.StoreError('DURABILITY_UNCONFIRMED')
+                    return original_write(parent, name, data, device, **options)
+                with monkeypatch.context() as mp:
+                    mp.setattr(m, '_write', stop_at_marker)
+                    error('DURABILITY_UNCONFIRMED', w.finalize, doc, batch_raw=b, batch_rc=5)
+            else:
+                result = w.finalize(doc, batch_raw=b, batch_rc=5)
+        marker = directory / 'run_manifest.json'
+        if prepared:
+            assert not marker.exists()
+            pending = directory / 'prepared.json'
+            envelope = json.loads(pending.read_bytes())['body']
+            manifest = envelope['manifest']
+        else:
+            manifest = result.manifest
+            assert store.open(RID) == result
+        assert manifest['run_state'] == 'PARTIAL'
+        assert {h['host_id']: h['host_state'] for h in manifest['hosts']} == {
+            ids[0]: 'COMPLETE', ids[1]: 'ERROR'}
+        assert manifest['missing_artifacts'] == [
+            {'path': f'details/{ids[1]}/platform.json', 'reason_code': 'REQUIRED_DETAIL_MISSING'}]
+        schema.validate(manifest)
+        changed = _r1_02_omit_complete_detail(directory, manifest, ids[0])
+        schema.validate(changed)
+        assert all((directory / row['path']).is_file() and
+                   (directory / row['path']).stat().st_size == row['size'] and
+                   digest((directory / row['path']).read_bytes()) == row['sha256']
+                   for row in changed['artifacts'])
+        if prepared:
+            envelope['manifest'] = changed
+            pending.write_bytes(m._seal(envelope, m.MAX_MANIFEST))
+            before = pending.read_bytes()
+            error('REQUIRED_DETAIL_MISSING', store.recover, RID)
+            assert not marker.exists() and pending.read_bytes() == before
+        else:
+            marker.write_bytes(raw(changed))
+            error('REQUIRED_DETAIL_MISSING', store.open, RID)
+            assert marker.read_bytes() == raw(changed)
+
+
+def test_r1_02_recover_valid_mixed_missing_detail(root, schema):
+    ids, args = _r1_02_mixed_requirements()
+    with m.RunStore(root) as store:
+        with store.begin(**args) as w:
+            record(w, [(TARGETS[0], 'COMPLETE'), (TARGETS[1], 'ERROR')], use_details=True)
+        result = store.recover(RID)
+        assert result.manifest['run_state'] == 'PARTIAL'
+        assert result.manifest['recovery'] is True
+        assert f'details/{ids[0]}/platform.json' in result.artifacts
+        assert result.manifest['missing_artifacts'] == [
+            {'path': 'batch_manifest.json', 'reason_code': 'BATCH_MANIFEST_UNAVAILABLE'},
+            {'path': f'details/{ids[1]}/platform.json', 'reason_code': 'REQUIRED_DETAIL_MISSING'}]
+        schema.validate(result.manifest)
+        assert store.open(RID) == result
+
 # Child entry points exist only in this test file; no product fault-injection
 # parameter, CLI or dynamically selected callback is exposed.
 if __name__ == '__main__' and len(sys.argv) >= 4 and sys.argv[1] == '__child__':

@@ -133,7 +133,9 @@ The manifest preserves both raw artifact SHA and canonical batch SHA,
 plus the actual rc supplied by the trusted caller. It labels this contract
 `B04_S1_CONTRACT_ONLY`; it is not an assertion that #8 was executed.
 Normal rc 0/5/6 requires COMPLETE/PARTIAL/ERROR respectively; rc 7 is a
-caught interruption with reason INTERRUPTED and non-COMPLETE state. A run
+caught interruption with reason INTERRUPTED and non-COMPLETE state.
+INTERRUPTED is valid only with rc 7; contradictory rc/state/reason inputs
+are rejected, not rewritten, during publication, reading and recovery. A run
 is COMPLETE only for a nonempty all-COMPLETE host set without interruption,
 PARTIAL when any host provides valid coverage but the run is incomplete,
 otherwise ERROR. No report existence is used as a success oracle.
@@ -230,8 +232,9 @@ service-inventory. Assessment and raw rules are all-or-nothing; the fixed
 actual evaluator recomputes canonical bytes and rejects mismatches. CFF
 and typed detail are **SYNTHETIC only in S1**. Unknown producer formats or
 versions fail closed. Required detail cannot be missing from a COMPLETE
-host; a COMPLETE run cannot omit any required artifact. A partial/error
-run records the missing paths and fixed reasons.
+host, even within a PARTIAL run. Publication, reading and recovery enforce
+this same per-host requirement. A COMPLETE run cannot omit any required
+artifact; a partial/error run records permitted missing paths and fixed reasons.
 
 The closed synthetic detail envelope contains `format_version: "1.0.0"`,
 `format: "S1_TYPED_FIXTURE"`, `run_id`, `host_id`, `slot`, `collection_ids`,

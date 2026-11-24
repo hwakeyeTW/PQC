@@ -802,7 +802,7 @@ def _batch(s, doc, batch, rc, attempts):
     state = _run_state(doc['hosts'], interrupted=rc == 7)
     require(batch['run_state'] == doc['run']['run_state'] == state, 'BATCH_RUN_STATE')
     require(rc == 7 or rc == {'COMPLETE': 0, 'PARTIAL': 5, 'ERROR': 6}[state], 'BATCH_RC')
-    if rc == 7: require(batch['reason_code'] == 'INTERRUPTED', 'BATCH_RC')
+    require((rc == 7) == (batch['reason_code'] == 'INTERRUPTED'), 'BATCH_RC')
     if doc['run'].get('coverage_reason') is not None:
         require(doc['run']['coverage_reason'] == batch['reason_code'], 'BATCH_RUN_REASON')
     return batch
@@ -983,6 +983,7 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
     if s['requirements']['cff'] and cff_raw is None:
         missing.append({'path': FILES['cff'][0], 'reason_code': 'REQUIRED_ARTIFACT_MISSING'})
     for hid, slot in sorted(required_details - have_details):
+        require(hs[hid]['host_state'] != 'COMPLETE', 'REQUIRED_DETAIL_MISSING')
         missing.append({'path': '/'.join(_slot('detail', hid, slot)[0]), 'reason_code': 'REQUIRED_DETAIL_MISSING'})
     require(state != 'COMPLETE' or not missing, 'REQUIRED_ARTIFACT_MISSING')
     counts = Counter(h['host_state'] for h in rows)
