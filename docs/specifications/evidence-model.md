@@ -1,4 +1,4 @@
-# PQC Evidence Model V1.0.0
+# PQC Evidence Model 1.0.0 / 1.1.0
 
 **Contract:** PQC-M1-01 / Issue #10 / R1. Product release V2.0, schema
 `1.0.0`, collector version and rule version are independent. This is the
@@ -17,8 +17,9 @@ projection 與 schema conformity；#14–18 等 collector 另行實作。
 本地 `schemas/evidence.schema.json` 為 JSON Schema draft 2020-12，logical
 `$id = urn:pqc:evidence:1.0.0`，所有 `$ref` 只指向同文件 `$defs`。
 `tools/evidence.py` 為純 Python stdlib library；不從資料指定 schema、檔案、
-URL、命令、template 或動態 import。V1 只接受 exact `1.0.0`，未知版本、
-欄位及 evidence kind 拒絕；未來需明示新版本及 migration，不默默降級。
+URL、命令、template 或動態 import。原 V1.0.0 契約維持不變；#14 S1 新增 exact `1.1.0`（見 §9）。
+依 `schema_version` 選擇版本，未知版本、欄位及 evidence kind 拒絕；
+不自動升降版或 migration。
 
 ## 2. Envelope / registry
 
@@ -56,6 +57,7 @@ origin/hash 可因個別原始資料而異。Native 及 synthetic evidence 有�
 
 ## 3. Typed observations and algorithms
 
+下表為 1.0.0 的原始 shape；1.1.0 僅依 §9 擴充三種 typed data。
 所有 data fields 在下表必填；`?` 不代表省略，而表示 value 可以 null。
 非空 bounded text 只用允許的單一 normalized scalar，不是 raw dump。
 
@@ -206,7 +208,8 @@ JSON interoperable safe-integer 範圍，count nonnegative。這些為 R1 的有
 model-specific 初始表示；需求擴充經核准版本化，不靜默截斷。
 
 Schema 與專用 Python validator 共用 model-specific field declarations；
-`model_schema()` 只回傳本地 schema 物件以供開發交叉核對，不是通用
+`model_schema()` 預設回傳原 1.0.0 本地 schema；明示版本可取得 1.1.0。
+回傳獨立物件供開發交叉核對，不是通用
 JSON Schema interpreter。JSON Schema 約束 shape/type/enum/pattern、
 required/closed objects/conditional variants；Python 另做 strict JSON lexical
 檢查、Unicode control/format/surrogate、calendar/size/ID、references 及
@@ -439,3 +442,109 @@ release QA 交 #28；synthetic L4/L5 不代表任何 live negotiation/usage。
 }
 ```
 
+
+## 9. Evidence 1.1.0 — platform metadata extension (#14 S1)
+
+Contract: [PQC-M2-01 R1](https://github.com/hwakeyeTW/PQC/issues/14#issuecomment-7133535002),
+§§2–3. `schemas/evidence.schema.json` (1.0.0) remains byte-identical.
+`schemas/evidence-1.1.0.schema.json` is a separate draft 2020-12 snapshot,
+`$id = urn:pqc:evidence:1.1.0`, local `#/$defs/` references only. Both schemas
+are generated from the shared model declarations. `SCHEMA_VERSION` and
+`model_schema()` default remain `1.0.0`; `LATEST_SCHEMA_VERSION = "1.1.0"`.
+Use `model_schema("1.1.0")` explicitly. `parse_evidence_bytes`,
+`validate_document` and `canonical_bytes` keep their API and select the
+exact document version. No inferred version, auto-upgrade/downgrade, loss
+of fields, change of existing IDs, external resolver or I/O. Unknown versions
+(including a non-string version) fail with `SCHEMA_VERSION`. Missing version
+remains an error. Old producers, importer and saved documents can use 1.0.0.
+New producers must explicitly emit 1.1.0. Old PLATFORM_INFO shape cannot be
+used as a 1.1.0 platform row; PACKAGE_INVENTORY's original shape is retained.
+
+### 9.1 Typed data delta (all other 1.0.0 contracts unchanged)
+
+- **PLATFORM_INFO:** required `os_family`, `os_version`, `distribution`,
+  `major`, `minor`, `patch`, `architecture`, `platform_status`. The first
+  seven fields are nullable. Family/distribution/architecture are normalized
+  lowercase ASCII slugs of 1–64 characters (`[a-z0-9][a-z0-9_-]{0,63}`).
+  Version is a canonical decimal string with one to three components, no
+  leading zero except zero itself. The components are nonnegative safe
+  integers; no bool, float or missing intermediate component. Version and
+  tuple must agree exactly, and unknown tuple means null version. Conflicting
+  source version metadata is normalized by the producer to unknown with a
+  gap reason, not resolved by the validator. The producer uses explicit
+  trusted aliases (e.g. OracleLinux/Oracle Linux or trusted os-release ID
+  `ol` -> `oracle-linux`); family `redhat` alone is not an OL identity.
+- **platform_status:** `UNKNOWN` if distribution is unknown, or Oracle Linux
+  has incompatible known family, unknown major, or major 9 with unknown
+  minor. `OUT_OF_SCOPE` for a reliably identified non-OL distribution or a
+  non-9 OL major (without a family contradiction). `UNVERIFIED` for identified
+  Oracle Linux major 9 with known minor and family null or `redhat`.
+  All 9.x numeric minors, including 9.10, are eligible for this classification;
+  9.7/9.8/9.9 are test targets, not a whitelist or proven support. No
+  `SUPPORTED` value; this status authorizes neither dispatch nor PQC claims.
+- **PACKAGE_INVENTORY:** retain required name/version/present and add optional
+  nullable `release` (RPM RELEASE, using the existing bounded VERSION scalar,
+  not the OS version) and `architecture` (same normalized slug). Absent and
+  null both mean unknown; no automatic fill. Either new non-null field needs
+  `present=true`. A known package can support its own L1 observation, not L2
+  runtime capability. The #14 release RPM producer uses null asset/algorithm
+  and the rule engine must not classify release RPMs as crypto libraries.
+- **TOOL_AVAILABILITY:** required `tool_id` (rpm, openssl, ssh, sshd,
+  ssh-keygen, update-crypto-policies, timeout), `lookup_scope` (exact
+  `SYSTEM_EXECUTABLE_PATHS`), `available` (bool or null). True/false describe
+  the known executable-file result in the approved fixed system candidates,
+  not all PATH locations or cryptographic capability. Unknown/permission/error
+  results use null with the existing collection state/reason. Tool absence is
+  not a PQC FAIL. No probing, command execution or filesystem lookup in this API.
+
+The 1.1.0 PLATFORM_INFO and TOOL_AVAILABILITY rows require null `asset_id`
+and `algorithm`. All-null platform observation fields plus status UNKNOWN,
+or tool `available=null`, do not themselves justify COLLECTED/PARTIAL. Known
+metadata may support acquisition/coverage, but neither kind supplies any
+L1–L5 PASS/FAIL or direct PASS/FAIL finding evidence. Keep acquisition state
+independent of platform_status. Shape constraints include the metadata null
+associations and package presence conditional. Python additionally verifies
+platform tuple/status consistency, references, IDs, scope equality, source,
+observation time, usage interval, and acquisition/assessment semantics;
+standard Schema shape validity alone is insufficient. The V1 representation,
+limits, ID-V1, canonical sorting, L1–L5 and exact UTC/nanosecond semantics stay
+unchanged. The validator does not normalize input or prove provenance.
+
+Synthetic **typed data examples**, not standalone Evidence documents or
+actual OL observations (insert each in the corresponding kind in a 1.1.0
+host-scope evidence row):
+
+```json
+{
+  "PLATFORM_INFO": {"os_family": "redhat", "os_version": "9.10", "distribution": "oracle-linux", "major": 9, "minor": 10, "patch": null, "architecture": "x86_64", "platform_status": "UNVERIFIED"},
+  "PACKAGE_INVENTORY": {"name": "oraclelinux-release", "version": "9.9", "present": true, "release": "0.1", "architecture": "x86_64"},
+  "TOOL_AVAILABILITY": {"tool_id": "openssl", "lookup_scope": "SYSTEM_EXECUTABLE_PATHS", "available": true}
+}
+```
+
+### 9.2 Producer handoff and verification
+
+#14 S2 is separate. `collector_id=pqc-platform`, `collector_version=1.0.0`,
+per-host logical scopes `platform-info`, `release-rpm-oraclelinux-release`,
+`release-rpm-oraclelinux-release-el9`, `tool-<tool_id>`. The summary's scope
+must equal its parent collection scope. Multiple RPM records use `r-` plus
+SHA-256 of the compact UTF-8 canonical JSON tuple [name, version, release,
+architecture] as observation_key (never array index or delimiter join).
+Use the existing ID-V1 helpers for collection/evidence IDs; preserve exact
+scope target_id and truthful source/time/backrefs. Single observations use
+fixed logical keys. Not attempted means NOT_SCANNED with an allowed reason
+and no manufactured evidence. Known absence, unknown, error, denied and
+partial observations remain distinct. Summary counts describe the named
+producer scope, not the registry size. No assessment or report publication
+side effect. Neither this extension nor UNVERIFIED grants managed dispatch.
+
+A01–A03 R4 focused checks use the original evidence suite plus the version,
+platform, RPM, tool, association and round-trip cases. Generate the new
+snapshot with `model_schema("1.1.0")`; preserve the original schema and the
+two complete 1.0.0 examples in §8. Use the commands in §7 plus
+`python3 -m json.tool schemas/evidence-1.1.0.schema.json`. Where existing
+jsonschema is available, check both local snapshots and synthetic fixtures.
+No new runtime dependency. Actual Controller/OL, release RPM and system
+path behavior, collector/guard, offline installation and report integration
+are NOT_TESTED in S1 and remain for the applicable S2/#8 and release #28
+checks. S1 is a data contract, not a platform collector or formal QA verdict.
