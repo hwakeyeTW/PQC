@@ -1,0 +1,45 @@
+{
+  "policy_version": 1,
+  "collector_classes": {
+    "pqc_collect_packages": "passive",
+    "pqc_collect_openssl": "passive",
+    "pqc_collect_sshd": "passive",
+    "pqc_collect_ssh_host_keys": "passive",
+    "pqc_collect_system_certs": "passive",
+    "pqc_collect_crypto_policy": "passive",
+    "pqc_collect_nginx_certs": "extended",
+    "pqc_collect_tls_services": "active"
+  },
+  "profiles": {
+    "baseline": {
+      "pqc_collect_packages": true,
+      "pqc_collect_openssl": true,
+      "pqc_collect_sshd": true,
+      "pqc_collect_ssh_host_keys": true,
+      "pqc_collect_system_certs": true,
+      "pqc_collect_crypto_policy": true,
+      "pqc_collect_nginx_certs": false,
+      "pqc_collect_tls_services": false
+    },
+    "extended": {
+      "pqc_collect_packages": true,
+      "pqc_collect_openssl": true,
+      "pqc_collect_sshd": true,
+      "pqc_collect_ssh_host_keys": true,
+      "pqc_collect_system_certs": true,
+      "pqc_collect_crypto_policy": true,
+      "pqc_collect_nginx_certs": true,
+      "pqc_collect_tls_services": false
+    },
+    "active": {
+      "pqc_collect_packages": true,
+      "pqc_collect_openssl": true,
+      "pqc_collect_sshd": true,
+      "pqc_collect_ssh_host_keys": true,
+      "pqc_collect_system_certs": true,
+      "pqc_collect_crypto_policy": true,
+      "pqc_collect_nginx_certs": true,
+      "pqc_collect_tls_services": false
+    }
+  }
+}

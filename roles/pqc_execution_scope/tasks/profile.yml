@@ -1,0 +1,15 @@
+---
+# Explicit tasks_from: profile only. The trusted caller must use a dedicated
+# localhost play (gather_facts: false, local connection, no privilege escalation),
+# load the fixed V1 policy with duplicate rejection, and separate flag sources.
+# No authorization is inferred from inventory, role defaults or this result.
+# Arbitrary Ansible variable overrides are outside this adapter's trust boundary;
+# the supported entry point must enforce that boundary before any managed play.
+- name: Resolve the controller scan profile without dispatch
+  resolve_scan_profile:
+    policy: "{{ pqc_profile_policy }}"
+    request: "{{ pqc_profile_request }}"
+  connection: local
+  become: false
+  no_log: true
+  register: pqc_profile_result
