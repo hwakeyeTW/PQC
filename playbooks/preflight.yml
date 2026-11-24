@@ -1,0 +1,13 @@
+---
+# SCOPE-R1: deliberately no managed play or reusable authorization token.
+- name: Reject direct scan invocation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Direct Ansible scan execution is not available
+      ansible.builtin.fail:
+        msg: "LIVE_NOT_AVAILABLE: use tools/pqc_scan.py --plan-only"
+      tags:
+        - always
