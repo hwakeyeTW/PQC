@@ -1,0 +1,262 @@
+---
+# Historical local scan entry point: anonymization review candidate.
+# Intended legacy path: playbooks/scan_ol9.yml
+# Synthetic scope example: scopes/canary.yml
+# Static reference only; do not execute as a scan or automatically load in CI.
+
+- name: Build approved PQC scan scope
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    # Either or both selectors may be supplied in the scope file.
+    pqc_scan_hosts: []
+    pqc_scan_groups: []
+    # Deliberate per-run ceiling; set a higher value in the scope file only
+    # after reviewing the expanded group membership.
+    pqc_max_hosts: 10
+    pqc_report_root: "{{ playbook_dir | dirname }}/reports"
+    pqc_report_dir: "{{ pqc_report_root }}/{{ pqc_run_id }}"
+
+  tasks:
+    - name: Validate scan scope types and run ID
+      ansible.builtin.assert:
+        that:
+          - pqc_run_id is defined
+          - (pqc_run_id | default('')) is match('^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+          - pqc_scan_hosts is sequence
+          - pqc_scan_hosts is not string
+          - pqc_scan_groups is sequence
+          - pqc_scan_groups is not string
+          - ((pqc_scan_hosts | length) + (pqc_scan_groups | length)) > 0
+          - (pqc_max_hosts | int) >= 1
+          - (pqc_max_hosts | int) <= 5000
+          - (groups.get('pqc_runtime_targets', []) | length) == 0
+        fail_msg: >-
+          Invalid scope. Supply at least one list: pqc_scan_hosts and/or
+          pqc_scan_groups, a safe pqc_run_id, and pqc_max_hosts from 1 to 5000.
+
+    - name: Validate inventory hosts and group names
+      ansible.builtin.assert:
+        that:
+          - (pqc_scan_hosts | difference(groups.get('all', [])) | length) == 0
+          - (pqc_scan_groups | difference(groups.keys() | list) | length) == 0
+          - (pqc_scan_groups | intersect(['all', 'ungrouped', 'pqc_runtime_targets']) | length) == 0
+          - (pqc_scan_groups | unique | list | length) == (pqc_scan_groups | length)
+        fail_msg: >-
+          One or more hosts/groups are not present in the current Dynamic
+          Inventory, or a forbidden broad group was selected. Check the exact
+          names using ansible-inventory --graph; 'all' and 'ungrouped' are not allowed.
+
+    - name: Expand approved inventory group membership
+      ansible.builtin.set_fact:
+        _pqc_group_hosts: "{{ (_pqc_group_hosts | default([])) + (groups[item] | list) }}"
+      loop: "{{ pqc_scan_groups }}"
+
+    - name: Combine and deduplicate selected inventory hosts
+      ansible.builtin.set_fact:
+        _pqc_resolved_hosts: >-
+          {{ (pqc_scan_hosts + (_pqc_group_hosts | default([]))) | unique | list }}
+
+    - name: Enforce resolved host count and safe names
+      ansible.builtin.assert:
+        that:
+          - (_pqc_resolved_hosts | length) > 0
+          - (_pqc_resolved_hosts | length) <= (pqc_max_hosts | int)
+          - (_pqc_resolved_hosts | difference(groups.get('all', [])) | length) == 0
+          - (_pqc_resolved_hosts | intersect(['localhost', '127.0.0.1', '::1']) | length) == 0
+          - (_pqc_resolved_hosts | reject('match', '^[A-Za-z0-9][A-Za-z0-9_.-]*$') | list | length) == 0
+        fail_msg: >-
+          Resolved {{ _pqc_resolved_hosts | length }} host(s); limit is
+          pqc_max_hosts={{ pqc_max_hosts }}. The selected hosts may be empty,
+          exceed the limit, or include a prohibited/unsafe name. Review the
+          actual group membership before changing the limit.
+        success_msg: >-
+          Approved {{ _pqc_resolved_hosts | length }} distinct inventory host(s)
+          from hosts={{ pqc_scan_hosts }} and groups={{ pqc_scan_groups }}.
+
+    - name: Reject localhost connection targets
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].ansible_connection | default('ssh')) != 'local'
+        fail_msg: "{{ item }} uses ansible_connection=local; refusing a local scan target."
+      loop: "{{ _pqc_resolved_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Display exact approved destinations
+      ansible.builtin.debug:
+        msg: "{{ item }} => {{ hostvars[item].ansible_host | default(item) }}"
+      loop: "{{ _pqc_resolved_hosts }}"
+
+    - name: Check whether this report run already exists
+      ansible.builtin.stat:
+        path: "{{ pqc_report_dir }}"
+      register: _pqc_existing_run
+
+    - name: Refuse to overwrite a previous report run
+      ansible.builtin.assert:
+        that:
+          - not _pqc_existing_run.stat.exists
+        fail_msg: >-
+          Report directory exists: {{ pqc_report_dir }}.
+          Select a new pqc_run_id; old reports are never overwritten.
+
+    - name: Create private report directories on controller
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ pqc_report_root }}"
+        - "{{ pqc_report_dir }}"
+        - "{{ pqc_report_dir }}/cbom"
+
+    - name: Create ephemeral scan group from existing inventory hosts
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: pqc_runtime_targets
+      loop: "{{ _pqc_resolved_hosts }}"
+
+- name: Scan approved Oracle Linux 9 hosts
+  hosts: pqc_runtime_targets
+  become: true
+  gather_facts: true
+  serial: 2
+  vars:
+    pqc_report_dir: "{{ playbook_dir | dirname }}/reports/{{ pqc_run_id }}"
+
+    # Start with conservative read-only discovery; no active port probes.
+    pqc_collect_packages: true
+    pqc_collect_openssl: true
+    pqc_collect_nginx_certs: false
+    pqc_collect_sshd: true
+    pqc_collect_ssh_host_keys: true
+    pqc_collect_system_certs: true
+    pqc_collect_tls_services: false
+    pqc_collect_crypto_policy: true
+
+  pre_tasks:
+    - name: Restrict scanning to Oracle Linux 9.7 or newer 9.x
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'OracleLinux'
+          - ansible_facts['distribution_major_version'] == '9'
+          - ansible_facts['distribution_version'] is version('9.7', '>=')
+          - ansible_facts['distribution_version'] is version('10.0', '<')
+        fail_msg: >-
+          Unsupported OS on {{ inventory_hostname }}:
+          {{ ansible_facts['distribution'] | default('unknown') }}
+          {{ ansible_facts['distribution_version'] | default('unknown') }}.
+          Only Oracle Linux 9.7+ within major version 9 is approved.
+        success_msg: >-
+          Accepted {{ inventory_hostname }}:
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+
+  roles:
+    - role: crypto_posture_snapshot
+
+  tasks:
+    - name: Enrich report with Oracle Linux release
+      ansible.builtin.set_fact:
+        pqc_crypto_report: >-
+          {{ pqc_crypto_report | combine({
+               'os_distribution': ansible_facts['distribution'],
+               'os_version': ansible_facts['distribution_version']
+             }) }}
+
+    - name: Save JSON report on control node
+      ansible.builtin.copy:
+        content: "{{ pqc_crypto_report | to_nice_json }}\n"
+        dest: "{{ pqc_report_dir }}/{{ inventory_hostname }}.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Save HTML report on control node
+      ansible.builtin.template:
+        src: "{{ playbook_dir | dirname }}/roles/crypto_posture_snapshot/templates/report.html.j2"
+        dest: "{{ pqc_report_dir }}/{{ inventory_hostname }}.html"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Build CycloneDX CBOM in memory
+      generate_cbom:
+        crypto_report: "{{ pqc_crypto_report }}"
+      register: _pqc_cbom_result
+      delegate_to: localhost
+      become: false
+
+    - name: Save CBOM with restricted permissions
+      ansible.builtin.copy:
+        content: "{{ _pqc_cbom_result.cbom | to_nice_json }}\n"
+        dest: "{{ pqc_report_dir }}/cbom/{{ inventory_hostname }}.cbom.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Mark host as completed only after all three reports were saved
+      ansible.builtin.set_fact:
+        pqc_report_complete: true
+
+    - name: Display per-host report paths
+      ansible.builtin.debug:
+        msg:
+          - "JSON: {{ pqc_report_dir }}/{{ inventory_hostname }}.json"
+          - "HTML: {{ pqc_report_dir }}/{{ inventory_hostname }}.html"
+          - "CBOM: {{ pqc_report_dir }}/cbom/{{ inventory_hostname }}.cbom.json"
+
+- name: Summarize this scan run on the controller
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+  vars:
+    pqc_report_dir: "{{ playbook_dir | dirname }}/reports/{{ pqc_run_id }}"
+
+  tasks:
+    - name: Collect successful per-host results from runtime group
+      ansible.builtin.set_fact:
+        _pqc_all_reports: >-
+          {{ groups.get('pqc_runtime_targets', [])
+             | map('extract', hostvars)
+             | selectattr('pqc_report_complete', 'defined')
+             | selectattr('pqc_report_complete', 'equalto', true)
+             | map(attribute='pqc_crypto_report') | list }}
+
+    - name: Build run summary
+      ansible.builtin.set_fact:
+        _pqc_summary:
+          run_id: "{{ pqc_run_id }}"
+          selected_hosts: "{{ groups.get('pqc_runtime_targets', []) }}"
+          successful_hosts: "{{ _pqc_all_reports | map(attribute='host') | list }}"
+          hosts_without_report: >-
+            {{ groups.get('pqc_runtime_targets', [])
+               | difference(_pqc_all_reports | map(attribute='host') | list) }}
+          selected_count: "{{ groups.get('pqc_runtime_targets', []) | length }}"
+          completed_count: "{{ _pqc_all_reports | length }}"
+          generated_at: "{{ ansible_date_time.iso8601 }}"
+          reports: "{{ _pqc_all_reports }}"
+
+    - name: Save aggregate JSON report
+      ansible.builtin.copy:
+        content: "{{ _pqc_summary | to_nice_json }}\n"
+        dest: "{{ pqc_report_dir }}/pqc_fleet_report.json"
+        mode: '0600'
+
+    - name: Save aggregate HTML report
+      ansible.builtin.template:
+        src: "{{ playbook_dir | dirname }}/roles/crypto_posture_snapshot/templates/report_aggregate.html.j2"
+        dest: "{{ pqc_report_dir }}/pqc_fleet_report.html"
+        mode: '0600'
+      when: _pqc_all_reports | length > 0
+
+    - name: Display run summary
+      ansible.builtin.debug:
+        msg:
+          - "Selected: {{ _pqc_summary.selected_count }}"
+          - "Completed: {{ _pqc_summary.completed_count }}"
+          - "Without report: {{ _pqc_summary.hosts_without_report }}"
+          - "Output: {{ pqc_report_dir }}"
