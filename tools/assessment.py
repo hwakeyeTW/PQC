@@ -312,7 +312,13 @@ def _coverage_nontrivial(row):
     # Only the minimum proof needed for a coverage gap; never a verdict from
     # metadata or version. Use the same typed observations as Evidence V1.
     kind, d = row['evidence_kind'], row['data']
-    if kind in ('PLATFORM_INFO', 'ASSET_METADATA'):
+    if kind == 'PLATFORM_INFO':
+        # 1.1.0 status is derived; the original 1.0.0 fields still count.
+        return any(v is not None for k, v in d.items() if k != 'platform_status')
+    if kind == 'TOOL_AVAILABILITY':
+        # A known result is coverage only, including a proven absence.
+        return d['available'] is not None
+    if kind == 'ASSET_METADATA':
         return any(v is not None for v in d.values())
     if kind == 'COLLECTION_SUMMARY':
         return d['applicable'] is True and d['attempted'] is True and d['coverage'] != 'UNKNOWN'

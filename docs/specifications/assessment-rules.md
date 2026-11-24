@@ -171,6 +171,17 @@ collections containing only direct observations, the direct claims already
 describe the available facts; no additional coverage finding is necessary.
 Absence of a claim is not PASS/FAIL or proof of non-applicability.
 
+For Evidence 1.1.0, PLATFORM_INFO contributes nontrivial coverage only
+when an acquired field other than the derived platform_status is non-null.
+An all-null platform with UNKNOWN status contributes no actual evidence.
+The original 1.0.0 platform shape and coverage semantics are unchanged.
+TOOL_AVAILABILITY contributes coverage only for available=true or false
+(a known result within its lookup scope); null is unknown. Neither kind
+belongs to L1-L5 or directly produces readiness PASS/FAIL. A PARTIAL
+finding cites only the usable, nontrivial observations of its collection
+and subject. Release RPM metadata does not imply crypto readiness; a
+generic package's own L1 installed claim retains its existing semantics.
+
 NOT_APPLICABLE requires an explicit applicable=false COLLECTION_SUMMARY,
 usable applicability acquisition, exact same scope and subject, and a
 consistent known annotation when algorithm is specified. For a direct claim,
@@ -205,9 +216,12 @@ version conflicts raise ASSESSMENT_CONFLICT, never silently replace data.
 For changed evidence or approved rules, evaluate the original unassessed
 Evidence document and retain the previous evaluated document separately.
 No upgrade/downgrade of Evidence schema, taxonomy or rule version is guessed.
-The V1 contract accepts only Evidence 1.0.0; future 1.1.0 integration requires
-its own approved compatibility contract. Output size is subject to the
-original Evidence model's bound; no truncation or partial verdict is returned.
+The assessment engine uses the installed Evidence validator's exact version
+dispatch. The original 1.0.0 remains supported; the approved #14 S1 1.1.0
+contract is compatible when that validator is installed. No version is
+guessed or changed, and the original ID/API, rule and taxonomy versions
+remain unchanged. Output size is subject to the Evidence model's bound;
+no truncation or partial verdict is returned.
 
 ## R4 tests and remaining work
 
@@ -220,6 +234,16 @@ Only synthetic data and the unchanged Evidence public API are used. Tests
 cover positive/negative exact aliases, collision and malformed rules,
 all five levels, scope/subject/algorithm/time and acquisition boundaries,
 strict output/ID/reference validation, idempotence, conflicts, and no I/O.
+F-R1-01 adds focused coverage and original-shape cases to the existing
+tests. The fixed #14 S1 validator (Head b16cbfa59098b7e445fe4e42189a17747654dbc3,
+validator Blob e74577bf3cdc015dd363a4bd12d6438897ea7dbc) and both schema
+snapshots are used in a separate private synthetic projection, not copied
+into this PR. Its bounded compatibility smoke calls the reusable
+r1_v11_cases, check_r1_coverage_case and check_r1_release_package helpers
+in the assessment test module with the real evaluate_document and canonical
+APIs. It checks CE01/CE02a/b, known/unknown metadata, absence of readiness
+claims, invalid incomplete observations, package-own L1 and original V1
+inputs. This is synthetic compatibility, not actual collector integration.
 The engine does not modify existing normalize_pqc, generate_cbom, CFF,
 HTML, legacy importer, or any collector. Actual producer normalization,
 legacy import (#12), CFF (#13), CBOM (#26), Portal and release integration

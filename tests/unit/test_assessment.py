@@ -655,3 +655,124 @@ def test_a02_fips_boolean_only_describes_its_setting(rules):
     claims = f.evaluate(rules)['claims']
     assert len(claims) == 1 and claims[0]['level'] == 'L3'
     assert claims[0]['assessment_state'] == 'PASS' and claims[0]['subject']['algorithm_id'] is None
+
+
+# F-R1-01: the two versions share the coverage contract, not readiness.
+# The 1.1.0 cases are also reusable by a private, fixed-S1 validator projection.
+# No optional dependency, discovery of a validator path, or skipped test is needed.
+_R1_PLATFORM_NULL = {'os_family': None, 'os_version': None, 'distribution': None,
+    'major': None, 'minor': None, 'patch': None, 'architecture': None,
+    'platform_status': 'UNKNOWN'}
+_R1_PLATFORM_KNOWN = {**_R1_PLATFORM_NULL, 'os_family': 'redhat', 'os_version': '9.10',
+    'distribution': 'oracle-linux', 'major': 9, 'minor': 10,
+    'architecture': 'x86_64', 'platform_status': 'UNVERIFIED'}
+
+
+def r1_tool(available):
+    return {'tool_id': 'openssl', 'lookup_scope': 'SYSTEM_EXECUTABLE_PATHS',
+            'available': available}
+
+
+@pytest.mark.parametrize('kind,data,expected', [
+    ('PLATFORM_INFO', {'os_family': None, 'os_version': None}, False),
+    ('PLATFORM_INFO', {'os_family': 'Oracle Linux', 'os_version': None}, True),
+    ('PLATFORM_INFO', {'os_family': None, 'os_version': '9.9'}, True),
+    ('PLATFORM_INFO', _R1_PLATFORM_NULL, False),
+    ('PLATFORM_INFO', {**_R1_PLATFORM_NULL, 'architecture': 'x86_64'}, True),
+    ('PLATFORM_INFO', _R1_PLATFORM_KNOWN, True),
+    ('TOOL_AVAILABILITY', r1_tool(True), True),
+    ('TOOL_AVAILABILITY', r1_tool(False), True),
+    ('TOOL_AVAILABILITY', r1_tool(None), False),
+])
+def test_r1_coverage_nontrivial(kind, data, expected):
+    assert a._coverage_nontrivial({'evidence_kind': kind, 'data': data}) is expected
+    assert kind not in a.KIND_LEVEL
+
+
+def check_r1_coverage_case(rules, version, state, observations, expected, reason, selected):
+    """Use the actual imported validator, assessment and canonical public APIs.
+
+    For 1.1.0, call from the fixed S1 projection; the original 1.0.0 validator
+    must not be made to accept the new version or have its functions mocked.
+    """
+    f = Fixture()
+    f.doc['schema_version'] = version
+    c = f.collection(state=state)
+    rows = [f.add(c, key, kind, deepcopy(data)) for key, kind, data in observations]
+    before = deepcopy(f.doc)
+    if expected == 'REJECT':
+        with pytest.raises(e.EvidenceError) as exc:
+            a.evaluate_document(f.doc, rules)
+        assert exc.value.code == reason and f.doc == before
+        return
+    out = f.evaluate(rules)
+    assert f.doc == before
+    assert out['schema_version'] == version and out['claims'] == []
+    assert len(out['findings']) == 1
+    finding = out['findings'][0]
+    assert finding['rule_id'] == 'pqc-coverage'
+    assert finding['assessment_state'] == expected and finding['reason_code'] == reason
+    assert finding['claim_ids'] == []
+    assert finding['evidence_ids'] == sorted(rows[i]['evidence_id'] for i in selected)
+    canonical = e.canonical_bytes(out)
+    assert e.parse_evidence_bytes(canonical) == out
+    assert e.canonical_bytes(a.evaluate_document(out, rules)) == canonical
+    assert out['evidence'] == json.loads(e.canonical_bytes(before))['evidence']
+
+
+@pytest.mark.parametrize('data,state,expected,reason,selected', [
+    ({'os_family': 'Oracle Linux', 'os_version': '9.9'}, 'PARTIAL',
+     'PARTIAL', 'INCOMPLETE_COLLECTION', (0,)),
+    ({'os_family': None, 'os_version': None}, 'UNKNOWN',
+     'UNKNOWN', 'ACQUISITION_UNAVAILABLE', (0,)),
+    ({'os_family': None, 'os_version': None}, 'PARTIAL',
+     'REJECT', 'PARTIAL_EVIDENCE_REQUIRED', ()),
+])
+def test_r1_original_platform_coverage(rules, data, state, expected, reason, selected):
+    check_r1_coverage_case(rules, '1.0.0', state, [('platform', 'PLATFORM_INFO', data)],
+                           expected, reason, selected)
+
+
+def r1_v11_cases():
+    """Named, bounded 1.1.0 end-to-end cases; no source/path selection."""
+    unknown = ('platform', 'PLATFORM_INFO', _R1_PLATFORM_NULL)
+    known = ('platform', 'PLATFORM_INFO', _R1_PLATFORM_KNOWN)
+    arch = ('platform', 'PLATFORM_INFO', {**_R1_PLATFORM_NULL, 'architecture': 'x86_64'})
+    yes, no, missing = [('tool', 'TOOL_AVAILABILITY', r1_tool(v)) for v in (True, False, None)]
+    return [
+        ('CE01', 'PARTIAL', [unknown, yes], 'PARTIAL', 'INCOMPLETE_COLLECTION', (1,)),
+        ('CE02a', 'PARTIAL', [yes], 'PARTIAL', 'INCOMPLETE_COLLECTION', (0,)),
+        ('CE02b', 'PARTIAL', [no], 'PARTIAL', 'INCOMPLETE_COLLECTION', (0,)),
+        ('unknown-platform-known-absent', 'PARTIAL', [unknown, no], 'PARTIAL', 'INCOMPLETE_COLLECTION', (1,)),
+        ('known-platform-unknown-tool', 'PARTIAL', [known, missing], 'PARTIAL', 'INCOMPLETE_COLLECTION', (0,)),
+        ('known-architecture', 'PARTIAL', [arch], 'PARTIAL', 'INCOMPLETE_COLLECTION', (0,)),
+        ('both-known', 'PARTIAL', [known, no], 'PARTIAL', 'INCOMPLETE_COLLECTION', (0, 1)),
+        ('all-unknown', 'UNKNOWN', [unknown, missing], 'UNKNOWN', 'ACQUISITION_UNAVAILABLE', (0, 1)),
+        ('unknown-tool-only', 'UNKNOWN', [missing], 'UNKNOWN', 'ACQUISITION_UNAVAILABLE', (0,)),
+        ('unknown-partial-invalid', 'PARTIAL', [unknown, missing], 'REJECT', 'PARTIAL_EVIDENCE_REQUIRED', ()),
+        ('unknown-collected-invalid', 'COLLECTED', [unknown], 'REJECT', 'COLLECTION_EVIDENCE_REQUIRED', ()),
+        ('known-but-failed-acquisition', 'ERROR', [yes], 'UNKNOWN', 'ACQUISITION_UNAVAILABLE', (0,)),
+        ('collected-present', 'COLLECTED', [yes], 'UNKNOWN', 'NO_DIRECT_EVIDENCE', (0,)),
+        ('collected-absent', 'COLLECTED', [no], 'UNKNOWN', 'NO_DIRECT_EVIDENCE', (0,)),
+    ]
+
+
+def check_r1_release_package(rules, present):
+    f = Fixture()
+    f.doc['schema_version'] = '1.1.0'
+    c = f.collection()
+    row = f.add(c, 'rpm', 'PACKAGE_INVENTORY', {'name': 'oraclelinux-release',
+        'version': '9.9' if present else None, 'present': present,
+        'release': '0.1' if present else None, 'architecture': 'x86_64' if present else None})
+    f.add(c, 'platform', 'PLATFORM_INFO', deepcopy(_R1_PLATFORM_KNOWN))
+    f.add(c, 'tool', 'TOOL_AVAILABILITY', r1_tool(True))
+    out = f.evaluate(rules)
+    assert out['schema_version'] == '1.1.0'
+    assert len(out['claims']) == 1
+    cl = out['claims'][0]
+    assert cl['level'] == 'L1' and cl['subject']['algorithm_id'] is None
+    assert cl['assessment_state'] == ('PASS' if present else 'FAIL')
+    assert cl['evidence_ids'] == [row['evidence_id']]
+    assert len(out['findings']) == 2
+    assert next(x for x in out['findings'] if x['rule_id'] == 'pqc-coverage')['assessment_state'] == 'UNKNOWN'
+    assert e.parse_evidence_bytes(e.canonical_bytes(out)) == out
