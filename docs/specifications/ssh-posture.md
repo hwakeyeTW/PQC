@@ -1,20 +1,24 @@
 # SSH posture: internal acquisition and Evidence 1.1.0 (S01-S03)
 
-Approved contract: Issue #17, proposal #7138840806 and dispatch #7138943919.
-This is an **engineering candidate on HOLD**, not a live entry point. In
-particular, S02's safe native `sshd -T` invocation and actual positive control
-are NOT_IMPLEMENTED/NOT_TESTED. The SSH client binary is also unavailable in
-this development environment. An exit-zero focused suite with these mandatory
-skips is not S01/S02 acceptance. Do not merge or authorize live dispatch on the
-basis of the other tests. #8 owns before-connect/remote termination, #9 owns
-private storage, and #28 owns actual target/controller release verification.
+Approved contract: Issue #17, proposal #7138840806, dispatch #7138943919,
+R2 dispatch #7141561283 and latest Owner clarification #7141633127.
+This is an **engineering candidate on HOLD**, not a live entry point. Development
+uses test-only `sshd -G` / `-G -C`; production acquisition is fixed to `sshd -T`
+/ `-T -C`, without a G fallback. S02a shared effective-result projection is
+implemented; S02b has a restricted acquisition candidate but both production
+qualification gates remain false. Actual native G, T and client Q controls
+remain NOT_TESTED; no native safety or public-only parity claim is made.
+Do not merge or authorize live dispatch on the basis of synthetic results.
+#8 owns before-connect/remote termination, #9 owns private storage, and #28
+owns actual target/controller release verification.
 
 ## Internal request and acquisition
 
 Use `pqc_platform_crypto`, `tasks_from: ssh_posture`, by short name or
 `security.compliance_pqc_readiness.pqc_platform_crypto`. The trusted caller
 supplies `pqc_ssh_request` with exactly `flags`, `platform_status` and optional
-`context_refs`. Flags must be exact booleans `pqc_collect_sshd` and
+`context_refs`, and optional `context_specs` only together with `context_refs`.
+Flags must be exact booleans `pqc_collect_sshd` and
 `pqc_collect_ssh_host_keys` from the existing per-host profile decision.
 `platform_status` is the same host's trusted #14 `UNVERIFIED` (eligible OL9,
 not supported-platform proof), `OUT_OF_SCOPE` or `UNKNOWN`. The role does not
@@ -23,9 +27,16 @@ must own that binding, without inventory/report overrides of internal facts.
 
 `context_refs` defaults to `["global-default"]`; if supplied, it is a unique
 list of one or two opaque references (`global-default` or `ctx-` plus 64
-lowercase hex digits). These are reserved context identities, not a completed
-`-C` authorization contract. No actual username, address, DNS, group, NSS or
-agent context is consumed until S02 is safely implemented.
+lowercase hex digits). For the future qualified T path, `context_specs` is a
+closed mapping keyed only by supplied non-default context refs. Each value is
+exactly `{user, host, addr, laddr, lport}`: bounded ASCII account and hostname,
+canonical literal IP addresses (no zone), integer port 1..65535. Its ref is
+`ctx-` plus SHA-256 of compact ASCII JSON array
+`["ssh-native-context-v1", user, host, addr, laddr, lport]`. No guessed/default
+context for an unresolved ref, no comma/flag injection, no user/group lookup by
+this validator. The trusted caller must authorize the actual values; they
+travel only in the no-log helper input and are never projected. A ref alone
+is not authority. Actual native NSS/DNS behavior remains unqualified.
 
 The role is `become: false`, `no_log: true`, non-cacheable. It emits only
 `pqc_ssh_snapshot` with `flags`, `platform_status`, `context_refs`, `slots`.
@@ -33,21 +44,23 @@ Each fixed slot is `{state, reason, rc, rows, gaps}`. `rc` is null or an exact
 integer in [-255,255] (not a bool); file and blocked native slots have null rc.
 `gaps` is a sorted unique array of closed constant reason codes. The snapshot
 validator rejects unknown fields, invalid rows, cross-slot reason misuse,
-disabled/ineligible results with acquired data and forged native positives.
+disabled/ineligible results with acquired data, malformed effective rows,
+mixed modes and unqualified native-source positives.
 
 | Slot | Flag | Scope and bounded source |
 |---|---|---|
 | `client-kex`, `client-cipher`, `client-key`, `client-sig`, `client-mac` | sshd | fixed `/usr/bin/ssh -Q kex/cipher/key/sig/mac`, respectively |
 | `config` | sshd | fixed main, allowlisted Include closure, lexical metadata only |
 | `keys` | ssh_host_keys | fixed single-level public-key candidates, not private files |
-| `native-0`, optional `native-1` | sshd AND ssh_host_keys | opaque context; **no `sshd` execution in this candidate** |
+| `native-0`, optional `native-1` | sshd AND ssh_host_keys | context-bound T candidate; **hard-disabled pending qualification** |
 
 Disabled flags acquire nothing for that family. Reliable out-of-scope platform
 is `NOT_APPLICABLE`; unknown eligibility remains `UNKNOWN`. With sshd enabled
 but keys disabled, native slots are `UNKNOWN/KEY_FLAG_REQUIRED`, with zero
 native helper calls. With both enabled, the native helper only checks the
 fixed `/usr/sbin/sshd` executable and returns a tool gap or
-`UNKNOWN/NATIVE_SAFETY_UNPROVEN`. It cannot emit a successful native row.
+`UNKNOWN/NATIVE_SAFETY_UNPROVEN`. No Inventory/CLI/env/role parameter can
+enable native evaluation. G is never a production execution mode.
 
 The outer command uses the fixed system `env -i`, `timeout` and Python
 (`-I -B`); the system Python's normal installation symlink is trusted, not a
@@ -156,22 +169,60 @@ known public-key source observations; unique assets are separate. Complete
 zero is allowed only after a successful bounded candidate enumeration with no
 gaps. Unknown layout or bad input never creates a complete zero assertion.
 
-## S02 hold and required follow-up
+## S02: shared parser, restricted T candidate and remaining HOLD
 
-A real `sshd -T` may read host private keys, Includes, NSS/DNS, agent data and
-other dependencies. This candidate intentionally contains no native eval
-launch path and rejects any proposed positive native result at normalization.
-It cannot produce `EFFECTIVE_CONFIGURATION allowed=true/false` or L3 claims.
-To clear HOLD, implement a verified readonly confined native evaluator with
-public-only host key input, exact config closure/Include order/backend and
-trusted default plus distinct approved `-C` contexts. Prove actual `sshd -T`
-positive outputs for Include and different Match results and demonstrate real
-private-key, outside-path, agent, network and external-command restrictions.
-Do not assume `-T`, non-root or permission alone supplies those restrictions.
-Do not use an actual managed host, real private key or mock-only substitute.
-The current approved development Runtime lacks ssh/sshd/ssh-keygen, and
-restoring the same archive cannot supply them. A later compatible offline tool
-material and independently bounded implementation/verification are needed.
+The test-only G and production T output use the same `parse_effective` and
+closed typed snapshot. Successful rows have exactly `{mode, setting, token}`,
+mode G or T, lowercase canonical setting, original exact algorithm token.
+Required lists: kexalgorithms, ciphers, macs, hostkeyalgorithms,
+pubkeyacceptedalgorithms, hostbasedacceptedalgorithms, casignaturealgorithms;
+gssapikexalgorithms is optional. Old `*acceptedkeytypes` names normalize to
+`*acceptedalgorithms`; duplicate aliases are contradictions even if equal.
+No raw unrelated output (accounts, addresses, path values, commands) is
+returned. Nonzero rc or stderr, missing list, malformed/duplicate token,
+modifier, wildcard, `none`, invalid encoding, absent final newline, over
+16 KiB combined output or over 256 tokens rejects the entire result. A valid
+list is explicit permission in that context only, not negotiation, loaded
+host key, daemon reload or denial of any absent algorithm. Synthetic fixtures
+are SYNTHETIC, not an actual G/T native result. Mode and context are in the
+observation identity and mandatory companion; mixed mode slots are rejected.
+Actual T positives are additionally refused by the controller qualification
+gate; G can never be a NATIVE_COLLECTOR positive. G has no product command path.
+
+The internal candidate `evaluate_native_t` is wired from the native slot but
+requires the code-only `NATIVE_T_QUALIFIED` gate (false here), non-root and a
+validated context. It constructs fixed `/usr/sbin/sshd -T -f <private config>`
+and adds `-C <validated spec>` only for a named context. No shell, fixed
+minimal env, closed child stdin, 23 s shared deadline plus outer bound, no
+retry. The helper uses the existing descriptor-anchored readers to create a
+fresh 0700 private directory with exclusive 0600 files. It requires explicit
+fixed HostKey declarations in the main file before Include/Match, reads only
+the matching validated public keys, removes comments, rewrites HostKey paths
+to the copied public representation and preserves the approved Include
+boundaries and sorted order. It rejects arbitrary paths, cycles/repeated or
+empty Includes, unknown directives, user/group/host/exec predicates, agent,
+external commands, unsafe or missing keys. The candidate subset permits the
+recognized crypto directives, `Match all` or one Address/LocalAddress/
+LocalPort condition and yes/no PasswordAuthentication/PubkeyAuthentication.
+It does not accept a general OL configuration; any excluded directive means
+UNKNOWN rather than silently removing it. The stage is cleaned before output
+parsing; cleanup failure discards the result. Crash/outer hard-kill cleanup
+and native execution containment are not yet proven.
+
+This source transformation is a candidate, NOT proof of identical effective
+settings or safety. `-T` additionally performs key checks; even `-G` cannot
+be assumed safe across distributions, defaults, Includes, NSS and helpers.
+Current QA #7141119955 failed outside-file/exec isolation controls; this
+container has no fixed sshd or ssh binary. Real G/-C, actual T/-C public-only
+parity and dependency restrictions (private keys, agent, NSS/DNS, external
+files/programs, network, child/temporary cleanup) remain NOT_TESTED and the
+production gates must not be enabled on parser/fixture results. The test-side
+G command is separate and remains gated on a qualified existing environment.
+Synthetic FS and unit capture-boundary tests prove preparation/rejection and
+cleanup logic, not the behavior of the native binary. No runtime restore or
+new isolation platform is proposed. #28 must verify actual OL T/-C and real
+safe supported configurations; unresolved required safety/feature gaps remain
+HOLD until a separately reviewed qualification or Owner scope decision.
 
 ## Mandatory paired Evidence and details (format 1.0.0)
 
@@ -193,7 +244,13 @@ use exact #11 SSH_KEX, SSH_CIPHER and SIGNATURE classification. `client-key`
 and `client-mac` have UNKNOWN taxonomy here: no certificate-key, signature,
 cipher or KEM substitution. Missing lists never give supported=false. Static
 config rows use ASSET_METADATA (observed source/setting name, version null,
-asset/algorithm null); never an effective allow/deny. Known key assets use
+asset/algorithm null); never an effective allow/deny. Shared effective rows
+use EFFECTIVE_CONFIGURATION with setting, original token as effective_value,
+and allowed=true for the exact context. KEX/cipher/CA signature use the
+existing SSH_KEX/SSH_CIPHER/SIGNATURE taxonomy. MAC, host-key and public-key
+authentication lists and unknown tokens retain UNKNOWN taxonomy; no inferred
+negative, service asset or L4/L5. In this candidate the only accepted effective
+positives are SYNTHETIC and cannot mix into a native run. Known key assets use
 `asset_kind=public_key`, identity `sha256-<wire digest>`, stable only for a
 stable host, otherwise run-scoped per ID-V1. ASSET_METADATA name is this
 observed identity, version null, algorithm observation conservatively UNKNOWN

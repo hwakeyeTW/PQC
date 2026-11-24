@@ -427,7 +427,7 @@ def test_child_reap_no_agent_env_and_closed_stdin(monkeypatch):
         'import os,sys; print(sorted(os.environ)); print(len(sys.stdin.read()))'], 2)
     assert (reason, rc, err) == (None, 0, b'') and out == b"['HOME', 'LC_ALL', 'PATH']\n0\n"
     reason, rc, out, err = H['capture']([sys.executable, '-I', '-B', '-c',
-        'import os,time; print(os.getpid(),flush=True); time.sleep(5)'], .4)
+        'import os,time; print(os.getpid(),flush=True); time.sleep(8)'], 2)
     assert reason == 'TIMEOUT' and rc < 0 and not err
     with pytest.raises(ProcessLookupError):
         os.kill(int(out), 0)
@@ -459,7 +459,8 @@ def test_actual_client_query_smoke_required():
 
 def test_required_safe_native_effective_control():
     # No unproven sshd -T invocation even on a host with sshd installed.
-    pytest.skip('S02 HOLD: real isolated public-only sshd -T / Include / Match / safety proof not implemented')
+    assert H['NATIVE_T_QUALIFIED'] is ssh.NATIVE_T_QUALIFIED is False
+    pytest.skip('S02 HOLD: actual production -T/-C, public-only equivalence and native safety not qualified')
 
 
 def native_play(role, root, tmp_path, requests, expected):
@@ -531,3 +532,312 @@ def test_real_source_permissions_and_missing(tmp_path):
             ssh.validate_snapshot(snapshot(**{slot: r}))
     finally:
         cfg.chmod(0o600); key.chmod(0o600)
+
+
+# Synthetic effective output; never presented as native OpenSSH output.
+EFFECTIVE_FIXTURE = (b'KexAlgorithms curve25519-sha256,mlkem768x25519-sha256,future-kex\n'
+                     b'ciphers aes128-ctr,aes256-ctr\n'
+                     b'macs hmac-sha2-256\n'
+                     b'hostkeyalgorithms ssh-ed25519\n'
+                     b'PubkeyAcceptedKeyTypes ssh-ed25519\n'
+                     b'hostbasedacceptedalgorithms ssh-ed25519\n'
+                     b'casignaturealgorithms RSA-SHA256\n'
+                     b'passwordauthentication yes\n'
+                     b'allowusers DUMMY-USER-SENTINEL\n')
+NATIVE_SPEC = dict(user='fixture_user', host='fixture.example.invalid', addr='192.0.2.2',
+                   laddr='198.51.100.2', lport=22)
+NATIVE_CTX = H['digest']('ctx', ['ssh-native-context-v1', NATIVE_SPEC['user'], NATIVE_SPEC['host'],
+                               NATIVE_SPEC['addr'], NATIVE_SPEC['laddr'], NATIVE_SPEC['lport']])
+
+
+def effective(mode='T', out=EFFECTIVE_FIXTURE, rc=0, err=b''):
+    return H['parse_effective'](mode, rc, out, err)
+
+
+@pytest.mark.parametrize('mode', ['G', 'T'])
+def test_r2_shared_effective_roundtrip(mode):
+    one = effective(mode)
+    two = effective(mode, EFFECTIVE_FIXTURE.replace(b'PubkeyAcceptedKeyTypes ssh-ed25519',
+                                                    b'pubkeyacceptedalgorithms rsa-sha2-256'))
+    assert one['state'] == two['state'] == 'COLLECTED'
+    assert {r['mode'] for r in one['rows']} == {mode}
+    assert any(r['token'] == 'RSA-SHA256' for r in one['rows'])
+    assert not any(r['setting'] in ('passwordauthentication', 'allowusers') for r in one['rows'])
+    assert all(r['setting'] != 'pubkeyacceptedkeytypes' for r in one['rows'])
+    d, detail = norm(snapshot(contexts=['global-default', NATIVE_CTX], **{'native-0': one, 'native-1': two}))
+    assert detail['source']['source_kind'] == 'SYNTHETIC'
+    assert b'DUMMY-USER-SENTINEL' not in ssh.canonical(detail)
+    rows = [e for e in d['evidence'] if e['evidence_kind'] == 'EFFECTIVE_CONFIGURATION']
+    assert len(rows) == len(one['rows']) + len(two['rows'])
+    assert {e['collection_id'] for e in rows} == {r['collection_id'] for r in detail['records'] if r['slot'].startswith('native-')}
+    assert all(e['data']['allowed'] is True and e['asset_id'] is None for e in rows)
+    for e in rows:
+        if e['data']['setting'] in ('macs', 'hostkeyalgorithms', 'pubkeyacceptedalgorithms', 'hostbasedacceptedalgorithms') or e['data']['effective_value'] == 'future-kex':
+            assert e['algorithm']['family'] == 'UNKNOWN'
+    a = assessment.evaluate_document(ev.parse_evidence_bytes(ev.canonical_bytes(d)), RULES)
+    assert all(c['level'] == 'L3' for c in a['claims'])
+    assert {c['assessment_state'] for c in a['claims']} == {'PASS', 'UNKNOWN'}
+    assert not any(c['assessment_state'] == 'FAIL' for c in a['claims'])
+    ssh.validate_details(a, detail, RULES)
+    forged = copy.deepcopy(detail)
+    rec = next(r for r in forged['records'] if r['slot'] == 'native-0')
+    rec['observations'][0]['row']['mode'] = 'T' if mode == 'G' else 'G'
+    rehash(forged)
+    with pytest.raises(ev.EvidenceError):
+        ssh.validate_details(a, forged, RULES)
+
+
+@pytest.mark.parametrize('mode', ['G', 'T'])
+def test_r2_native_source_must_not_accept_unqualified_positive(mode):
+    s = snapshot(**{'native-0': effective(mode)})
+    doc = document()
+    native = dict(SOURCE, source_kind='NATIVE_COLLECTOR')
+    doc['run']['source'] = native
+    with pytest.raises(ev.EvidenceError, match='SSH_NATIVE_SOURCE_UNQUALIFIED'):
+        ssh.normalize_ssh(doc, HOST, s, native, TIME, RULES)
+    # A synthetic producer cannot be mixed into a native run by relabeling.
+    with pytest.raises(ev.EvidenceError, match='SYNTHETIC_MIX'):
+        ssh.normalize_ssh(doc, HOST, s, SOURCE, TIME, RULES)
+    with pytest.raises(ev.EvidenceError):
+        ssh.validate_snapshot(snapshot(keys_on=False, **{'native-0': effective(mode)}))
+
+
+def test_r2_no_mixed_native_modes_or_forged_rows():
+    with pytest.raises(ev.EvidenceError, match='SSH_NATIVE_MODE_MISMATCH'):
+        ssh.validate_snapshot(snapshot(contexts=['global-default', NATIVE_CTX],
+                                       **{'native-0': effective('G'), 'native-1': effective('T')}))
+    for modify in (lambda r: r['rows'].append(copy.deepcopy(r['rows'][-1])),
+                   lambda r: r['rows'].pop(0), lambda r: r['rows'][0].update(token='-bad'),
+                   lambda r: r['rows'][0].update(mode='G'), lambda r: r.update(rc=1),
+                   lambda r: r['rows'][0].update(extra='DUMMY-SECRET')):
+        r = effective()
+        modify(r)
+        with pytest.raises(ev.EvidenceError):
+            ssh.validate_snapshot(snapshot(**{'native-0': r}))
+
+
+@pytest.mark.parametrize('out,rc,err,reason', [
+    (EFFECTIVE_FIXTURE, 7, b'', 'COMMAND_FAILED'),
+    (EFFECTIVE_FIXTURE, 0, b'diagnostic', 'COMMAND_FAILED'),
+    (EFFECTIVE_FIXTURE, 1, b'Permission denied', 'PERMISSION_DENIED'),
+    (b'', 0, b'', 'NO_OUTPUT'),
+    (EFFECTIVE_FIXTURE[:-1], 0, b'', 'INCOMPLETE_OUTPUT'),
+    (EFFECTIVE_FIXTURE + b'\xff\n', 0, b'', 'INVALID_ENCODING'),
+    (EFFECTIVE_FIXTURE + b'ciphers aes128-ctr\n', 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE + b'pubkeyacceptedalgorithms ssh-ed25519\n', 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE.replace(b'ciphers aes128-ctr,aes256-ctr\n', b''), 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE.replace(b'ciphers aes128-ctr,aes256-ctr', b'ciphers'), 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE.replace(b'aes128-ctr,aes256-ctr', b'aes128-ctr,aes128-ctr'), 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE.replace(b'aes128-ctr,aes256-ctr', b'+aes128-ctr'), 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE.replace(b'aes128-ctr,aes256-ctr', b'none'), 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE + b'KexAlgorithms=x\n', 0, b'', 'UNRECOGNIZED_OUTPUT'),
+    (EFFECTIVE_FIXTURE + b'gssapikexalgorithms ' + b','.join(b'x'+str(i).encode() for i in range(257)) + b'\n', 0, b'', 'ROW_LIMIT'),
+    (EFFECTIVE_FIXTURE + b'x'*16384, 0, b'', 'OUTPUT_LIMIT'),
+])
+def test_r2_effective_parser_rejects_whole_result(out, rc, err, reason):
+    for mode in ('G', 'T'):
+        r = effective(mode, out, rc, err)
+        assert r['reason'] == reason and not r['rows'] and not r['gaps']
+        ssh.validate_snapshot(snapshot(**{'native-0': r}))
+
+
+def test_r2_fixed_t_argv_and_context_rejection():
+    path = '/tmp/pqc-fixture/config-0'
+    base = ['/usr/sbin/sshd', '-T', '-f', path]
+    assert H['native_argv'](path, 'global-default', None) == base
+    assert H['native_argv'](path, NATIVE_CTX, NATIVE_SPEC) == base + [
+        '-C', 'user=fixture_user,host=fixture.example.invalid,addr=192.0.2.2,laddr=198.51.100.2,lport=22']
+    for spec in (dict(NATIVE_SPEC, user='-G'), dict(NATIVE_SPEC, host='a,b'),
+                 dict(NATIVE_SPEC, addr='192.0.2.2,user=root'), dict(NATIVE_SPEC, laddr='fe80::1%eth0'),
+                 dict(NATIVE_SPEC, lport=True), dict(NATIVE_SPEC, lport=0), dict(NATIVE_SPEC, extra='-G'),
+                 None, NATIVE_SPEC):
+        with pytest.raises(H['ReadFailure'], match='NATIVE_CONTEXT_REJECTED'):
+            H['native_argv'](path, 'ctx-'+'0'*64, spec)
+    with pytest.raises(H['ReadFailure']):
+        H['native_argv'](path, 'global-default', NATIVE_SPEC)
+
+
+def native_fixture(root):
+    put(root/'etc/ssh/sshd_config', 'HostKey /etc/ssh/ssh_host_ed25519_key\n'
+        'PasswordAuthentication yes\nInclude /etc/ssh/sshd_config.d/*.conf\n'
+        'Match Address 192.0.2.0/24\n PasswordAuthentication no\n')
+    put(root/'etc/ssh/sshd_config.d/20-last.conf', 'Ciphers aes256-ctr\n')
+    put(root/'etc/ssh/sshd_config.d/10-first.conf', 'Include /etc/crypto-policies/back-ends/opensshserver.config\n')
+    put(root/'etc/crypto-policies/back-ends/opensshserver.config', 'KexAlgorithms curve25519-sha256\n')
+    put(root/'etc/ssh/ssh_host_ed25519_key.pub', public()[0])
+    marker = put(root/'etc/ssh/ssh_host_ed25519_key', b'DUMMY-PRIVATE-KEY-SENTINEL')
+    os.utime(marker, ns=(1000000000, 1000000000))
+    return marker
+
+
+def prepare_fixture(root, stage):
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return Path(H['prepare_native'](fd, str(stage), time.monotonic()+2))
+    finally:
+        os.close(fd)
+
+
+def test_r2_public_only_native_closure_actual_fs(tmp_path):
+    root, stage = tmp_path/'fixture', tmp_path/'stage'
+    stage.mkdir(mode=0o700)
+    marker = native_fixture(root)
+    before = marker.stat().st_atime_ns
+    main = prepare_fixture(root, stage)
+    text = main.read_text()
+    assert 'HostKey '+str(stage/'public-0.pub') in text
+    assert 'Include '+str(stage/'config-1')+' '+str(stage/'config-3') in text
+    assert 'Include '+str(stage/'config-2') in (stage/'config-1').read_text()
+    assert (stage/'config-2').read_bytes() == b'KexAlgorithms curve25519-sha256\n'
+    assert (stage/'config-3').read_bytes() == b'Ciphers aes256-ctr\n'
+    assert 'Match Address 192.0.2.0/24\nPasswordAuthentication no' in text
+    assert marker.stat().st_atime_ns == before
+    for path in stage.iterdir():
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert b'DUMMY-PRIVATE-KEY-SENTINEL' not in path.read_bytes()
+    assert b'DUMMY-COMMENT' not in (stage/'public-0.pub').read_bytes()
+    assert H['parse_public']((stage/'public-0.pub').read_bytes()) == H['parse_public'](public()[0])
+
+
+@pytest.mark.parametrize('problem', ['include', 'user-match', 'agent', 'command', 'unknown', 'no-global-key',
+                                      'late-key', 'key-symlink', 'include-symlink', 'cycle', 'key-invalid'])
+def test_r2_unsafe_closure_rejected_before_capture(tmp_path, monkeypatch, problem):
+    root = tmp_path/'fixture'
+    native_fixture(root)
+    config = root/'etc/ssh/sshd_config'
+    raw = config.read_text()
+    if problem == 'include': put(config, raw.replace('/etc/ssh/sshd_config.d/*.conf', '/outside.conf'))
+    if problem == 'user-match': put(config, raw.replace('Match Address 192.0.2.0/24', 'Match User fixture_user'))
+    if problem == 'agent': put(config, raw+'HostKeyAgent /tmp/agent.sock\n')
+    if problem == 'command': put(config, raw+'AuthorizedKeysCommand /usr/bin/true\n')
+    if problem == 'unknown': put(config, raw+'UnknownDirective yes\n')
+    if problem == 'no-global-key': put(config, raw.split('\n',1)[1])
+    if problem == 'late-key': put(config, raw.split('\n',1)[1]+raw.split('\n',1)[0]+'\n')
+    if problem == 'key-symlink':
+        key = root/'etc/ssh/ssh_host_ed25519_key.pub'; key.unlink(); key.symlink_to(root/'etc/ssh/ssh_host_ed25519_key')
+    if problem == 'include-symlink':
+        inc = root/'etc/ssh/sshd_config.d/20-last.conf'; inc.unlink(); inc.symlink_to(config)
+    if problem == 'cycle': put(root/'etc/ssh/sshd_config.d/20-last.conf', 'Include /etc/ssh/sshd_config.d/*.conf\n')
+    if problem == 'key-invalid': put(root/'etc/ssh/ssh_host_ed25519_key.pub', b'DUMMY INVALID PUBLIC\n')
+    # The qualification gate is changed in this isolated unit-test namespace
+    # only, to exercise the future path. No real sshd process is allowed.
+    monkeypatch.setitem(H, 'NATIVE_T_QUALIFIED', True)
+    monkeypatch.setitem(H, 'capture', lambda *a, **kw: pytest.fail('unsafe closure reached child'))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        r = H['evaluate_native_t'](fd, {'context_ref': 'global-default', 'context_spec': None})
+    finally:
+        os.close(fd)
+    assert r['state'] in ('UNKNOWN', 'ERROR', 'PERMISSION_DENIED') and not r['rows']
+    assert r['reason'] in ('NATIVE_SOURCE_REJECTED', 'SOURCE_PERMISSION', 'SOURCE_DRIFT', 'SOURCE_LIMIT')
+    ssh.validate_snapshot(snapshot(**{'native-0': r}))
+
+
+def test_r2_native_unqualified_zero_child_or_source_reads(monkeypatch):
+    assert H['NATIVE_T_QUALIFIED'] is ssh.NATIVE_T_QUALIFIED is False
+    monkeypatch.setitem(H, 'tool_error', lambda path: None)
+    monkeypatch.setitem(H, 'prepare_native', lambda *a: pytest.fail('unqualified source read'))
+    monkeypatch.setitem(H, 'capture', lambda *a, **kw: pytest.fail('unqualified child'))
+    assert H['run_slot']('native-0', dict(context_ref=NATIVE_CTX, context_spec=NATIVE_SPEC)) == H['result']('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+    assert H['evaluate_native_t'](-1, {}) == H['result']('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+
+
+@pytest.mark.parametrize('reason', [None, 'TIMEOUT', 'OUTPUT_LIMIT', 'CLEANUP_FAILED'])
+def test_r2_native_t_candidate_fixed_capture_and_cleanup(tmp_path, monkeypatch, reason):
+    root = tmp_path/'fixture'; native_fixture(root)
+    stages = []
+    monkeypatch.setitem(H, 'NATIVE_T_QUALIFIED', True)
+    def fake_capture(argv, seconds):
+        # Unit test boundary only: this output is synthetic, no sshd executed.
+        assert 0 < seconds <= 23
+        assert argv[:3] == ['/usr/sbin/sshd', '-T', '-f'] and argv[4] == '-C' and len(argv) == 6
+        assert argv[-1].startswith('user=fixture_user,host=fixture.example.invalid,')
+        stage = Path(argv[3]).parent
+        assert stage.stat().st_mode & 0o777 == 0o700
+        assert all(p.stat().st_mode & 0o777 == 0o600 for p in stage.iterdir())
+        stages.append(stage)
+        return reason, 0 if reason is None else -9, EFFECTIVE_FIXTURE, b''
+    monkeypatch.setitem(H, 'capture', fake_capture)
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        r = H['evaluate_native_t'](fd, {'context_ref': NATIVE_CTX, 'context_spec': NATIVE_SPEC})
+    finally:
+        os.close(fd)
+    assert len(stages) == 1 and not stages[0].exists()
+    if reason is None:
+        assert r == effective('T')
+    else:
+        assert r['state'] == 'ERROR' and r['reason'] == reason and not r['rows']
+    ssh.validate_snapshot(snapshot(**{'native-0': r}))
+
+
+def development_g_argv(path, ref, spec):
+    # Test-only G path. No runtime switch or fallback in the product helper.
+    argv = H['native_argv'](str(path), ref, spec)
+    return [argv[0], '-G', *argv[2:]]
+
+
+def test_r2_development_g_argv_separate():
+    assert development_g_argv('/tmp/fixture/config-0', 'global-default', None) == [
+        '/usr/sbin/sshd', '-G', '-f', '/tmp/fixture/config-0']
+    assert development_g_argv('/tmp/fixture/config-0', NATIVE_CTX, NATIVE_SPEC)[4] == '-C'
+    assert H['native_argv']('/tmp/fixture/config-0', NATIVE_CTX, NATIVE_SPEC)[1] == '-T'
+
+
+def test_r2_actual_development_g_control(tmp_path):
+    # Requires an actual qualified G execution environment. Do not make mere
+    # executable presence, non-root or the network guard a safety proof.
+    if H['tool_error']('/usr/sbin/sshd'):
+        pytest.skip('Development -G/-G -C: fixed sshd unavailable')
+    # Current QA evidence explicitly fails outside-file/exec negative controls.
+    # An independently qualified exact G environment is required before this
+    # test-only constant is changed. Never change the production T gate for G.
+    development_g_qualified = False
+    if not development_g_qualified:
+        pytest.skip('Development -G/-G -C: native safety qualification unavailable')
+    root, stage = tmp_path/'fixture', tmp_path/'stage'
+    stage.mkdir(mode=0o700)
+    native_fixture(root)
+    main = prepare_fixture(root, stage)
+    for ref, spec, password in [('global-default', None, b'passwordauthentication yes'),
+                                (NATIVE_CTX, NATIVE_SPEC, b'passwordauthentication no')]:
+        reason, rc, out, err = H['capture'](development_g_argv(main, ref, spec))
+        assert reason is None and rc == 0 and not err
+        assert password in out.lower().splitlines()
+        r = effective('G', out, rc, err)
+        assert r['state'] == 'COLLECTED'
+        d, detail = norm(snapshot(contexts=[ref], **{'native-0': r}))
+        ssh.validate_details(assessment.evaluate_document(d, RULES), detail, RULES)
+
+
+
+def test_r2_context_rejected_before_source_or_child(monkeypatch):
+    monkeypatch.setitem(H, 'NATIVE_T_QUALIFIED', True)
+    monkeypatch.setitem(H, 'prepare_native', lambda *a: pytest.fail('invalid context source read'))
+    monkeypatch.setitem(H, 'capture', lambda *a, **kw: pytest.fail('invalid context child'))
+    assert H['evaluate_native_t'](-1, {'context_ref': NATIVE_CTX, 'context_spec': dict(NATIVE_SPEC, user='-G')}) == H['result']('UNKNOWN', 'NATIVE_CONTEXT_REJECTED')
+
+
+def test_r2_stage_cleanup_failure_discards_native_result(tmp_path, monkeypatch):
+    root = tmp_path/'fixture'; native_fixture(root)
+    monkeypatch.setitem(H, 'NATIVE_T_QUALIFIED', True)
+    real = H['tempfile'].TemporaryDirectory
+    stages = []
+    class FailingCleanup:
+        def __init__(self, **options):
+            self.inner = real(**options)
+            self.name = self.inner.name
+            stages.append(Path(self.name))
+        def cleanup(self):
+            self.inner.cleanup()
+            raise OSError('synthetic cleanup failure')
+    monkeypatch.setattr(H['tempfile'], 'TemporaryDirectory', FailingCleanup)
+    monkeypatch.setitem(H, 'capture', lambda *a, **kw: (None, 0, EFFECTIVE_FIXTURE, b''))
+    monkeypatch.setitem(H, 'parse_effective', lambda *a: pytest.fail('cleanup failure reached parser'))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        r = H['evaluate_native_t'](fd, {'context_ref': 'global-default', 'context_spec': None})
+    finally:
+        os.close(fd)
+    assert r == H['result']('ERROR', 'CLEANUP_FAILED', 0) and len(stages) == 1 and not stages[0].exists()
+    ssh.validate_snapshot(snapshot(**{'native-0': r}))

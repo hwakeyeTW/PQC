@@ -1,8 +1,9 @@
 """Pure SSH posture adapter and paired Evidence 1.1.0 detail validation.
 
 The caller owns authorization, host identity, trusted inputs, timestamps and
-transport. S02 is deliberately fail-closed until a real safe native evaluation
-mechanism is proven. No command, file read, dispatch or generated verdict here.
+transport. Shared typed effective results support synthetic G/T development;
+actual T positives remain disabled until native safety/equivalence is proven.
+No command, file read, dispatch or generated verdict here.
 """
 import copy
 import hashlib
@@ -24,6 +25,13 @@ HEX = re.compile(r'[0-9a-f]{64}\Z', re.ASCII)
 SETTINGS = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms', 'pubkeyacceptedalgorithms',
             'pubkeyacceptedkeytypes', 'hostbasedacceptedalgorithms', 'hostbasedacceptedkeytypes',
             'casignaturealgorithms', 'gssapikexalgorithms'}
+# Paired with the code-only gate in the remote helper; neither is caller-controlled.
+NATIVE_T_QUALIFIED = False
+EFFECTIVE_REQUIRED = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms',
+                      'pubkeyacceptedalgorithms', 'hostbasedacceptedalgorithms', 'casignaturealgorithms'}
+EFFECTIVE_SETTINGS = EFFECTIVE_REQUIRED | {'gssapikexalgorithms'}
+EFFECTIVE_CONTEXTS = {'kexalgorithms': 'SSH_KEX', 'ciphers': 'SSH_CIPHER',
+                      'casignaturealgorithms': 'SIGNATURE'}
 CONFIG_GAPS = {'SOURCE_MISSING', 'SOURCE_PERMISSION', 'SOURCE_UNSAFE', 'FORMAT_GAP',
                'INCLUDE_REJECTED', 'INCLUDE_REPEATED', 'INCLUDE_EMPTY', 'MATCH_UNRESOLVED',
                'NATIVE_DEPENDENCY', 'HOSTKEY_PATH_REJECTED'}
@@ -32,12 +40,17 @@ TOOL_REASONS = {'TOOL_UNAVAILABLE', 'TOOL_UNSAFE_PATH', 'TOOL_NOT_EXECUTABLE'}
 COMMON_FAILURES = TOOL_REASONS | {'PERMISSION_DENIED', 'EXECUTION_ERROR', 'OUTER_DEADLINE', 'HELPER_ERROR'}
 CLIENT_FAILURES = COMMON_FAILURES | {'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT',
     'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT', 'INVALID_ENCODING'}
+NATIVE_FAILURES = COMMON_FAILURES | {'NATIVE_SAFETY_UNPROVEN', 'NATIVE_SOURCE_REJECTED',
+    'NATIVE_CONTEXT_REJECTED', 'SOURCE_PERMISSION', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT',
+    'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'INCOMPLETE_OUTPUT',
+    'INVALID_ENCODING', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT'}
 FILE_FAILURES = COMMON_FAILURES | {'SOURCE_PERMISSION', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'INPUT_LIMIT',
     'SOURCE_LIMIT', 'DIRECTORY_LIMIT', 'SOURCE_DRIFT', 'ROW_LIMIT', 'TIMEOUT', 'OUTPUT_LIMIT'}
 REASONS = {
     'COLLECTED': {'OK'}, 'PARTIAL': {'FORMAT_GAP', 'CONFIG_GAP', 'KEY_GAP'},
     'UNKNOWN': TOOL_REASONS | {'PLATFORM_UNRESOLVED', 'NATIVE_SAFETY_UNPROVEN', 'KEY_FLAG_REQUIRED',
-        'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'KEY_INVALID'},
+        'UNSUPPORTED_QUERY', 'NO_OUTPUT', 'UNRECOGNIZED_OUTPUT', 'SOURCE_MISSING', 'SOURCE_UNSAFE', 'KEY_INVALID',
+        'NATIVE_SOURCE_REJECTED', 'NATIVE_CONTEXT_REJECTED'},
     'ERROR': {'COMMAND_FAILED', 'OUTPUT_LIMIT', 'ROW_LIMIT', 'TIMEOUT', 'CLEANUP_FAILED', 'EXECUTION_ERROR',
         'INCOMPLETE_OUTPUT', 'INVALID_ENCODING', 'INPUT_LIMIT', 'SOURCE_LIMIT', 'DIRECTORY_LIMIT',
         'SOURCE_DRIFT', 'OUTER_DEADLINE', 'HELPER_ERROR'},
@@ -168,6 +181,23 @@ def validate_keys(rows, gaps):
     require([r['source_ref'] for r in rows] == sorted(seen))
 
 
+def validate_effective(rows):
+    require(1 <= len(rows) <= 256)
+    pairs, modes, settings = set(), set(), []
+    for row in rows:
+        mapping(row, {'mode', 'setting', 'token'})
+        mode, setting, token = (row[k] for k in ('mode', 'setting', 'token'))
+        require(type(mode) is str and mode in ('G', 'T') and type(setting) is str and
+                setting in EFFECTIVE_SETTINGS and matches(token, TOKEN) and token.lower() != 'none')
+        require((setting, token) not in pairs)
+        pairs.add((setting, token))
+        modes.add(mode)
+        settings.append(setting)
+    require(len(modes) == 1 and settings == sorted(settings) and EFFECTIVE_REQUIRED <= set(settings))
+    require(sum(len(row['token']) + 1 for row in rows) <= 16384)
+    return next(iter(modes))
+
+
 def slots(snapshot):
     return (*BASE_SLOTS, *(f'native-{i}' for i in range(len(snapshot['context_refs']))))
 
@@ -180,6 +210,7 @@ def validate_snapshot(s):
     require(type(contexts) is list and 1 <= len(contexts) <= 2 and all(context(x) for x in contexts) and
             len(set(contexts)) == len(contexts))
     mapping(s['slots'], slots(s))
+    native_modes = set()
     for slot in slots(s):
         r = mapping(s['slots'][slot], {'state', 'reason', 'rc', 'rows', 'gaps'})
         state, reason, rc, rows, gaps = (r[k] for k in ('state', 'reason', 'rc', 'rows', 'gaps'))
@@ -215,6 +246,17 @@ def validate_snapshot(s):
                     require(rc is not None and rc != 0)
                 elif reason in ('NO_OUTPUT', 'UNRECOGNIZED_OUTPUT'):
                     require(rc == 0)
+        elif slot.startswith('native-'):
+            if usable:
+                require(state == 'COLLECTED' and rc == 0 and not gaps)
+                native_modes.add(validate_effective(rows))
+            else:
+                require(reason in NATIVE_FAILURES)
+                if reason in TOOL_REASONS | {'NATIVE_SAFETY_UNPROVEN', 'NATIVE_CONTEXT_REJECTED',
+                                            'NATIVE_SOURCE_REJECTED', 'SOURCE_PERMISSION'}:
+                    require(rc is None)
+                elif reason in ('NO_OUTPUT', 'UNRECOGNIZED_OUTPUT'):
+                    require(rc == 0)
         else:
             require(rc is None)
             if slot == 'config' and usable:
@@ -223,12 +265,10 @@ def validate_snapshot(s):
             elif slot == 'keys' and usable:
                 require(set(gaps) <= KEY_GAPS and (state == 'COLLECTED' or reason == 'KEY_GAP'))
                 validate_keys(rows, gaps)
-            elif slot.startswith('native-'):
-                # Not a native result parser: reject even forged positives until S02 is proven.
-                require(not usable and reason in COMMON_FAILURES | {'NATIVE_SAFETY_UNPROVEN'})
             elif not usable:
                 require(reason in FILE_FAILURES | ({'UNRECOGNIZED_OUTPUT'} if slot == 'config' else {'KEY_INVALID'}))
         require(len(canonical(r)) <= 262144, 'SSH_PROJECTION_LIMIT')
+    require(len(native_modes) <= 1, 'SSH_NATIVE_MODE_MISMATCH')
 
 
 def unknown_algorithm(name, rules):
@@ -244,6 +284,11 @@ def _project(rid, host, snapshot, source, observed_at, rules):
     require(source['source_kind'] in ('SYNTHETIC', 'NATIVE_COLLECTOR') and source['producer_id'] == PRODUCER and
             source['producer_version'] == VERSION)
     ev.SOURCE.check(source, '$ssh.source')
+    for slot in slots(snapshot):
+        if slot.startswith('native-') and snapshot['slots'][slot]['rows']:
+            mode = snapshot['slots'][slot]['rows'][0]['mode']
+            require(source['source_kind'] == 'SYNTHETIC' or
+                    (mode == 'T' and NATIVE_T_QUALIFIED), 'SSH_NATIVE_SOURCE_UNQUALIFIED')
     ev.STAMP.check(observed_at, '$ssh.observed_at')
     hid = host['host_id']
     stable = host['identity_scope'] == 'STABLE'
@@ -293,7 +338,15 @@ def _project(rid, host, snapshot, source, observed_at, rules):
                 if row['kind'] == 'KEY_REFERENCE':
                     key_refs.setdefault(row['key_source_ref'], []).append(eid)
                 count += 1
-            else:  # validated keys slot; no accepted native positive rows
+            elif slot.startswith('native-'):
+                # The mode is part of the observation identity and mandatory detail.
+                setting, token = row['setting'], row['token']
+                alg = (assessment.classify_algorithm(token, EFFECTIVE_CONTEXTS[setting], rules)
+                       if setting in EFFECTIVE_CONTEXTS else unknown_algorithm(token, rules))
+                eid = add(digest('effective', [ctx, row['mode'], setting, token]),
+                          'EFFECTIVE_CONFIGURATION', dict(setting=setting, effective_value=token, allowed=True), alg)
+                count += 1
+            else:  # validated keys slot
                 identity = 'sha256-' + row['fingerprint_sha256']
                 if row['grammar'] == 'KNOWN':
                     aid = ev.asset_id(hid, 'public_key', identity, run_id=None if stable else rid)

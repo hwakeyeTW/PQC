@@ -1,11 +1,11 @@
 ---
 # Internal tasks_from only; trusted caller owns #7 flags, #14 eligibility and scope.
-# S02 is HOLD: no sshd evaluation until actual native safety/equivalence is proven.
+# S02: production -T/-C candidate is hard-disabled until native qualification.
 - name: Validate trusted SSH posture request
   ansible.builtin.assert:
     that:
       - pqc_ssh_request is mapping
-      - pqc_ssh_request.keys() | list | sort in [['flags', 'platform_status'], ['context_refs', 'flags', 'platform_status']]
+      - pqc_ssh_request.keys() | list | sort in [['flags', 'platform_status'], ['context_refs', 'flags', 'platform_status'], ['context_refs', 'context_specs', 'flags', 'platform_status']]
       - pqc_ssh_request.flags is mapping
       - pqc_ssh_request.flags.keys() | list | sort == ['pqc_collect_ssh_host_keys', 'pqc_collect_sshd']
       - pqc_ssh_request.flags.pqc_collect_sshd is boolean
@@ -16,8 +16,11 @@
       - contexts | select('string') | list | length == contexts | length
       - contexts | select('match', '^(global-default|ctx-[0-9a-f]{64})\\Z') | list | length == contexts | length
       - contexts | unique | list | length == contexts | length
+      - context_specs is mapping
+      - context_specs.keys() | list | difference(contexts | reject('equalto', 'global-default') | list) | length == 0
   vars:
     contexts: "{{ pqc_ssh_request.context_refs | default(['global-default']) }}"
+    context_specs: "{{ pqc_ssh_request.context_specs | default({}) }}"
   become: false
   no_log: true
 
@@ -91,6 +94,7 @@
         import base64
         import binascii
         import hashlib
+        import ipaddress
         import json
         import os
         import re
@@ -99,6 +103,7 @@
         import struct
         import subprocess
         import sys
+        import tempfile
         import time
 
         LIMIT = 16384
@@ -119,6 +124,15 @@
                 'INCLUDE_REPEATED', 'INCLUDE_EMPTY', 'MATCH_UNRESOLVED', 'NATIVE_DEPENDENCY',
                 'HOSTKEY_PATH_REJECTED', 'KEY_INVALID', 'KEY_TYPE_UNKNOWN'}
         ROOT_PATH = '/'
+        # Code-only release boundary: no Inventory, env, role or CLI override.
+        # The public-only source translation and actual native dependency closure
+        # still require qualification on the supported OpenSSH implementation.
+        NATIVE_T_QUALIFIED = False
+        EFFECTIVE_ALIASES = {'pubkeyacceptedkeytypes': 'pubkeyacceptedalgorithms',
+                             'hostbasedacceptedkeytypes': 'hostbasedacceptedalgorithms'}
+        EFFECTIVE_REQUIRED = {'kexalgorithms', 'ciphers', 'macs', 'hostkeyalgorithms',
+                              'pubkeyacceptedalgorithms', 'hostbasedacceptedalgorithms', 'casignaturealgorithms'}
+        EFFECTIVE_SETTINGS = EFFECTIVE_REQUIRED | {'gssapikexalgorithms'}
 
 
         def result(state, reason, rc=None, rows=None, gaps=None):
@@ -231,6 +245,57 @@
             gap = len(rows) != len(lines)
             return result('PARTIAL' if gap else 'COLLECTED', 'FORMAT_GAP' if gap else 'OK', rc, rows,
                           ['FORMAT_GAP'] if gap else [])
+
+
+        def parse_effective(mode, rc, out, err):
+            """Common bounded G/T output parser; G is used only by test callers.
+
+            No raw stdout/stderr, non-crypto directive, address or account is emitted.
+            A missing required list, repeated alias, modifier, malformed value or
+            incomplete capture invalidates the whole effective result.
+            """
+            if mode not in ('G', 'T'):
+                return result('ERROR', 'EXECUTION_ERROR')
+            if len(out) + len(err) > LIMIT:
+                return result('ERROR', 'OUTPUT_LIMIT', rc)
+            if rc != 0 or err:
+                if b'Permission denied' in err:
+                    return result('PERMISSION_DENIED', 'PERMISSION_DENIED', rc)
+                return result('ERROR', 'COMMAND_FAILED', rc)
+            if not out:
+                return result('UNKNOWN', 'NO_OUTPUT', rc)
+            if not out.endswith(b'\n'):
+                return result('ERROR', 'INCOMPLETE_OUTPUT', rc)
+            try:
+                text = out.decode('ascii')
+            except UnicodeError:
+                return result('ERROR', 'INVALID_ENCODING', rc)
+            if any(ord(c) < 32 and c not in '\n\t' or ord(c) == 127 for c in text):
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+            lists = {}
+            for line in text.splitlines():
+                fields = line.split(None, 1)
+                if not fields:
+                    continue
+                if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', fields[0], re.ASCII):
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                setting = EFFECTIVE_ALIASES.get(fields[0].lower(), fields[0].lower())
+                if setting not in EFFECTIVE_SETTINGS:
+                    continue
+                if len(fields) != 2 or setting in lists:
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                values = fields[1].split(',')
+                if (not all(TOKEN.fullmatch(v) and v.lower() != 'none' for v in values)
+                        or len(values) != len(set(values))):
+                    return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+                lists[setting] = values
+                if sum(map(len, lists.values())) > MAX_ROWS:
+                    return result('ERROR', 'ROW_LIMIT', rc)
+            if not EFFECTIVE_REQUIRED <= lists.keys():
+                return result('UNKNOWN', 'UNRECOGNIZED_OUTPUT', rc)
+            rows = [dict(mode=mode, setting=setting, token=token)
+                    for setting in sorted(lists) for token in lists[setting]]
+            return result('COLLECTED', 'OK', rc, rows)
 
 
         class ReadFailure(Exception):
@@ -619,7 +684,220 @@
                           rows=sorted(rows, key=lambda r: r['source_ref']), gaps=gaps)
 
 
-        def run_slot(slot):
+        def native_context(ref, spec):
+            # The trusted caller owns authorization. Refs alone never invent values.
+            if ref == 'global-default' and spec is None:
+                return None
+            fields = ('user', 'host', 'addr', 'laddr', 'lport')
+            if (type(spec) is not dict or spec.keys() != set(fields)
+                    or not all(type(spec[k]) is str for k in fields[:-1])
+                    or type(spec['lport']) is not int or not 1 <= spec['lport'] <= 65535
+                    or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', spec['user'], re.ASCII)
+                    or len(spec['host']) > 253
+                    or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', part, re.ASCII)
+                               for part in spec['host'].split('.'))):
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED')
+            try:
+                for k in ('addr', 'laddr'):
+                    if '%' in spec[k] or str(ipaddress.ip_address(spec[k])) != spec[k]:
+                        raise ValueError
+            except ValueError:
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED') from None
+            if ref != digest('ctx', ['ssh-native-context-v1', *(spec[k] for k in fields)]):
+                raise ReadFailure('NATIVE_CONTEXT_REJECTED')
+            return ','.join(f'{k}={spec[k]}' for k in fields)
+
+
+        def native_argv(config, ref, spec):
+            context_arg = native_context(ref, spec)
+            return ['/usr/sbin/sshd', '-T', '-f', config] + ([] if context_arg is None else ['-C', context_arg])
+
+
+        def prepare_native(root, directory, deadline):
+            """Build a narrow, private public-only candidate closure, not a parity proof.
+
+            Preserve Include boundaries and order; reject everything outside the
+            explicit subset, rather than drop directives or guess default HostKeys.
+            The caller owns the freshly created 0700 directory. No native process is
+            allowed until this construction AND the runtime have been qualified.
+            """
+            ssh = ('etc', 'ssh')
+            drop = ssh + ('sshd_config.d',)
+            backend = ('etc', 'crypto-policies', 'back-ends')
+            if (not re.fullmatch(r'/[A-Za-z0-9_./-]+', directory, re.ASCII) or
+                    not stat.S_ISDIR(os.stat(directory, follow_symlinks=False).st_mode) or
+                    stat.S_IMODE(os.stat(directory, follow_symlinks=False).st_mode) != 0o700 or
+                    os.stat(directory, follow_symlinks=False).st_uid != os.geteuid() or os.listdir(directory)):
+                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+            sources, keys = {}, {}
+            with Reader(root, 65536, 'config') as cfg, Reader(root, 524288, 'keys') as pubs:
+                cfg.end = pubs.end = deadline
+
+                def write(name, data):
+                    if len(data) > 65536:
+                        raise LimitFailure('INPUT_LIMIT')
+                    cfg.deadline()
+                    path = os.path.join(directory, name)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                    try:
+                        with os.fdopen(fd, 'wb', closefd=False) as f:
+                            f.write(data)
+                    finally:
+                        os.close(fd)
+                    return path
+
+                def visit(parts, name, depth):
+                    if depth > 4 or len(sources) >= 32:
+                        raise LimitFailure('SOURCE_LIMIT')
+                    identity = (parts, name)
+                    if identity in sources:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    dest = f'config-{len(sources)}'
+                    sources[identity] = dest
+                    try:
+                        raw = cfg.read(parts, name).decode('ascii')
+                    except UnicodeError:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED') from None
+                    if any(ord(c) < 32 and c not in '\t\n' or ord(c) == 127 for c in raw) or 'PRIVATE KEY-----' in raw:
+                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    lines = []
+                    before_include_match = depth == 0
+                    for raw_line in raw.split('\n'):
+                        cfg.deadline()
+                        line = raw_line.strip(' \t')
+                        if not line or line.startswith('#'):
+                            continue
+                        m = re.fullmatch(r'([A-Za-z][A-Za-z0-9]*)[ \t]+([^#]+)', line)
+                        if not m:
+                            raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                        setting, value = m[1].lower(), m[2].strip(' \t')
+                        if setting == 'include':
+                            # Require an explicit, unconditional HostKey before any
+                            # Include/Match in the main file; never use default key paths.
+                            if depth == 0 and not keys:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            before_include_match = False
+                            paths = []
+                            for arg in value.split():
+                                if arg in ('/etc/ssh/sshd_config.d/*.conf', 'sshd_config.d/*.conf'):
+                                    names = [n for n in cfg.names(drop) if n.endswith('.conf') and not n.startswith('.')]
+                                    if not names or not all(DROPIN.fullmatch(n) for n in names):
+                                        raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                    paths.extend(visit(drop, n, depth+1) for n in names)
+                                elif arg == '/etc/crypto-policies/back-ends/opensshserver.config':
+                                    paths.append(visit(backend, 'opensshserver.config', depth+1))
+                                else:
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            if not paths:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            lines.append('Include ' + ' '.join(paths))
+                        elif setting == 'hostkey':
+                            name = value.removeprefix('/etc/ssh/') + '.pub'
+                            if (not before_include_match or not value.startswith('/etc/ssh/')
+                                    or not KEY_FILE.fullmatch(name)):
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            if name not in keys:
+                                if len(keys) >= 32:
+                                    raise LimitFailure('SOURCE_LIMIT')
+                                raw_key = pubs.read(ssh, name)
+                                if parse_public(raw_key)['grammar'] != 'KNOWN':
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                # Only the validated public key wire representation; no comment.
+                                fields = raw_key.split(None, 2)
+                                keys[name] = write(f'public-{len(keys)}.pub', b' '.join(fields[:2])+b'\n')
+                            lines.append('HostKey ' + keys[name])
+                        elif setting in SETTINGS:
+                            op = value[:1] if value[:1] in ('+', '-', '^') else ''
+                            names = value[len(op):].split(',')
+                            if (not 1 <= len(names) <= MAX_ROWS or len(set(names)) != len(names)
+                                    or not all(re.fullmatch(r'[A-Za-z0-9*?][A-Za-z0-9_.+@*?-]{0,127}', n, re.ASCII) for n in names)):
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            lines.append(line)
+                        elif setting == 'match':
+                            if depth == 0 and not keys:
+                                raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                            before_include_match = False
+                            # Deliberately no User/Group/Host/exec/NSS predicates. Preserve
+                            # exact supported Address/LocalAddress/LocalPort or all.
+                            words = value.split()
+                            if value.lower() != 'all':
+                                if len(words) != 2 or words[0].lower() not in ('address', 'localaddress', 'localport'):
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                                try:
+                                    for item in words[1].split(','):
+                                        if words[0].lower() == 'localport':
+                                            if not re.fullmatch(r'[1-9][0-9]{0,4}', item) or int(item) > 65535:
+                                                raise ValueError
+                                        elif '%' in item:
+                                            raise ValueError
+                                        else:
+                                            ipaddress.ip_network(item, strict=False)
+                                except ValueError:
+                                    raise ReadFailure('NATIVE_SOURCE_REJECTED') from None
+                            lines.append(line)
+                        elif setting in ('passwordauthentication', 'pubkeyauthentication') and value.lower() in ('yes', 'no'):
+                            lines.append(line)
+                        else:
+                            # No implicit acceptance of unknown, command, agent, path,
+                            # NSS-dependent or vendor-specific configuration directives.
+                            raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                    return write(dest, ('\n'.join(lines)+'\n').encode('ascii'))
+
+                main = visit(ssh, 'sshd_config', 0)
+                if not keys:
+                    raise ReadFailure('NATIVE_SOURCE_REJECTED')
+                cfg.verify()
+                pubs.verify()
+            return main
+
+
+        def evaluate_native_t(root, request):
+            # Internal acquisition path, not a public API. Qualification is checked
+            # here as well as at the entry so no request can bypass it.
+            if not NATIVE_T_QUALIFIED:
+                return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+            if os.geteuid() == 0:
+                return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+            if type(request) is not dict or request.keys() != {'context_ref', 'context_spec'}:
+                return result('UNKNOWN', 'NATIVE_CONTEXT_REJECTED')
+            try:
+                native_context(request['context_ref'], request['context_spec'])
+            except ReadFailure:
+                return result('UNKNOWN', 'NATIVE_CONTEXT_REJECTED')
+            deadline = time.monotonic()+23
+            rc = None
+            try:
+                # Only a private transient closure containing allowlisted config and
+                # validated public bytes; no original private key path reaches sshd.
+                tmp = tempfile.TemporaryDirectory(prefix='pqc-ssh-native-', dir='/tmp')
+                try:
+                    main = prepare_native(root, tmp.name, deadline)
+                    argv = native_argv(main, request['context_ref'], request['context_spec'])
+                    left = deadline-time.monotonic()
+                    if left <= 0:
+                        raise LimitFailure('TIMEOUT')
+                    reason, rc, out, err = capture(argv, seconds=left)
+                finally:
+                    try:
+                        tmp.cleanup()
+                    except OSError:
+                        raise LimitFailure('CLEANUP_FAILED') from None
+            except LimitFailure as exc:
+                return result('ERROR', exc.code, rc)
+            except (OSError, ReadFailure) as exc:
+                code = read_gap(exc)
+                if code == 'SOURCE_PERMISSION':
+                    return result('PERMISSION_DENIED', code)
+                return result('UNKNOWN', 'NATIVE_SOURCE_REJECTED')
+            if reason:
+                state = 'PERMISSION_DENIED' if reason == 'PERMISSION_DENIED' else 'UNKNOWN' if reason == 'TOOL_UNAVAILABLE' else 'ERROR'
+                return result(state, reason, rc)
+            if time.monotonic() > deadline+1:
+                return result('ERROR', 'TIMEOUT', rc)
+            return parse_effective('T', rc, out, err)
+
+
+        def run_slot(slot, request=None):
             if slot in CLIENTS:
                 failed = tool_error('/usr/bin/ssh')
                 if failed:
@@ -630,8 +908,19 @@
                     return result(state, reason, rc)
                 return parse_client(rc, out, err)
             if slot in ('native-0', 'native-1'):
-                # S02 HOLD: no invocation until actual native isolation/equivalence is proven.
-                return tool_error('/usr/sbin/sshd') or result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+                failed = tool_error('/usr/sbin/sshd')
+                if failed:
+                    return failed
+                if not NATIVE_T_QUALIFIED:
+                    return result('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+                try:
+                    root = os.open(ROOT_PATH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try:
+                        return evaluate_native_t(root, request)
+                    finally:
+                        os.close(root)
+                except OSError:
+                    return result('ERROR', 'EXECUTION_ERROR')
             if slot not in ('config', 'keys'):
                 return result('ERROR', 'INVALID_SLOT')
             try:
@@ -647,12 +936,31 @@
         if __name__ == '__main__':
             if len(sys.argv) != 2 or sys.argv[1] not in (*CLIENTS, 'config', 'keys', 'native-0', 'native-1'):
                 sys.exit(2)
-            output = json.dumps(run_slot(sys.argv[1]), ensure_ascii=True, separators=(',', ':'))
+            request = None
+            if sys.argv[1].startswith('native-') and NATIVE_T_QUALIFIED:
+                try:
+                    raw_request = sys.stdin.read(4097)
+                    def unique_pairs(pairs):
+                        value = {}
+                        for k, v in pairs:
+                            if k in value:
+                                raise ValueError
+                            value[k] = v
+                        return value
+                    if len(raw_request) <= 4096:
+                        request = json.loads(raw_request, object_pairs_hook=unique_pairs)
+                except (ValueError, RecursionError):
+                    pass
+            output = json.dumps(run_slot(sys.argv[1], request), ensure_ascii=True, separators=(',', ':'))
             if len(output) > 262144:
                 output = json.dumps(result('ERROR', 'OUTPUT_LIMIT'), separators=(',', ':'))
             print(output)
       - "{{ item }}"
     expand_argument_vars: false
+    stdin: >-
+      {{ dict(context_ref=pqc_ssh_snapshot.context_refs[item[-1] | int],
+              context_spec=(pqc_ssh_request.context_specs | default({})).get(pqc_ssh_snapshot.context_refs[item[-1] | int])) | to_json
+         if item.startswith('native-') else '{}' }}
   loop: "{{ ['client-kex', 'client-cipher', 'client-key', 'client-sig', 'client-mac', 'config', 'keys', 'native-0'] + (['native-1'] if pqc_ssh_snapshot.context_refs | length == 2 else []) }}"
   register: pqc_ssh_queries
   when:
