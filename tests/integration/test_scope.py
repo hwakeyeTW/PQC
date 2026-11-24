@@ -1,4 +1,5 @@
-"""SCOPE-R1: native synthetic Inventory, literal plans and no managed dispatch."""
+"""Native synthetic Inventory, scope/profile plans and no managed dispatch."""
+import copy
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,14 @@ A, B, C, D = [f'host-{letter}.example.invalid' for letter in 'abcd']
 SECRET = 'SYNTHETIC_SECRET_SENTINEL'
 PKG = 'pqc_collect_packages'
 SSL = 'pqc_collect_openssl'
+TLS = 'pqc_collect_tls_services'
+NGINX = 'pqc_collect_nginx_certs'
+PROFILE_POLICY = ROOT / 'config/scan_profiles.yml'
+PROFILE_MODULE = ROOT / ('ansible_collections/security/compliance_pqc_readiness/'
+                         'plugins/modules/resolve_scan_profile.py')
+FLAG_KEYS = {f'pqc_collect_{name}' for name in (
+    'packages', 'openssl', 'sshd', 'ssh_host_keys', 'system_certs',
+    'crypto_policy', 'nginx_certs', 'tls_services')}
 SPEC = importlib.util.spec_from_file_location('pqc_scan', LAUNCHER)
 scan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(scan)
@@ -80,11 +89,12 @@ def native(tmp_path):
                 log.write({name!r} + '\\n')
             sys.exit(91)
         ''')
-    # Positive control: a real call to the tripwire is detected. Reset before launch.
-    assert subprocess.run([str(work / 'ssh')], env=env, capture_output=True, timeout=5).returncode == 91
-    assert traps.read_text() == 'ssh\n'
+    # Positive controls prove the detector sees transport, play/collector and probe tools.
+    for name in ('ssh', 'ansible-playbook', 'openssl'):
+        assert subprocess.run([str(work / name)], env=env, capture_output=True, timeout=5).returncode == 91
+    assert traps.read_text() == 'ssh\nansible-playbook\nopenssl\n'
     traps.unlink()
-    original = {p: snapshot(p) for p in (FIXTURE, CONFIG)}
+    original = {p: snapshot(p) for p in (FIXTURE, CONFIG, PROFILE_POLICY, PROFILE_MODULE)}
     provider = script(tmp_path / 'synthetic provider.py', f'''
         import json, os, runpy, sys
         f = runpy.run_path({str(FIXTURE)!r})
@@ -110,9 +120,9 @@ def native(tmp_path):
         print(json.dumps(data))
     ''')
     original[provider] = snapshot(provider)
-    def launch(*args, source=provider, mode='inline', extra_env=None):
-        result = subprocess.run([sys.executable, str(LAUNCHER), '-i', str(source), *args],
-                                cwd=ROOT, env=dict(env, PQC_SYNTHETIC_INVENTORY_MODE=mode, **(extra_env or {})),
+    def launch(*args, source=provider, mode='inline', extra_env=None, launcher=LAUNCHER, cwd=ROOT):
+        result = subprocess.run([sys.executable, str(launcher), '-i', str(source), *args],
+                                cwd=cwd, env=dict(env, PQC_SYNTHETIC_INVENTORY_MODE=mode, **(extra_env or {})),
                                 capture_output=True, timeout=65)
         assert SECRET.encode() not in result.stdout + result.stderr
         assert str(tmp_path).encode() not in result.stdout + result.stderr
@@ -127,14 +137,42 @@ def native(tmp_path):
     assert not traps.exists()
 
 
-def assert_ready(result, targets):
+def assert_ready(result, targets, profile='baseline'):
     assert result.returncode == 0, result.stderr.decode(errors='replace')
     assert result.stderr == b''
     plan = json.loads(result.stdout)
-    assert set(plan) == set(scan.PUBLIC_FIELDS)
-    assert plan == {'scope_plan_version': 1, 'plan_status': 'READY', 'reason_code': 'TARGET_PLAN_READY',
-                    'plan_only': True, 'execution_allowed': False, 'active_dispatch_allowed': False,
-                    'target_ids': targets, 'target_count': len(targets)}
+    # Independent field list: no extra raw inputs or replayable authorization.
+    scope = {'scope_plan_version': 1, 'plan_status': 'READY', 'reason_code': 'TARGET_PLAN_READY',
+             'plan_only': True, 'execution_allowed': False, 'active_dispatch_allowed': False,
+             'target_ids': targets, 'target_count': len(targets)}
+    profile_fields = {'profile_decision_version', 'profile', 'profile_status', 'profile_decisions'}
+    assert set(plan) == set(scope) | profile_fields == set(scan.PUBLIC_FIELDS)
+    assert {k: plan[k] for k in scope} == scope
+    status, reason = ('DEFERRED', 'ACTIVE_NOT_AVAILABLE_V2_0') if profile == 'active' else ('VALIDATED', 'PLAN_ONLY')
+    assert type(plan['profile_decision_version']) is int and plan['profile_decision_version'] == 1
+    assert plan['profile'] == profile and plan['profile_status'] == status
+    assert set(plan['profile_decisions']) == set(targets)
+    for decision in plan['profile_decisions'].values():
+        assert set(decision) == {'profile_decision_version', 'profile', 'decision', 'reason_code',
+                                 'plan_only', 'requested_flags', 'per_collector',
+                                 'active_intent_validated', 'active_dispatch_allowed', 'execution_allowed'}
+        assert type(decision['profile_decision_version']) is int and decision['profile_decision_version'] == 1
+        assert (decision['profile'], decision['decision'], decision['reason_code']) == (profile, status, reason)
+        assert decision['plan_only'] is True
+        assert decision['execution_allowed'] is False and decision['active_dispatch_allowed'] is False
+        assert decision['active_intent_validated'] is (profile == 'active')
+        flags, rows = decision['requested_flags'], decision['per_collector']
+        assert set(flags) == FLAG_KEYS and all(type(v) is bool for v in flags.values())
+        assert len(rows) == len(FLAG_KEYS) and {row['id'] for row in rows} == FLAG_KEYS
+        for row in rows:
+            assert set(row) == {'id', 'requested', 'allowed_by_profile', 'planned_scope',
+                                'request_source', 'collection_state', 'reason_code'}
+            assert row['requested'] is flags[row['id']] and type(row['allowed_by_profile']) is bool
+            assert row['collection_state'] == 'NOT_SCANNED'
+            assert row['planned_scope'] in ('baseline', 'extended', 'active')
+            assert row['request_source'] in ('PROFILE_DEFAULT', 'RUN', 'INVENTORY_EFFECTIVE', 'NARROWED')
+            assert row['reason_code'] in ('DISABLED_BY_USER', 'DISABLED_BY_PROFILE', 'NARROWED_BY_INVENTORY',
+                                          'PLAN_ONLY', 'ADAPTER_NOT_AVAILABLE', 'ACTIVE_NOT_AVAILABLE_V2_0')
     return plan
 
 
@@ -188,7 +226,9 @@ def test_native_scope_file(native, tmp_path, alias):
                      'pqc_scan_profile: extended\npqc_active_opt_in: false\npqc_active_endpoints: []\n')
     before = snapshot(scope)
     args = ['-e', '@' + str(scope)] if alias else ['--scope-file', str(scope)]
-    assert_ready(native['launch'](*args, '--plan-only', '--forks', '1'), [A, B])
+    plan = assert_ready(native['launch'](*args, '--plan-only', '--forks', '1'), [A, B], 'extended')
+    assert all(not d['requested_flags'][PKG] and d['requested_flags'][NGINX]
+               for d in plan['profile_decisions'].values())
     assert snapshot(scope) == before
 
 
@@ -275,9 +315,9 @@ def test_missing_plan_and_scope_conflict(native, tmp_path):
     ('pqc_scan_hosts: [a]\npqc_collect_unknown: true', 'UNSUPPORTED_SCOPE_FIELD'),
     ('pqc_scan_hosts: [a]\nexecution_allowed: true', 'UNSUPPORTED_SCOPE_FIELD'),
     ('pqc_scan_hosts: [a]\nreport_root: secret', 'UNSUPPORTED_SCOPE_FIELD'),
-    ('pqc_scan_hosts: [a]\npqc_scan_profile: active', 'PROFILE_INTEGRATION_REQUIRED'),
-    ('pqc_scan_hosts: [a]\npqc_active_opt_in: true', 'PROFILE_INTEGRATION_REQUIRED'),
-    ('pqc_scan_hosts: [a]\npqc_active_endpoints: [x]', 'PROFILE_INTEGRATION_REQUIRED'),
+    ('pqc_scan_hosts: [a]\npqc_scan_profile: active', 'ACTIVE_OPT_IN_REQUIRED'),
+    ('pqc_scan_hosts: [a]\npqc_active_opt_in: true', 'PROFILE_CONFLICT'),
+    ('pqc_scan_hosts: [a]\npqc_active_endpoints: [x]', 'PROFILE_CONFLICT'),
     ('pqc_scan_hosts: [a]\npqc_run_id: ../x', 'INVALID_RUN_ID'),
     ('[a]', 'INVALID_SCOPE'),
     ('pqc_scan_hosts: [a]\nother: ' + '[' * 20 + '0' + ']' * 20, 'SCOPE_COMPLEXITY'),
@@ -442,3 +482,292 @@ def test_controller_only_stubs():
     assert play['gather_facts'] is False and play['become'] is False
     assert len(play['tasks']) == 1 and set(play['tasks'][0]) == {'name', 'ansible.builtin.fail', 'tags'}
     assert 'LIVE_NOT_AVAILABLE' in play['tasks'][0]['ansible.builtin.fail']['msg']
+
+
+# S3 tests run through the actual launcher. Alternate installations/providers
+# are disposable synthetic fixtures, never runtime switches in the launcher.
+def profile_scope(tmp_path, profile='baseline', **extra):
+    data = dict(pqc_scan_groups=['pqc_targets'], pqc_scan_profile=profile, **extra)
+    path = tmp_path / 'profile-scope.json'
+    path.write_text(json.dumps(data), encoding='utf-8')
+    return path
+
+
+def intent(host=A, protocol='tls', **extra):
+    row = {'source_host': host, 'protocol': protocol, 'address': 'endpoint.example.invalid',
+           'port': 443 if protocol == 'tls' else 22,
+           'sni': 'sni.example.invalid' if protocol == 'tls' else None}
+    row.update(extra)
+    return row
+
+
+def row_for(plan, host, flag):
+    return next(row for row in plan['profile_decisions'][host]['per_collector'] if row['id'] == flag)
+
+
+def assert_one_inventory(native):
+    assert native['records']() == [
+        ['ansible-config', ['dump', '--format', 'json'], scan.FATAL_ENV],
+        ['ansible-inventory', ['-i', str(native['provider']), '--list'], scan.FATAL_ENV]]
+    assert native['provider_records']().count(['--list']) == 1
+
+
+def with_hostvars(native, tmp_path, values):
+    # Extend only the synthetic provider, retaining real native --list/--host.
+    original = native['provider'].read_text()
+    needle = 'if sys.argv[1:] == [\'--list\']:'
+    assert original.count(needle) == 1
+    update = 'for h, fields in ' + repr(values) + '.items():\n    hostvars[h].update(fields)\n'
+    path = tmp_path / 'profile-provider.py'
+    path.write_text(original.replace(needle, update + needle))
+    path.chmod(0o700)
+    return path
+
+
+@pytest.mark.parametrize('mode', ['inline', 'lookup'])
+def test_s3_native_profile_sources(native, tmp_path, mode):
+    scope = profile_scope(tmp_path, 'extended', pqc_collect_openssl=False)
+    before = snapshot(scope)
+    plan = assert_ready(native['launch']('--scope-file', str(scope), '--plan-only', mode=mode),
+                        [A, B, C], 'extended')
+    assert_one_inventory(native)
+    assert snapshot(scope) == before
+    assert row_for(plan, A, PKG)['request_source'] == 'INVENTORY_EFFECTIVE'
+    assert row_for(plan, A, PKG)['requested'] is True
+    assert row_for(plan, B, PKG)['request_source'] == 'NARROWED'
+    assert row_for(plan, B, PKG)['reason_code'] == 'NARROWED_BY_INVENTORY'
+    assert row_for(plan, B, PKG)['requested'] is False
+    assert all(row_for(plan, h, SSL)['reason_code'] == 'DISABLED_BY_USER'
+               and row_for(plan, h, SSL)['request_source'] == 'RUN'
+               and row_for(plan, h, SSL)['requested'] is False for h in [A, B, C])
+    calls = native['provider_records']()
+    assert calls == [['--list']] if mode == 'inline' else sorted(
+        row[1] for row in calls if row[0] == '--host') == [A, B, C, D]
+
+
+@pytest.mark.parametrize('profile', ['baseline', 'extended'])
+def test_s3_native_all_disabled(native, tmp_path, profile):
+    scope = profile_scope(tmp_path, profile, **dict.fromkeys(FLAG_KEYS, False))
+    plan = assert_ready(native['launch']('--scope-file', str(scope), '--plan-only'), [A, B, C], profile)
+    assert_one_inventory(native)
+    for decision in plan['profile_decisions'].values():
+        assert not any(decision['requested_flags'].values())
+        assert all(row['reason_code'] == 'DISABLED_BY_USER' and row['request_source'] == 'RUN'
+                   for row in decision['per_collector'])
+
+
+@pytest.mark.parametrize('kind', ['tls', 'ssh', 'mixed'])
+def test_s3_native_active_run_intent(native, tmp_path, kind):
+    endpoints = [intent(A, 'tls'), intent(B, 'ssh')] if kind == 'mixed' else [intent(A, kind)]
+    scope = profile_scope(tmp_path, 'active', pqc_active_opt_in='TRUE', pqc_active_endpoints=endpoints)
+    before = snapshot(scope)
+    result = native['launch']('--scope-file', str(scope), '--plan-only')
+    plan = assert_ready(result, [A, B, C], 'active')
+    assert_one_inventory(native)
+    assert snapshot(scope) == before
+    assert b'endpoint.example.invalid' not in result.stdout and b'sni.example.invalid' not in result.stdout
+    # C has no row. A TLS request remains a run-level policy request, not a grant.
+    for host in [A, B, C]:
+        assert row_for(plan, host, TLS)['requested'] is (kind != 'ssh')
+        assert row_for(plan, host, TLS)['allowed_by_profile'] is True
+    assert_denied(native['launch']('--scope-file', str(scope)), 2, 'LIVE_NOT_AVAILABLE')
+    assert_one_inventory(native)  # no second inventory on live attempt
+
+
+@pytest.mark.parametrize('profile,run,host_flags,rc,reason', [
+    ('baseline', {TLS: True}, {A: {TLS: False}}, 2, 'PROFILE_CONFLICT'),
+    ('baseline', {}, {B: {NGINX: True}}, 4, 'PROFILE_CONFLICT'),
+    ('extended', {}, {B: {TLS: True}}, 4, 'PROFILE_CONFLICT'),
+    ('baseline', {}, {A: {NGINX: False}, B: {NGINX: True}}, 4, 'PROFILE_CONFLICT'),
+    ('active', {TLS: False}, {}, 2, 'PROFILE_CONFLICT'),
+    ('active', {}, {B: {TLS: False}}, 4, 'PROFILE_CONFLICT'),
+])
+def test_s3_native_whole_batch_denied(native, tmp_path, profile, run, host_flags, rc, reason):
+    active = {'pqc_active_opt_in': True, 'pqc_active_endpoints': [intent(A)]} if profile == 'active' else {}
+    scope = profile_scope(tmp_path, profile, **dict(run, **active))
+    source = with_hostvars(native, tmp_path, host_flags)
+    before = snapshot(source)
+    assert_denied(native['launch']('--scope-file', str(scope), '--plan-only', source=source), rc, reason)
+    assert snapshot(source) == before
+    assert native['provider_records']() == [['--list']]
+
+
+def test_s3_native_run_false_narrows_inventory_expansion(native, tmp_path):
+    source = with_hostvars(native, tmp_path, {B: {TLS: True, NGINX: True}})
+    scope = profile_scope(tmp_path, **{TLS: False, NGINX: False})
+    plan = assert_ready(native['launch']('--scope-file', str(scope), '--plan-only', source=source), [A, B, C])
+    for flag in (TLS, NGINX):
+        assert row_for(plan, B, flag)['requested'] is False
+        assert row_for(plan, B, flag)['reason_code'] == 'DISABLED_BY_USER'
+    assert native['provider_records']() == [['--list']]
+
+
+@pytest.mark.parametrize('overrides,reason', [
+    ({'pqc_scan_profile': None}, 'INVALID_PROFILE'),
+    ({'pqc_scan_profile': ''}, 'INVALID_PROFILE'),
+    ({'pqc_scan_profile': 'Baseline'}, 'INVALID_PROFILE'),
+    ({'pqc_scan_profile': ['active']}, 'INVALID_PROFILE'),
+    ({'pqc_scan_profile': 'active', 'pqc_active_opt_in': True}, 'ENDPOINT_INVALID'),
+    ({'pqc_active_opt_in': 1}, 'INVALID_ACTIVE_INTENT'),
+    ({'pqc_active_opt_in': ' true '}, 'INVALID_ACTIVE_INTENT'),
+    ({'pqc_active_opt_in': 'yes'}, 'INVALID_ACTIVE_INTENT'),
+    ({'pqc_active_endpoints': {}}, 'INVALID_ACTIVE_INTENT'),
+    ({'pqc_scan_profile': 'active', 'pqc_active_opt_in': True,
+      'pqc_active_endpoints': [intent()] * 201}, 'ENDPOINT_INVALID'),
+    ({'pqc_profile_policy': {}}, 'UNSUPPORTED_SCOPE_FIELD'),
+    ({'profile_decisions': {}}, 'UNSUPPORTED_SCOPE_FIELD'),
+    ({'pqc_scan_profile': '{{ unsafe }}'}, 'UNSAFE_SCOPE_YAML'),
+])
+def test_s3_native_early_denials(native, tmp_path, overrides, reason):
+    data = dict(pqc_scan_hosts=[A], **overrides)
+    path = tmp_path / 'invalid.json'
+    path.write_text(json.dumps(data))
+    assert_denied(native['launch']('--scope-file', str(path), '--plan-only'), 2, reason)
+    assert native['records']() == [] and native['provider_records']() == []
+
+
+@pytest.mark.parametrize('endpoints,rc,reason', [
+    ([intent(D)], 4, 'TARGET_NOT_AUTHORIZED'),
+    ([intent(A), intent(A, address='ENDPOINT.example.invalid.')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, port=True)], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, port='443')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, port=65536)], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, address='*.example.invalid')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, address='192.0.2.0/24')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, address='https://endpoint.example.invalid')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, protocol='ssh', sni='sni.example.invalid')], 2, 'ENDPOINT_INVALID'),
+    ([intent(A, unexpected=SECRET)], 2, 'ENDPOINT_INVALID'),
+])
+def test_s3_native_endpoint_denials(native, tmp_path, endpoints, rc, reason):
+    scope = profile_scope(tmp_path, 'active', pqc_active_opt_in=True, pqc_active_endpoints=endpoints)
+    assert_denied(native['launch']('--scope-file', str(scope), '--plan-only'), rc, reason)
+    assert_one_inventory(native)
+
+
+@pytest.mark.parametrize('key', ['pqc_profile_policy', 'pqc_profile_request', 'pqc_profile_result',
+    'profile_decision_version', 'profile_status', 'profile_decisions', 'decision', 'requested_flags',
+    'per_collector', 'active_intent_validated', 'inventory_flags_source', 'connection_status'])
+def test_s3_reserved_effective_fields(key):
+    data = basic_inventory()
+    data['_meta']['hostvars'][B][key] = SECRET
+    reject(lambda: scan.build_plan(data, request(groups=['g'])), 4, 'INVENTORY_SCOPE_CONFLICT')
+
+
+def test_s3_native_reserved_inventory_input(native, tmp_path):
+    source = with_hostvars(native, tmp_path, {B: {'pqc_profile_result': SECRET}})
+    assert_denied(native['launch']('--group', 'pqc_targets', '--plan-only', source=source),
+                  4, 'INVENTORY_SCOPE_CONFLICT')
+    assert native['provider_records']() == [['--list']]
+
+
+@pytest.mark.parametrize('kind', ['missing-policy', 'duplicate', 'drift', 'malformed', 'oversize',
+    'nonregular', 'redirected', 'missing-module', 'invalid-module'])
+def test_s3_native_fixed_source_failures(native, tmp_path, kind):
+    root = tmp_path / 'installation'
+    for source in (LAUNCHER, PROFILE_MODULE, PROFILE_POLICY):
+        dest = root / source.relative_to(ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+    policy = root / PROFILE_POLICY.relative_to(ROOT)
+    module = root / PROFILE_MODULE.relative_to(ROOT)
+    if kind == 'missing-policy':
+        policy.unlink()
+    elif kind == 'duplicate':
+        policy.write_text('{"policy_version":1,' + PROFILE_POLICY.read_text().lstrip()[1:])
+    elif kind == 'drift':
+        data = json.loads(PROFILE_POLICY.read_text())
+        data['profiles']['baseline'][TLS] = True
+        policy.write_text(json.dumps(data))
+    elif kind == 'malformed':
+        policy.write_bytes(b'\xff')
+    elif kind == 'oversize':
+        policy.write_bytes(b' ' * 16385)
+    elif kind == 'nonregular':
+        policy.unlink()
+        os.mkfifo(policy)
+    elif kind == 'redirected':
+        policy.unlink()
+        policy.symlink_to(PROFILE_POLICY)
+    elif kind == 'missing-module':
+        module.unlink()
+    else:
+        module.write_text('this is invalid python !')
+    reason = 'PROFILE_RESOLVER_ERROR' if kind.endswith('module') else 'PROFILE_POLICY_ERROR'
+    assert_denied(native['launch']('--host', A, '--plan-only', launcher=root / 'tools/pqc_scan.py'), 3, reason)
+    assert_one_inventory(native)
+
+
+def test_s3_fixed_loader_ignores_cwd_and_module_search(native, tmp_path, monkeypatch):
+    fake = tmp_path / 'resolve_scan_profile.py'
+    fake.write_text('raise RuntimeError("' + SECRET + '")\n')
+    other = tmp_path / 'config'
+    other.mkdir()
+    (other / 'scan_profiles.yml').write_text('{}')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    policy, resolver = scan.load_profile_contract()
+    assert Path(resolver.__code__.co_filename) == PROFILE_MODULE
+    assert policy == json.loads(PROFILE_POLICY.read_text())
+    result = native['launch']('--host', A, '--plan-only', cwd=tmp_path,
+                              extra_env={'PYTHONPATH': str(tmp_path)})
+    assert_ready(result, [A])
+    assert_one_inventory(native)
+
+
+@pytest.mark.parametrize('fault', ['extra', 'secret-reason', 'dispatch', 'integer-bool',
+    'missing-row', 'duplicate-row', 'bad-source', 'wrong-status', 'exception'])
+def test_s3_bad_resolver_output_is_closed(monkeypatch, capsys, fault):
+    policy, real = scan.load_profile_contract()
+    data = basic_inventory()
+    before = copy.deepcopy(data)
+    req = request(groups=['g'])
+    def broken(p, r):
+        decision = real(p, r)
+        if not r['inventory_flags'] and r['target_ids'] == [A, B]:
+            # Fault can occur on the run result or on a later host.
+            if fault == 'exception':
+                raise RuntimeError(SECRET)
+            if fault == 'extra':
+                decision['endpoint'] = SECRET
+            elif fault == 'secret-reason':
+                decision['reason_code'] = SECRET
+            elif fault == 'dispatch':
+                decision['execution_allowed'] = True
+            elif fault == 'integer-bool':
+                decision['active_dispatch_allowed'] = 0
+            elif fault == 'missing-row':
+                decision['per_collector'].pop()
+            elif fault == 'duplicate-row':
+                decision['per_collector'][-1] = decision['per_collector'][0]
+            elif fault == 'bad-source':
+                decision['per_collector'][0]['request_source'] = SECRET
+            elif fault == 'wrong-status':
+                decision['decision'] = 'DEFERRED'
+        return decision
+    monkeypatch.setattr(scan, 'load_profile_contract', lambda: (policy, broken))
+    monkeypatch.setattr(scan, 'parse_cli', lambda _argv: ('synthetic', req))
+    monkeypatch.setattr(scan, 'load_effective_inventory', lambda _source: data)
+    assert scan.main([]) == 3
+    assert capsys.readouterr() == ('', 'PROFILE_RESOLVER_ERROR\n')
+    assert data == before
+
+
+def test_s3_later_host_failure_never_publishes_partial_plan(monkeypatch, capsys):
+    policy, real = scan.load_profile_contract()
+    data = basic_inventory()
+    data['_meta']['hostvars'][B][PKG] = False
+    req = request(groups=['g'])
+    observed = []
+    def broken(p, r):
+        observed.append(copy.deepcopy(r))
+        result = real(p, r)
+        if r['inventory_flags'] == {PKG: False}:
+            result['active_dispatch_allowed'] = True
+        return result
+    monkeypatch.setattr(scan, 'load_profile_contract', lambda: (policy, broken))
+    monkeypatch.setattr(scan, 'parse_cli', lambda _argv: ('synthetic', req))
+    monkeypatch.setattr(scan, 'load_effective_inventory', lambda _source: data)
+    assert scan.main([]) == 3
+    assert capsys.readouterr() == ('', 'PROFILE_RESOLVER_ERROR\n')
+    assert [r['inventory_flags'] for r in observed] == [{}, {}, {PKG: False}]
+    assert all(r['target_ids'] == [A, B] for r in observed)
