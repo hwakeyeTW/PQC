@@ -1,0 +1,632 @@
+---
+# Explicit internal tasks_from: crypto_policy only. The caller must already
+# own authorization and the native connection/variable context. Neither this
+# flag nor any profile decision permits live dispatch. No inventory overrides.
+- name: Acquire fixed Crypto Policy metadata for an authorized internal caller
+  no_log: true
+  become: false
+  vars:
+    policy_scopes: [profile-config, profile-show, kernel-fips, current-policy, backend-openssh, backend-opensshserver, backend-openssl, backend-opensslcnf, local-overrides]
+    profile_decision: "{{ pqc_profile_decision | default({}) }}"
+    requested: "{{ (profile_decision.requested_flags | default({})).crypto_policy | default(none) }}"
+    flag_rows: "{{ profile_decision.per_collector | default([]) | selectattr('id', 'equalto', 'crypto_policy') | list }}"
+    flag_reason: "{{ (flag_rows | first | default({})).reason_code | default('NOT_ATTEMPTED') }}"
+    platform_projection: "{{ pqc_platform_snapshot | default({}) }}"
+    facts: "{{ platform_projection.facts | default({}) }}"
+    tools: "{{ platform_projection.tools | default({}) }}"
+    timer: "{{ (tools.timeout | default([]) | first) | default({}) }}"
+    show_slots: "{{ tools['update-crypto-policies'] | default([]) }}"
+    show_bin: "{{ show_slots[0] | default({}) }}"
+    show_sbin: "{{ show_slots[1] | default({}) }}"
+    timer_ready: >-
+      {{ tools.timeout | default([]) | length == 1 and timer.state | default('UNKNOWN') == 'OK' and timer.exists | default(none) is sameas true
+         and timer.isreg | default(none) is sameas true and timer.islnk | default(none) is sameas false
+         and timer.executable | default(none) is sameas true }}
+    bin_ready: >-
+      {{ show_slots | length == 2 and show_bin.state | default('UNKNOWN') == 'OK'
+         and show_bin.exists | default(none) is sameas true and show_bin.isreg | default(none) is sameas true
+         and show_bin.islnk | default(none) is sameas false and show_bin.executable | default(none) is sameas true }}
+    sbin_ready: >-
+      {{ show_slots | length == 2 and show_sbin.state | default('UNKNOWN') == 'OK'
+         and show_sbin.exists | default(none) is sameas true and show_sbin.isreg | default(none) is sameas true
+         and show_sbin.islnk | default(none) is sameas false and show_sbin.executable | default(none) is sameas true }}
+    eligible: >-
+      {{ platform_projection.facts_state | default('UNKNOWN') == 'OK'
+         and facts.distribution | default(none) is string and facts.distribution | lower in ['oraclelinux', 'oracle linux', 'oracle-linux']
+         and (facts.os_family | default(none) is none or (facts.os_family is string and facts.os_family | lower == 'redhat'))
+         and facts.distribution_version | default(none) is string
+         and facts.distribution_version is regex('9[.](?:0|[1-9][0-9]{0,15})(?:[.](?:0|[1-9][0-9]{0,15}))?', match_type='fullmatch')
+         and facts.distribution_version.split('.')[1] | int <= 9007199254740991
+         and facts.distribution_version.split('.')[-1] | int <= 9007199254740991
+         and (facts.distribution_major_version | default(none) is none or
+              (facts.distribution_major_version is string and facts.distribution_major_version == '9') or
+              (facts.distribution_major_version is integer and facts.distribution_major_version == 9)) }}
+    outside: >-
+      {{ platform_projection.facts_state | default('UNKNOWN') == 'OK'
+         and facts.distribution | default(none) is string
+         and (facts.distribution | lower in ['redhat', 'red hat enterprise linux', 'rhel', 'rocky', 'rocky linux', 'almalinux', 'alma linux', 'centos', 'centos stream', 'fedora', 'debian', 'ubuntu', 'sles', 'suse', 'opensuse']
+              or (facts.distribution | lower in ['oraclelinux', 'oracle linux', 'oracle-linux']
+                  and (facts.os_family | default(none) is none or (facts.os_family is string and facts.os_family | lower == 'redhat'))
+                  and facts.distribution_version | default(none) is string
+                  and facts.distribution_version is regex('(?:0|[1-9][0-9]{0,15})(?:[.](?:0|[1-9][0-9]{0,15})){0,2}', match_type='fullmatch')
+                  and facts.distribution_version.split('.')[0] | int != 9
+                  and facts.distribution_version.split('.')[0] | int <= 9007199254740991
+                  and facts.distribution_version.split('.')[-1] | int <= 9007199254740991
+                  and (facts.distribution_major_version | default(none) is none or
+                       (facts.distribution_major_version is string and facts.distribution_major_version == facts.distribution_version.split('.')[0]) or
+                       (facts.distribution_major_version is integer and facts.distribution_major_version == facts.distribution_version.split('.')[0] | int)))) }}
+    gate: "{{ profile_decision.decision | default('DENIED') == 'VALIDATED' and requested is sameas true and eligible and timer_ready }}"
+    gap_reason: >-
+      {{ (flag_reason if flag_reason in ['DISABLED_BY_USER', 'DISABLED_BY_PROFILE'] else 'NOT_ATTEMPTED') if requested is sameas false
+         else 'PROFILE_NOT_VALIDATED' if profile_decision.decision | default('DENIED') != 'VALIDATED' or requested is not sameas true
+         else 'PLATFORM_OUT_OF_SCOPE' if outside else 'PLATFORM_UNKNOWN' if not eligible
+         else 'TIMEOUT_TOOL_UNAVAILABLE' if not timer_ready else 'NOT_ATTEMPTED' }}
+    skipped_slot: "{{ dict(state='NOT_SCANNED', reason=gap_reason, rc=none, values=[], overrides=[]) }}"
+  block:
+    - name: Initialize independent policy scopes without acquisition
+      ansible.builtin.set_fact:
+        pqc_crypto_policy_snapshot: "{{ dict(policy_scopes | zip([skipped_slot] * (policy_scopes | length))) }}"
+        cacheable: false
+
+    - name: Record missing show executable separately from file acquisition
+      ansible.builtin.set_fact:
+        pqc_crypto_policy_snapshot: "{{ pqc_crypto_policy_snapshot | combine({'profile-show': dict(state='NOT_SCANNED', reason='SHOW_TOOL_UNAVAILABLE', rc=none, values=[], overrides=[])}) }}"
+        cacheable: false
+      when: gate and not bin_ready and not sbin_ready
+
+    - name: Read only fixed policy sources and optionally one fixed show command
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/timeout
+          - --signal=TERM
+          - --kill-after=2s
+          - 27s
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            # Fixed target-side stdlib acquisition. No user-supplied root, path or command.
+            import ctypes
+            import hashlib
+            import json
+            import os
+            import posixpath
+            import re
+            import selectors
+            import signal
+            import stat
+            import subprocess
+            import sys
+            import time
+            from contextlib import contextmanager
+
+            # BEGIN SHARED POLICY GRAMMAR
+            FILE_LIMIT = 16 * 1024
+            TOTAL_LIMIT = 64 * 1024
+            MAX_VALUES = 64
+            MAX_ENTRIES = 32
+            BACKENDS = ("openssh", "opensshserver", "openssl", "opensslcnf")
+            SCOPES = ("profile-config", "profile-show", "kernel-fips", "current-policy",
+                      *("backend-" + k for k in BACKENDS), "local-overrides")
+            PROFILE = re.compile(r"[A-Z0-9][A-Z0-9_-]{0,31}(?::[A-Z0-9][A-Z0-9_-]{0,31}){0,3}", re.ASCII)
+            TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,95}", re.ASCII)
+            # '+' can be an operator. Never interpret cipher aliases, globbing or exclusions.
+            POLICY_FIELDS = {"cipher": "cipher", "group": "group", "sign": "sign",
+                             "key_exchange": "key-exchange", "protocol": "protocol"}
+            SSH_FIELDS = {"ciphers": "ciphers", "kexalgorithms": "kex-algorithms",
+                          "hostkeyalgorithms": "host-key-algorithms", "pubkeyacceptedalgorithms": "pubkey-accepted-algorithms"}
+            SSL_FIELDS = {"cipherstring": "cipher-string", "ciphersuites": "cipher-suites",
+                          "minprotocol": "min-protocol"}
+            PROTOCOLS = frozenset(("TLSv1", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3", "DTLSv1", "DTLSv1.2"))
+
+
+            def result(state, reason, values=(), *, rc=None, overrides=()):
+                return dict(state=state, reason=reason, rc=rc, values=list(values), overrides=list(overrides))
+
+
+            def fields_for(scope):
+                if scope == "current-policy":
+                    return frozenset(POLICY_FIELDS.values())
+                if scope in ("backend-openssh", "backend-opensshserver"):
+                    return frozenset(SSH_FIELDS.values())
+                if scope in ("backend-openssl", "backend-opensslcnf"):
+                    return frozenset(SSL_FIELDS.values())
+                return frozenset()
+
+
+            def valid_token(field, value):
+                if type(value) is not str or not TOKEN.fullmatch(value):
+                    return False
+                if field == "min-protocol":
+                    return value in PROTOCOLS
+                if field == "cipher-suites":
+                    return re.fullmatch(r"TLS_[A-Z0-9_]+", value, re.ASCII) is not None
+                if field == "cipher-string":
+                    # Only explicit suite spellings, not OpenSSL selector expressions.
+                    return re.fullmatch(r"(?:TLS_[A-Z0-9_]+|[A-Z0-9]+(?:-[A-Z0-9]+){2,})", value, re.ASCII) is not None
+                return True
+
+
+            def parse_source(scope, raw, *, rc=None):
+                """Parse a single bounded fixed source; never return raw text or paths."""
+                if scope not in SCOPES[:-1] or type(raw) is not bytes:
+                    return result("ERROR", "MALFORMED_OUTPUT", rc=rc)
+                if len(raw) > FILE_LIMIT:
+                    return result("ERROR", "OUTPUT_LIMIT", rc=rc)
+                if scope == "profile-show" and (type(rc) is not int or rc != 0):
+                    return result("ERROR", "COMMAND_FAILED", rc=rc)
+                if scope != "profile-show" and rc is not None:
+                    return result("ERROR", "MALFORMED_OUTPUT")
+                try:
+                    text = raw.decode("ascii")
+                except UnicodeError:
+                    return result("UNKNOWN", "UNSUPPORTED_SYNTAX", rc=rc)
+                if any(ord(c) < 32 and c not in "\n\t" or ord(c) == 127 for c in text):
+                    return result("UNKNOWN", "UNSUPPORTED_SYNTAX", rc=rc)
+                if scope in ("profile-config", "profile-show"):
+                    # Only a single exact token, optionally terminated by one LF.
+                    if scope == "profile-config":
+                        lines = [line.strip(" \t") for line in text.split("\n")
+                                 if line.strip(" \t") and not line.lstrip(" \t").startswith("#")]
+                        token = lines[0] if len(lines) == 1 else ""
+                    else:
+                        token = text.removesuffix("\n")
+                    if PROFILE.fullmatch(token):
+                        return result("COLLECTED", "OK", [["profile", token]], rc=rc)
+                    return result("UNKNOWN", "AMBIGUOUS_PROFILE", rc=rc)
+                if scope == "kernel-fips":
+                    if text in ("0", "0\n", "1", "1\n"):
+                        return result("COLLECTED", "OK", [["fips-enabled", text[0] == "1"]])
+                    return result("UNKNOWN", "AMBIGUOUS_FIPS")
+                # A field is usable only as an entire literal statement. An unsupported or
+                # contradictory occurrence invalidates that field, not unrelated fields.
+                known, blocked, gap = {}, set(), False
+                for line in text.split("\n"):
+                    line = line.strip(" \t")
+                    if not line or line.startswith(("#", ";")):
+                        continue
+                    if scope == "current-policy":
+                        key, sep, body = line.partition("=")
+                        field = POLICY_FIELDS.get(key.strip(" \t"))
+                        tokens = body.split() if sep else []
+                    elif scope in ("backend-openssh", "backend-opensshserver"):
+                        match = re.fullmatch(r"([A-Za-z]+)[ \t]+(.+)", line)
+                        field = SSH_FIELDS.get(match[1].lower()) if match else SSH_FIELDS.get(line.lower())
+                        tokens = match[2].split(",") if match else []
+                    else:
+                        key, sep, body = line.partition("=")
+                        field = SSL_FIELDS.get(key.strip(" \t").lower())
+                        tokens = body.strip(" \t").split(":") if sep else []
+                    if field is None:
+                        gap = True
+                        continue
+                    if (not tokens or len(tokens) > MAX_VALUES or any(not valid_token(field, v) for v in tokens)
+                            or len(set(tokens)) != len(tokens) or field in blocked
+                            or (field == "min-protocol" and len(tokens) != 1)
+                            or (field in known and known[field] != tokens)):
+                        known.pop(field, None)
+                        blocked.add(field)
+                        gap = True
+                        continue
+                    known[field] = tokens
+                values = [[field, v] for field in sorted(known) for v in known[field]]
+                if len(values) > MAX_VALUES:
+                    return result("UNKNOWN", "VALUE_LIMIT")
+                if not values:
+                    return result("UNKNOWN", "UNSUPPORTED_SYNTAX" if gap else "NO_DATA")
+                return result("PARTIAL" if gap else "COLLECTED", "INCOMPLETE_SYNTAX" if gap else "OK", values)
+            # END SHARED POLICY GRAMMAR
+
+            FILE_SCOPES = tuple(s for s in SCOPES if s not in ("profile-show", "local-overrides"))
+            PATHS = {"profile-config": "/etc/crypto-policies/config",
+                     "current-policy": "/etc/crypto-policies/state/CURRENT.pol",
+                     "kernel-fips": "/proc/sys/crypto/fips_enabled",
+                     **{"backend-" + b: "/etc/crypto-policies/back-ends/" + b + ".config" for b in BACKENDS}}
+            LOCAL_DIR = "/etc/crypto-policies/local.d"
+            SHOW_PATHS = {"show-bin": "/usr/bin/update-crypto-policies", "show-sbin": "/usr/sbin/update-crypto-policies"}
+            LINK_PROFILES = ("DEFAULT", "FUTURE", "LEGACY", "FIPS")
+            OVERRIDE = re.compile(r"(opensshserver|openssh|opensslcnf|openssl)(?:-[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?\.txt", re.ASCII)
+
+
+            class Fault(Exception):
+                def __init__(self, state, reason):
+                    self.state, self.reason = state, reason
+                    super().__init__(reason)
+
+
+            def failure(exc):
+                if isinstance(exc, Fault):
+                    return result(exc.state, exc.reason)
+                if isinstance(exc, PermissionError):
+                    return result("PERMISSION_DENIED", "PERMISSION_DENIED")
+                if isinstance(exc, FileNotFoundError):
+                    return result("UNKNOWN", "SOURCE_ABSENT")
+                # ENOTDIR/ELOOP from no-follow directory traversal are unsafe, not absent.
+                if isinstance(exc, OSError) and exc.errno in (20, 40):
+                    return result("UNKNOWN", "UNSAFE_SOURCE")
+                return result("ERROR", "READ_ERROR")
+
+
+            def unsafe():
+                raise Fault("UNKNOWN", "UNSAFE_SOURCE")
+
+
+            def trusted(st):
+                return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+            def identity(st):
+                return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size,
+                        st.st_mtime_ns, st.st_ctime_ns, st.st_nlink)
+
+
+            class Reader:
+                # The FD argument is internal to the helper; main always opens '/' itself.
+                # Tests exercise this same implementation on an isolated synthetic FD.
+                def __init__(self, root_fd, deadline):
+                    self.root = root_fd
+                    self.deadline = deadline
+                    self.remaining = TOTAL_LIMIT
+                    if not trusted(os.fstat(root_fd)) or not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                        unsafe()
+
+                def tick(self):
+                    if time.monotonic() >= self.deadline:
+                        raise Fault("ERROR", "TIMEOUT")
+
+                @contextmanager
+                def directory(self, path, *, listing=False):
+                    parts = path.strip("/").split("/") if path != "/" else []
+                    if len(parts) > 12 or any(not p or p in (".", "..") for p in parts):
+                        unsafe()
+                    fd = os.dup(self.root)
+                    try:
+                        for index, part in enumerate(parts):
+                            self.tick()
+                            flags = os.O_RDONLY if listing and index == len(parts) - 1 else os.O_PATH
+                            new = os.open(part, flags | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                            os.close(fd)
+                            fd = new
+                            st = os.fstat(fd)
+                            if not stat.S_ISDIR(st.st_mode) or not trusted(st):
+                                unsafe()
+                        yield fd
+                    finally:
+                        os.close(fd)
+
+                def link_target(self, path, target, allowed):
+                    if not target.isascii() or not 0 < len(target) <= 512:
+                        unsafe()
+                    # Resolve only an initial relative parent traversal, never a symlink
+                    # component followed by '..'. Open the normalized path independently.
+                    parts = target.split("/")
+                    if target.startswith("/"):
+                        parts = parts[1:]
+                        if any(p in ("", ".", "..") for p in parts):
+                            unsafe()
+                    else:
+                        while parts and parts[0] == "..":
+                            parts.pop(0)
+                        if any(p in ("", ".", "..") for p in parts):
+                            unsafe()
+                    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+                    if resolved not in allowed:
+                        unsafe()
+                    return resolved
+
+                @contextmanager
+                def pinned(self, path, allowed, *, local_fd=None):
+                    # Only fixed source names enter this function. The local directory FD
+                    # is used for already validated direct entries, not arbitrary paths.
+                    seen = set()
+                    for _ in range(5):
+                        self.tick()
+                        if path in seen or path not in allowed:
+                            unsafe()
+                        seen.add(path)
+                        parent, name = posixpath.split(path)
+                        if local_fd is None:
+                            with self.directory(parent) as fd:
+                                entry = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                        else:
+                            entry = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=local_fd)
+                        try:
+                            st = os.fstat(entry)
+                            if stat.S_ISLNK(st.st_mode):
+                                if local_fd is not None or len(allowed) == 1 or st.st_uid != 0:
+                                    unsafe()
+                                path = self.link_target(path, os.readlink("", dir_fd=entry), allowed)
+                                continue
+                            if not stat.S_ISREG(st.st_mode) or not trusted(st) or st.st_nlink != 1:
+                                unsafe()
+                            yield entry, st
+                            return
+                        finally:
+                            os.close(entry)
+                    unsafe()
+
+                def read(self, path, allowed, *, local_fd=None):
+                    self.tick()
+                    with self.pinned(path, allowed, local_fd=local_fd) as (pinned, st):
+                        if st.st_size > FILE_LIMIT:
+                            raise Fault("ERROR", "OUTPUT_LIMIT")
+                        if st.st_size > self.remaining:
+                            raise Fault("ERROR", "TOTAL_LIMIT")
+                        # O_PATH + fstat before opening prevents FIFO/device side effects.
+                        # /proc/self/fd is a Linux kernel-owned reference to the pinned FD.
+                        fd = os.open("/proc/self/fd/" + str(pinned), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                        try:
+                            if identity(os.fstat(fd)) != identity(st):
+                                raise Fault("ERROR", "SOURCE_CHANGED")
+                            data = bytearray()
+                            while True:
+                                self.tick()
+                                room = min(FILE_LIMIT - len(data), self.remaining)
+                                if room <= 0:
+                                    # A positive, unchanged regular-file size establishes
+                                    # EOF at the exact cap. Pseudo-files cannot use this.
+                                    if st.st_size > 0 and st.st_size == len(data) and path != PATHS["kernel-fips"]:
+                                        break
+                                    raise Fault("ERROR", "OUTPUT_LIMIT" if len(data) == FILE_LIMIT else "TOTAL_LIMIT")
+                                part = os.read(fd, min(4096, room))
+                                self.remaining -= len(part)
+                                if not part:
+                                    break
+                                data.extend(part)
+                            self.tick()
+                            if identity(os.fstat(fd)) != identity(st):
+                                raise Fault("ERROR", "SOURCE_CHANGED")
+                            with self.pinned(path, allowed, local_fd=local_fd) as (_, current):
+                                if identity(current) != identity(st):
+                                    raise Fault("ERROR", "SOURCE_CHANGED")
+                            return bytes(data)
+                        finally:
+                            os.close(fd)
+
+                def slot(self, scope):
+                    path = PATHS[scope]
+                    allowed = {path}
+                    if scope.startswith("backend-"):
+                        name = posixpath.basename(path)
+                        allowed.update("/usr/share/crypto-policies/" + profile + "/" + name for profile in LINK_PROFILES)
+                    try:
+                        return parse_source(scope, self.read(path, allowed))
+                    except (Fault, OSError) as exc:
+                        return failure(exc)
+
+                def overrides(self):
+                    try:
+                        with self.directory(LOCAL_DIR, listing=True) as fd:
+                            before = os.fstat(fd)
+                            names = []
+                            with os.scandir(fd) as entries:
+                                for entry in entries:
+                                    self.tick()
+                                    if len(names) == MAX_ENTRIES:
+                                        raise Fault("ERROR", "ENTRY_LIMIT")
+                                    names.append(entry.name)
+                            rows, gap, total = [], False, 0
+                            for name in sorted(names):
+                                self.tick()
+                                match = OVERRIDE.fullmatch(name)
+                                if not match:
+                                    gap = True
+                                    continue
+                                backend = match[1]
+                                path = LOCAL_DIR + "/" + name
+                                try:
+                                    row = parse_source("backend-" + backend, self.read(path, {path}, local_fd=fd))
+                                except (Fault, OSError) as exc:
+                                    row = failure(exc)
+                                if total + len(row["values"]) > MAX_VALUES:
+                                    row = result("UNKNOWN", "VALUE_LIMIT")
+                                total += len(row["values"])
+                                gap |= row["state"] != "COLLECTED"
+                                rows.append(dict(override_id="ov-" + hashlib.sha256(name.encode("ascii")).hexdigest(),
+                                                 backend=backend, result=row))
+                            self.tick()
+                            if identity(os.fstat(fd)) != identity(before):
+                                raise Fault("ERROR", "SOURCE_CHANGED")
+                            return result("PARTIAL" if gap else "COLLECTED", "INCOMPLETE_OVERRIDES" if gap else "OK",
+                                          [["entry-count", len(names)]], overrides=rows)
+                    except (Fault, OSError) as exc:
+                        return failure(exc)
+
+                def collect(self):
+                    rows = {scope: self.slot(scope) for scope in FILE_SCOPES}
+                    rows["local-overrides"] = self.overrides()
+                    return rows
+
+
+            def timeout_fault(_signum, _frame):
+                raise Fault("ERROR", "TIMEOUT")
+
+
+            def reap_group(proc, terminate):
+                """Reap the direct child and adopted same-group children, bounded 1.5 s."""
+                deadline = time.monotonic() + 1.5
+                pgid = proc.pid
+                residual = False
+                while True:
+                    rc = proc.poll()
+                    if rc is not None:
+                        while time.monotonic() < deadline:
+                            try:
+                                pid, _ = os.waitpid(-pgid, os.WNOHANG)
+                            except ChildProcessError:
+                                break
+                            if not pid:
+                                break
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        return rc is not None, residual
+                    except OSError:
+                        return False, residual
+                    if rc is not None:
+                        residual = True
+                    if terminate or residual:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except OSError:
+                            return False, residual
+                    if time.monotonic() >= deadline:
+                        return False, residual
+                    time.sleep(0.01)
+
+
+            def capture(argv, deadline):
+                # Internal function only; main selects exactly one fixed --show argv.
+                # Linux subreaper lets us confirm same-group cleanup, not detached tasks.
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.prctl(36, 1, 0, 0, 0) != 0:
+                    return result("ERROR", "CLEANUP_FAILED")
+                parent = os.getpid()
+                blocked = {signal.SIGTERM, signal.SIGINT}
+                mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+                p = None
+                buffers = [bytearray(), bytearray()]
+                reason, early, clean, residual = None, None, False, False
+
+                def child_setup():
+                    # Single-threaded trusted helper. The direct child must not outlive
+                    # an unexpectedly killed parent during the launch window.
+                    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+                        os._exit(126)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+                try:
+                    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, start_new_session=True, preexec_fn=child_setup,
+                                         env={"PATH": "/usr/bin:/usr/sbin:/bin", "LC_ALL": "C", "LANG": "C",
+                                              "PYTHONDONTWRITEBYTECODE": "1"})
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                    with selectors.DefaultSelector() as sel:
+                        for i, pipe in enumerate((p.stdout, p.stderr)):
+                            sel.register(pipe, selectors.EVENT_READ, i)
+                        while sel.get_map():
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise Fault("ERROR", "TIMEOUT")
+                            for key, _ in sel.select(remaining):
+                                room = FILE_LIMIT - sum(map(len, buffers))
+                                if room == 0:
+                                    raise Fault("ERROR", "OUTPUT_LIMIT")
+                                block = os.read(key.fd, min(4096, room))
+                                if block:
+                                    buffers[key.data].extend(block)
+                                else:
+                                    sel.unregister(key.fileobj)
+                        try:
+                            p.wait(timeout=max(0, deadline - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            raise Fault("ERROR", "TIMEOUT") from None
+                except PermissionError:
+                    reason = "COMMAND_FAILED"
+                    early = result("PERMISSION_DENIED", "PERMISSION_DENIED")
+                except FileNotFoundError:
+                    reason = "COMMAND_FAILED"
+                    early = result("UNKNOWN", "TOOL_UNAVAILABLE")
+                except Fault as exc:
+                    reason = exc.reason
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    reason = "COMMAND_FAILED"
+                finally:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+                    try:
+                        if p is not None:
+                            clean, residual = reap_group(p, reason is not None)
+                            p.stdout.close()
+                            p.stderr.close()
+                    finally:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                if p is None:
+                    return early or result("ERROR", reason or "COMMAND_FAILED")
+                rc = p.returncode
+                if not clean or residual:
+                    return result("ERROR", "CLEANUP_FAILED", rc=rc)
+                if reason:
+                    return result("ERROR", reason, rc=rc)
+                if rc != 0:
+                    return result("PERMISSION_DENIED", "PERMISSION_DENIED", rc=rc) if rc == 126 and bytes(buffers[1]) in (b"Permission denied\n", b"Permission denied") else result("ERROR", "COMMAND_FAILED", rc=rc)
+                if buffers[1]:
+                    return result("UNKNOWN", "AMBIGUOUS_PROFILE", rc=rc)
+                return parse_source("profile-show", bytes(buffers[0]), rc=rc)
+
+
+            def main():
+                mode = sys.argv[1] if len(sys.argv) == 2 else None
+                deadline = time.monotonic() + 23
+                signal.signal(signal.SIGTERM, timeout_fault)
+                signal.signal(signal.SIGINT, timeout_fault)
+                if mode not in ("reader", *SHOW_PATHS):
+                    raise SystemExit(2)
+                try:
+                    root = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try:
+                        reader = Reader(root, deadline)
+                        if mode == "reader":
+                            # Alarm interrupts ordinary blocking syscalls. GNU timeout is
+                            # the outer deadline including cleanup; D-state is not proven.
+                            signal.signal(signal.SIGALRM, timeout_fault)
+                            signal.setitimer(signal.ITIMER_REAL, 23)
+                            try:
+                                rows = reader.collect()
+                            finally:
+                                signal.setitimer(signal.ITIMER_REAL, 0)
+                        else:
+                            path = SHOW_PATHS[mode]
+                            with reader.pinned(path, {path}) as (fd, st):
+                                if not os.access(path, os.X_OK, effective_ids=True):
+                                    rows = {"profile-show": result("UNKNOWN", "TOOL_UNAVAILABLE")}
+                                else:
+                                    row = capture([path, "--show"], deadline)
+                                    # A trusted installation can still drift. Do not accept
+                                    # a result if the executable identity changed.
+                                    with reader.pinned(path, {path}) as (_, after):
+                                        if identity(st) != identity(after):
+                                            row = result("ERROR", "SOURCE_CHANGED", rc=row["rc"])
+                                    rows = {"profile-show": row}
+                    finally:
+                        os.close(root)
+                except (Fault, OSError) as exc:
+                    row = failure(exc)
+                    rows = {scope: row for scope in (*FILE_SCOPES, "local-overrides")} if mode == "reader" else {"profile-show": row}
+                payload = json.dumps(rows, separators=(",", ":"), ensure_ascii=True)
+                if len(payload) > TOTAL_LIMIT:
+                    rows = {scope: result("ERROR", "TOTAL_LIMIT") for scope in rows}
+                    payload = json.dumps(rows, separators=(",", ":"))
+                print(payload)
+
+
+            if __name__ == "__main__":
+                main()
+          - "{{ item }}"
+        expand_argument_vars: false
+      environment:
+        LC_ALL: C
+      loop: [reader, show-bin, show-sbin]
+      register: pqc_crypto_policy_acquisition
+      changed_when: false
+      failed_when: false
+      when:
+        - gate
+        - item == 'reader' or (item == 'show-bin' and bin_ready) or (item == 'show-sbin' and not bin_ready and sbin_ready)
+
+    - name: Project only fixed typed acquisition slots
+      ansible.builtin.set_fact:
+        pqc_crypto_policy_snapshot: "{{ pqc_crypto_policy_snapshot | combine(projected) }}"
+        cacheable: false
+      vars:
+        mode_scopes: "{{ policy_scopes | reject('equalto', 'profile-show') | list if item.item == 'reader' else ['profile-show'] }}"
+        failed_slot: >-
+          {{ dict(state='ERROR', reason=('TIMEOUT' if item.rc | default(-1) in [124, 137] else 'COMMAND_FAILED'),
+                  rc=item.rc | default(none), values=[], overrides=[]) }}
+        projected: >-
+          {{ item.stdout | from_json if item.rc | default(-1) == 0
+             else dict(mode_scopes | zip([failed_slot] * (mode_scopes | length))) }}
+      loop: "{{ pqc_crypto_policy_acquisition.results | default([]) }}"
+      when: not item.skipped | default(false)
