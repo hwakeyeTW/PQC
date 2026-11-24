@@ -1,0 +1,43 @@
+{
+  "legacy-per-host": {
+    "host": "host-a.example.invalid",
+    "collected_at": "2026-01-01T12:00:00Z",
+    "openssl_packages": {
+      "openssl": [{"name": "openssl", "version": "3.5.0", "release": "1.el9", "arch": "x86_64", "epoch": 0, "source": "rpm"}],
+      "openssl-libs": [{"version": "3.5.0", "release": "1.el9", "arch": "x86_64"}]
+    },
+    "openssl_version": "OpenSSL 3.5.0 8 Apr 2025 (Library: OpenSSL 3.5.0 8 Apr 2025)",
+    "openssl_version_rc": 0,
+    "openssl_tls1_3_groups": "X25519MLKEM768:MLKEM768:X25519:P-256",
+    "openssl_tls1_3_groups_rc": 0,
+    "crypto_policy": {"profile": "DEFAULT:PQC", "fips_enabled": true, "fips_output": "synthetic text", "local_overrides": ["/fixture/policy.txt"]},
+    "ssh_host_keys": [{"path": "/fixture/ssh_host_rsa_key.pub", "bits": 3072, "fingerprint": "SHA256:synthetic", "algorithm": "RSA", "risk": "quantum_safe"}],
+    "system_certificates": [{"path": "/fixture/server.pem", "subject": "CN=synthetic", "issuer": "CN=fixture-ca", "expires": "Dec 2027", "signature_algorithm": "ML-DSA-65", "public_key_algorithm": "rsaEncryption", "public_key_size": 2048, "risk": "quantum_safe"}],
+    "nginx_present": true,
+    "nginx_certificates": [{"path": "/fixture/server.pem", "subject": {"commonName": "synthetic"}, "issuer": {"commonName": "fixture-ca"}, "not_after": "20271201000000Z", "not_before": "20250101000000Z", "signature_algorithm": "sha256WithRSAEncryption", "public_key_type": "ECDSA", "public_key_size": "256"}],
+    "tls_services": [{"port": 443, "protocol": "TLSv1.3", "cipher": "TLS_AES_256_GCM_SHA384", "key_exchange": "X25519MLKEM768, 768 bits", "key_exchange_risk": "quantum_safe", "peer_signature": "RSA-PSS", "server_signature": "ML-DSA-65"}],
+    "sshd_crypto_lines": ["KexAlgorithms curve25519-sha256,ecdh-sha2-nistp256"],
+    "sshd_crypto_lines_commented": ["# KexAlgorithms synthetic"]
+  },
+  "legacy-fleet": {
+    "generated_at": "2026-01-01T13:00:00Z",
+    "total_hosts": 2,
+    "hosts": [
+      {"host": "host-b.example.invalid", "collected_at": "2026-01-01T12:00:00Z", "openssl_packages": {"openssl": [{"version": "3.0.7", "release": "1.el9", "arch": "x86_64"}]}, "openssl_version": "OpenSSL 3.0.7 1 Nov 2022", "openssl_version_rc": 0, "openssl_tls1_3_groups": "X25519:P-256:P-384", "openssl_tls1_3_groups_rc": 0, "crypto_policy": {}, "ssh_host_keys": [], "system_certificates": [], "tls_services": [], "nginx_present": false, "nginx_certificates": [], "sshd_crypto_lines": [], "sshd_crypto_lines_commented": []},
+      {"host": "host-c.example.invalid", "collected_at": "2026-01-01T12:00:00Z", "openssl_packages": {}, "openssl_version": "", "openssl_version_rc": -1, "openssl_tls1_3_groups": "", "openssl_tls1_3_groups_rc": -1, "crypto_policy": {}, "ssh_host_keys": [], "system_certificates": [], "tls_services": [], "nginx_present": false, "nginx_certificates": [], "sshd_crypto_lines": [], "sshd_crypto_lines_commented": []}
+    ]
+  },
+  "legacy-ol-run-summary": {
+    "run_id": "fixture-old-run",
+    "selected_hosts": ["host-d.example.invalid", "host-e.example.invalid", "host-f.example.invalid"],
+    "successful_hosts": ["host-d.example.invalid", "host-e.example.invalid"],
+    "hosts_without_report": ["host-f.example.invalid"],
+    "selected_count": 3,
+    "completed_count": 2,
+    "generated_at": "2026-01-01T14:00:00Z",
+    "reports": [
+      {"host": "host-d.example.invalid", "collected_at": "2026-01-01T12:30:00Z", "os_distribution": "OracleLinux", "os_version": "9.10", "openssl_packages": {"openssl": [{"version": "3.5.0", "release": "2.el9", "arch": "aarch64", "source": "rpm"}]}, "openssl_version": "OpenSSL 3.5.0 8 Apr 2025", "openssl_version_rc": 0, "openssl_tls1_3_groups": "X25519MLKEM768:X25519", "openssl_tls1_3_groups_rc": 0, "crypto_policy": {"profile": "DEFAULT", "fips_enabled": false}, "ssh_host_keys": [], "system_certificates": [], "tls_services": [], "nginx_present": false, "nginx_certificates": [], "sshd_crypto_lines": [], "sshd_crypto_lines_commented": []},
+      {"host": "host-e.example.invalid", "collected_at": "2026-01-01T12:30:00Z", "openssl_packages": {}, "openssl_version": "", "openssl_version_rc": -1, "openssl_tls1_3_groups": "", "openssl_tls1_3_groups_rc": -1, "crypto_policy": {}, "ssh_host_keys": [], "system_certificates": [], "tls_services": [], "nginx_present": false, "nginx_certificates": [], "sshd_crypto_lines": [], "sshd_crypto_lines_commented": []}
+    ]
+  }
+}
