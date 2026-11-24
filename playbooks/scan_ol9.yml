@@ -1,0 +1,4 @@
+---
+# Historical path retained as a controller-only fail-closed stub.
+- name: Import the controller-only rejection entry point
+  ansible.builtin.import_playbook: preflight.yml
