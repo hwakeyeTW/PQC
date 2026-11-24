@@ -677,8 +677,18 @@ def validate_document(document):
                 _require(e["observed_at"] is not None and e["algorithm"] is not None and
                          e["algorithm"]["algorithm_id"] is not None and e["algorithm"]["primitive"] != "UNKNOWN",
                          "ACTUAL_ALGORITHM_REQUIRED", p)
+                if level == "L5":
+                    # Actual usage must already have occurred when documented.
+                    # Observation may be inside the interval or retrospective.
+                    observed = _timestamp_key(e["observed_at"])
+                    recorded = _timestamp_key(run["recorded_at"])
+                    _require(_timestamp_key(context["started_at"]) <= observed <= recorded and
+                             _timestamp_key(context["finished_at"]) <= recorded,
+                             "USAGE_TIME_ORDER", p + ".data.conditions")
         if e["evidence_kind"] == "COLLECTION_SUMMARY":
             d = e["data"]
+            # V1 has no scope hierarchy: every summary describes its parent scope.
+            _require(d["scope"] == c["scope_key"], "SCOPE_MISMATCH", p + ".data.scope")
             if d["coverage"] != "UNKNOWN":
                 _require(d["attempted"] is True and d["applicable"] is True and d["observation_count"] is not None,
                          "COVERAGE_EVIDENCE", p)

@@ -104,7 +104,7 @@ def installed(present=True, state="PASS"):
 
 
 def summary(d, c, *, count=0, coverage="COMPLETE", attempted=True, applicable=True):
-    return observation(d, c, "COLLECTION_SUMMARY", dict(scope="all", attempted=attempted,
+    return observation(d, c, "COLLECTION_SUMMARY", dict(scope=c["scope_key"], attempted=attempted,
         coverage=coverage, observation_count=count, applicable=applicable))
 
 
@@ -585,3 +585,84 @@ def test_e05_synthetic_cannot_be_mixed_with_native():
     d = installed()
     d["run"]["source"]["source_kind"] = "NATIVE_COLLECTOR"
     rejected(d, "SYNTHETIC_MIX")
+
+
+# R1 C01: scope equality is semantic; shape alone cannot establish association.
+@pytest.mark.parametrize("state", ["COLLECTED", "NOT_APPLICABLE"])
+@pytest.mark.parametrize("scope", ["scope-b", "Scope-a", "scope-a-child"])
+def test_c01_summary_scope_mismatch(standard, state, scope):
+    d = document()
+    c = collector(d, scope="scope-a", state=state)
+    if state == "NOT_APPLICABLE":
+        e = summary(d, c, count=None, coverage="UNKNOWN", attempted=False, applicable=False)
+        cl = claim(d, c, refs=[e["evidence_id"]], state=state, reason="OUTSIDE_APPLICABILITY")
+        finding(d, cl, refs=[e["evidence_id"]])
+    else:
+        e = summary(d, c)
+    e["data"]["scope"] = scope
+    standard.validate(d)  # shape valid, same host/collector and intact ID/backrefs
+    rejected(d, "SCOPE_MISMATCH")
+
+
+def test_c01_same_scope_segmented_coverage(standard):
+    d = document()
+    a = collector(d, scope="scope-a")
+    b = collector(d, scope="scope-b", state="NOT_APPLICABLE", reason="OUTSIDE_APPLICABILITY")
+    c = collector(d, scope="scope-c", state="PARTIAL", reason="INCOMPLETE_SCOPE")
+    zero = summary(d, a)
+    na = summary(d, b, count=None, coverage="UNKNOWN", attempted=False, applicable=False)
+    part = summary(d, c, count=7, coverage="PARTIAL")
+    cl = claim(d, b, refs=[na["evidence_id"]], state="NOT_APPLICABLE", reason="OUTSIDE_APPLICABILITY")
+    finding(d, cl, refs=[na["evidence_id"]], claims=False)
+    claim(d, c, refs=[part["evidence_id"]], state="PARTIAL", key="partial", reason="INCOMPLETE_SCOPE")
+    standard.validate(d)
+    ev.validate_document(d)
+    assert zero["data"]["observation_count"] == 0
+    assert len(c["evidence_ids"]) == 1 and part["data"]["observation_count"] == 7
+    assert len({a["collection_id"], b["collection_id"], c["collection_id"]}) == 3
+    part["data"]["scope"] = a["scope_key"]
+    rejected(d, "SCOPE_MISMATCH")
+
+
+def usage_times(state, start, finish, observed, recorded):
+    d = negotiated("L5", state)
+    cl, e = d["claims"][0], d["evidence"][0]
+    cl["conditions"].update(started_at=start, finished_at=finish)
+    e["data"]["conditions"] = copy.deepcopy(cl["conditions"])
+    cl["claim_id"] = ev.claim_id(RID, cl["subject"], "L5", cl["rule_id"], cl["claim_key"], cl["conditions"])
+    e["observed_at"] = observed
+    d["run"]["recorded_at"] = recorded
+    return d
+
+
+# R1 C02: the original CE02a/b plus independent time boundaries.
+@pytest.mark.parametrize("state", ["PASS", "FAIL"])
+@pytest.mark.parametrize("start,finish,observed,recorded", [
+    ("2026-02-01T00:00:00Z", "2026-02-01T00:01:00Z", TS, END),
+    ("2026-01-01T00:00:00.000000001Z", END, TS, END),
+    (TS, END, "2026-01-01T00:01:00.000000001Z", END),
+    (TS, "2026-01-01T00:01:00.000000001Z", TS, END),
+], ids=["future-interval", "before-start", "record-before-observation", "record-before-end"])
+def test_c02_usage_time_mismatch(standard, state, start, finish, observed, recorded):
+    d = usage_times(state, start, finish, observed, recorded)
+    standard.validate(d)
+    rejected(d, "USAGE_TIME_ORDER")
+    # Direct finding support must not bypass the same actual-evidence check.
+    cl = d["claims"].pop()
+    finding(d, cl, refs=cl["evidence_ids"], claims=False)
+    rejected(d, "USAGE_TIME_ORDER")
+
+
+@pytest.mark.parametrize("state", ["PASS", "FAIL"])
+@pytest.mark.parametrize("observed,recorded", [
+    (TS, END),
+    ("2026-01-01T00:00:30Z", END),
+    (END, END),
+    ("2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+    ("2026-01-01T00:01:00.000000001+00:00", "2026-01-01T00:01:00.000000001Z"),
+], ids=["start", "within", "end", "retrospective", "exact-nanosecond-offset"])
+def test_c02_usage_time_consistent(standard, state, observed, recorded):
+    d = usage_times(state, TS, END, observed, recorded)
+    standard.validate(d)
+    ev.validate_document(d)
+    assert ev.parse_evidence_bytes(ev.canonical_bytes(d))["claims"][0]["assessment_state"] == state

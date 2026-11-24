@@ -127,6 +127,10 @@ object keys sorted，UTF-8 compact JSON，無尾端換行；保持原 document �
 
 Collection COLLECTED 必須有實證；成功空集合須具 `COLLECTION_SUMMARY`：
 `attempted=true`, `coverage=COMPLETE`, `observation_count=0`, `applicable=true`。
+每個 COLLECTION_SUMMARY 的 `data.scope` 必須與其 parent collection 的
+`scope_key` 完全相等（含大小寫）；V1 不推論父子、substring 或 aggregate
+關係。不同 scope 分段各自記錄；錯配文件以 SCOPE_MISMATCH 拒絕，不能
+借用其他 scope 支持 COLLECTED、PARTIAL、N/A 或相關 claim/finding。
 Count 是具名 scope 的 producer observation count，不等同 evidence registry
 大小。未知 coverage/count 或無資料不得當作成功空集合。PARTIAL 需已知
 部分實證及具名 gap reason；N/A 必有 `applicable=false` applicability summary
@@ -168,6 +172,13 @@ contract。Probe/協商本身不算業務使用。Claim context 必須與 eviden
 context 完全相同，實際結果在 `data.outcome`，algorithm/primitive 在
 `evidence.algorithm`。Service asset、host、algorithm 與 subject 一致。
 L4/L5 反例同樣須具實際條件與結果；timeout/error 或 probe-only 非反例。
+實際 OBSERVED_USAGE（OBSERVED 或 CONTRADICTED）須符合 `started_at <=
+finished_at`、`started_at <= evidence.observed_at <= run.recorded_at` 及
+`finished_at <= run.recorded_at`（精確 UTC 比較，保留九位小數秒）。允許
+區間內觀察或事後取得／匯入，不要求 observation 與記錄時刻相等，也不
+從單次觀察推定整段連續使用。時間矛盾以 USAGE_TIME_ORDER 拒絕（逆序
+區間仍為 TIME_ORDER），不支持任何 claim/finding。UNKNOWN 不提供
+實際使用正反證；不增加 L4 或其他 evidence kind 的一般時間限制。
 V2.0 僅 synthetic L4/L5 語義測試，真實 Active 由 #36–38 另行授權。
 
 ## 6. API / validation / safety
