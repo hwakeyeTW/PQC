@@ -682,4 +682,20 @@ def import_legacy(raw, *, format_id, run_id, recorded_at, origin_ref, rules,
     except evidence.EvidenceError as exc:
         raise LegacyImportError('NORMALIZED_' + exc.code) from None
     require(len(canonical) <= MAX_BYTES, 'SIZE_LIMIT')
-    return ImportResult(json.loads(canonical), provenance, dict(sorted(diagnostics.items())))
+    normalized = json.loads(canonical)
+    del canonical
+    # An empty claims/findings registry can fit while the assessed document
+    # exceeds Evidence's byte bound. The fixed evaluator already validates and
+    # canonicalizes its complete result. Use it once, with the exact caller
+    # rules, and discard the assessed result: import remains normalization.
+    # Work is bounded by the existing host/scope and evidence limits. With
+    # these import-only kinds (no COLLECTION_SUMMARY), each observation can
+    # yield at most one claim, one linked finding and one coverage finding;
+    # empty scopes add at most one each. No retries or result truncation.
+    try:
+        assessment.evaluate_document(normalized, rules)
+    except evidence.EvidenceError as exc:
+        if exc.code == 'SIZE_LIMIT':
+            raise LegacyImportError('REASSESSMENT_SIZE_LIMIT') from None
+        raise  # unexpected evaluator/validator failures are not capacity errors
+    return ImportResult(normalized, provenance, dict(sorted(diagnostics.items())))

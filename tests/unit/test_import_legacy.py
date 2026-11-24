@@ -616,3 +616,61 @@ def test_l02_manifest_reordering_keeps_ids_not_input_hash(rules, fixtures):
     for registry, id_key in e.REGISTRIES.items():
         assert [x[id_key] for x in first[registry]] == [x[id_key] for x in second[registry]]
     assert first['run']['source']['input_sha256'] != second['run']['source']['input_sha256']
+
+
+# F-R1-01: real fixed-rules expansion, not a normalized-size-only oracle.
+def _capacity_fleet(host_count):
+    return {'total_hosts': host_count, 'hosts': [
+        {'host': f'host-{i:03d}.example.invalid', 'openssl_packages': {
+            'openssl': [{'version': f'3.5.{j}'} for j in range(10)]}}
+        for i in range(host_count)]}
+
+
+def test_r1_reassessment_capacity_ce01(rules):
+    # Original Reviewer case: raw, host, asset/evidence and normalized-byte
+    # limits all fit, but the actual evaluator's full output does not.
+    b = raw(_capacity_fleet(1000))
+    assert len(b) == 269030
+    before_rules = deepcopy(rules)
+    before_hash = sha256(b).hexdigest()
+    error(b, rules, 'REASSESSMENT_SIZE_LIMIT', m.FORMATS[1])
+    assert sha256(b).hexdigest() == before_hash and rules == before_rules
+
+
+def test_r1_reassessment_capacity_near_limit(rules):
+    # Same workload at 800 hosts: near the actual 32 MiB assessed limit,
+    # with no changed validator bounds and no truncation of either document.
+    n = 800
+    b = raw(_capacity_fleet(n))
+    before_rules = deepcopy(rules)
+    result = run(b, rules, m.FORMATS[1])
+    d = result.document
+    assert d['claims'] == d['findings'] == []
+    assert d['schema_version'] == '1.0.0'
+    assert result.provenance['input_sha256'] == sha256(b).hexdigest()
+    assert len(d['hosts']) == len(d['run']['expected_host_ids']) == n
+    assert len(d['collections']) == n * len(m.SCOPES)
+    assert len(d['assets']) == len(d['evidence']) == n * 10
+    assessed = a.evaluate_document(d, rules)
+    assert len(assessed['claims']) == n * 10
+    assert len(assessed['findings']) == n * 30
+    assert all(c['level'] == 'L1' and c['assessment_state'] == 'PASS'
+               for c in assessed['claims'])
+    assert sum(f['assessment_state'] == 'PASS' for f in assessed['findings']) == n * 10
+    assert all(assessed[k] == d[k] for k in ('run', 'hosts', 'collections', 'assets', 'evidence'))
+    assessed_bytes = e.canonical_bytes(assessed)
+    assert e.MAX_BYTES * 95 // 100 < len(assessed_bytes) <= e.MAX_BYTES
+    assert e.parse_evidence_bytes(assessed_bytes) == assessed
+    assert d['claims'] == d['findings'] == [] and rules == before_rules
+
+
+@pytest.mark.parametrize('failure', [e.EvidenceError('CLAIM_EVIDENCE_REQUIRED'),
+                                    a.AssessmentError('ASSESSMENT_CONFLICT')])
+def test_r1_noncapacity_failure_not_hidden(rules, monkeypatch, failure):
+    # Fault injection is only for error propagation, never the capacity oracle.
+    def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(a, 'evaluate_document', fail)
+    with pytest.raises(type(failure)) as exc:
+        run({'host': HOST}, rules)
+    assert exc.value is failure

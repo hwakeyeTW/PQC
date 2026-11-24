@@ -72,8 +72,13 @@ and optional independently verified producer version (default null). The
 selector and adapter version are not the legacy producer's software version.
 Source version in an untrusted report is ignored. The adapter does not modify
 rules, inputs or existing Evidence files. Retaining the raw bytes is the
-caller's responsibility. The normalized Evidence is sufficient for offline
-reassessment without opening original reports or contacting hosts.
+caller's responsibility. A successful import also preflights the complete
+assessment with the exact supplied rules using the real #11 evaluator (which
+validates and canonicalizes its result). The temporary assessed document is
+not returned or stored: the normalized Evidence still has empty claims and
+findings and is sufficient for offline reassessment with those same rules,
+without opening original reports or contacting hosts. A different future
+ruleset is not covered by this capacity guarantee.
 
 ### Bounds and failure contract
 
@@ -86,6 +91,22 @@ reassessment without opening original reports or contacting hosts.
   entries and aggregate package rows bounded separately), 20,000 evidence
   rows and 20,000 assets, and 4,096 distinct algorithm/context classifications
   per import. Excess rejects the whole input, not a truncated result.
+- The 32 MiB Evidence bound applies independently to the complete assessed
+  document, not just the normalized bytes. One bounded real reassessment is
+  required before returning an import. An assessor `SIZE_LIMIT` is reported
+  as `LegacyImportError('REASSESSMENT_SIZE_LIMIT')`; nothing is returned and
+  no rows, hosts, claims or findings are truncated. Unexpected assessment or
+  validation failures propagate rather than being mislabeled as capacity
+  errors. No second evaluator, retries, rules modification or new dependency.
+  With at most 20,000 observations and 11 scopes per host, the fixed #11
+  evaluator can generate at most 20,000 claims and 51,000 findings (one
+  direct claim and its finding per observation, one coverage finding per
+  observation or empty scope). The importer emits no COLLECTION_SUMMARY,
+  so there is no cross-product of applicability references. The existing
+  input/registry/string/depth and streaming 32 MiB encoder bounds therefore
+  also bound preflight work and temporary output; no additional unbounded
+  input or external work is accepted. This is a deterministic resource bound,
+  not a wall-clock or process-RSS guarantee across Controllers.
 - New run ID, origin ref and optional version satisfy the existing Evidence
   lexical forms. A host must be a non-placeholder, exact ASCII literal alias
   (letters/digits/underscore/dot/hyphen/colon/@/+ within the existing logical
@@ -226,8 +247,11 @@ runtime dependency). They cover exact manifests, duplicate/malformed/default
 and malicious input, caps, disabled binding/conflicts, typed scope semantics,
 no input-directed I/O, IDs/determinism, and real `validate_document`,
 `evaluate_document`, `canonical_bytes`, `parse_evidence_bytes` and standard
-1.0.0 schema checks. No Ansible runtime is required. Only the four approved
-new paths are part of this work package.
+1.0.0 schema checks. R1 capacity regression uses the real APIs with the
+1,000-host/10-package-version CE01 negative case and an 800-host near-limit
+positive case, checks full reassessment/roundtrip and exact preserved counts,
+and verifies that non-capacity failures are not suppressed. No Ansible runtime
+is required. Only the four approved new paths are part of this work package.
 
 The API is an offline development component; actual historical reports,
 Controller/Oracle Linux 9.7/9.8/9.9, product store/Portal and complete offline
