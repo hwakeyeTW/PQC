@@ -1,4 +1,5 @@
 """Issue #3 synthetic inventory contract; no play execution or remote access."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -186,9 +187,9 @@ def require_binary(isolated, name):
 
 # Bounded diagnostic families from ansible-core v2.18.3 and v2.19.11
 # inventory/script.py. Matching a family is not a runtime version/support claim.
-PROFILE_FAILURE = "unable to get json decoder for inventory script result."
-VALUE_FAILURE = "value could not be parsed as json."
-DECODE_FAILURE = "inventory script result could not be parsed as json."
+PROFILE_FAILURE = "unable to get json decoder for inventory script result"
+VALUE_FAILURE = "value could not be parsed as json"
+DECODE_FAILURE = "inventory script result could not be parsed as json"
 EXIT_FAILURE = "inventory script returned non-zero exit code "
 OLD_JSON_FAILURE = "failed to parse executable inventory script results from "
 
@@ -203,9 +204,13 @@ def inventory_json_object(proc):
     parse_failures = (
         "failed to parse", "unable to parse", "no inventory was parsed",
         "failed to load inventory plugin", "no inventory plugins available",
-        PROFILE_FAILURE, DECODE_FAILURE, EXIT_FAILURE,
+        EXIT_FAILURE,
     )
+    # D0 captured colon-joined causes; do not require their source-code periods.
+    new_json_failure = any(re.search(re.escape(phrase) + r"[.:](?=\s|$)", normalized)
+                           for phrase in (PROFILE_FAILURE, DECODE_FAILURE))
     assert not (any(phrase in normalized for phrase in parse_failures)
+                or new_json_failure
                 or ("inventory script" in normalized and "had an execution error" in normalized)), (
         "inventory source parse failure: " + stderr)
     return data
@@ -434,41 +439,104 @@ def test_ansible_inventory_fatal_controls(isolated):
             f"effective fatal control not enabled: {setting}")
 
 
+# This is a narrow oracle for the two fixed disposable providers, not a log
+# parser for arbitrary inventories. D0's actual 2.19.11 warning/expanded/Origin/
+# help/fatal layout is the primary evidence; legacy and separated/decode forms
+# below are bounded source-derived alternatives, not additional native runs.
+SCRIPT_WARNING = "[WARNING]: Failed to parse inventory with 'script' plugin: "
+SCRIPT_EXPANDED = "\n\nFailed to parse inventory with 'script' plugin.\n\n<<< caused by >>>\n\n"
+SCRIPT_HELP = "\n\nStandard error from inventory script:\nSYNTHETIC_PROVIDER_FAILURE"
+JSON_DETAIL = "expecting value: line 1 column 1 (char 0)"
+
+
+def new_cause_family(message):
+    # Normalize diagnostic words only. Never normalize a source path.
+    message = message.lower()
+    if message in (
+        PROFILE_FAILURE + ": " + VALUE_FAILURE + ": " + JSON_DETAIL,
+        PROFILE_FAILURE + ".\n" + VALUE_FAILURE + ".",
+        PROFILE_FAILURE + ": " + VALUE_FAILURE + ".",
+    ):
+        return "profile"
+    if message in (DECODE_FAILURE + ".", DECODE_FAILURE + ": " + JSON_DETAIL):
+        return "decode"
+    if message == EXIT_FAILURE + "7.":
+        return "exit7"
+    return None
+
+
+def new_warning_family(event, provider):
+    if not event.startswith(SCRIPT_WARNING):
+        return None
+    brief, divider, expanded = event[len(SCRIPT_WARNING):].partition(SCRIPT_EXPANDED)
+    if not divider:
+        return None
+    # Origin must terminate the expanded cause and refer to this exact script.
+    # The help text is attached to that same expanded record, not a global search.
+    origin = f"\nOrigin: <inventory plugin 'script' with source '{provider}'>"
+    cause, bound, help_text = expanded.partition(origin)
+    if not bound:
+        return None
+    family = new_cause_family(cause)
+    if family is None or new_cause_family(brief) != family:
+        return None
+    if help_text != (SCRIPT_HELP if family == "exit7" else ""):
+        return None
+    return family
+
+
+def diagnostic_words(message):
+    """Allow legacy textwrap between diagnostic words, not inside source paths."""
+    return r"(?i:" + r"\s+".join(re.escape(word) for word in message.split()) + ")"
+
+
+def old_warning_family(event, provider):
+    # v2.18.3 manager/display: optional source-bound warning header followed
+    # by the legacy plugin reason. A wrapped/foreign path that cannot be bound
+    # exactly is ambiguous and must fail closed. No Origin is required here.
+    path = re.escape(str(provider))
+    header = (diagnostic_words("[WARNING]: * Failed to parse") + r"\s+" + path
+              + r"\s+" + diagnostic_words("with script plugin:") + r"\s+")
+    json_reason = (diagnostic_words(OLD_JSON_FAILURE) + r"\s+" + path + r":\s+"
+                   + "(?:" + diagnostic_words("invalid JSON") + "|"
+                   + diagnostic_words(JSON_DETAIL) + ")")
+    exit_reason = (diagnostic_words("Inventory script") + r"\s+\(" + path + r"\)\s+"
+                   + diagnostic_words("had an execution error:")
+                   + r"\s+SYNTHETIC_PROVIDER_FAILURE")
+    for family, reason in (("old-json", json_reason), ("old-exit", exit_reason)):
+        if re.fullmatch("(?:" + header + ")?" + reason, event):
+            return family
+    return None
+
+
 def assert_failed_provider(proc, provider, case):
-    """Native negative-case oracle; accept only the source-proven cause families."""
+    """Require native failure and complete, same-source diagnostic records."""
     stderr = proc.stderr.decode("utf-8", errors="replace")
-    normalized = " ".join(stderr.split())
-    lower = normalized.lower()
-    path = re.escape(" ".join(str(provider).split()))
     assert proc.returncode != 0, "native parser accepted failed synthetic provider"
-    # Both managers append this fatal diagnostic for the explicit inventory source.
-    # Require its exact path (not just the filename or a substring of another path).
-    assert re.search(r"(?i:completely failed to parse inventory source) " + path
-                     + r"(?=\s|$)", normalized), stderr
-    old_json = re.search(r"(?i:" + OLD_JSON_FAILURE + r")" + path + r":", normalized)
-    old_exit = re.search(r"(?i:inventory script) \(" + path
-                         + r"\) (?i:had an execution error):", normalized)
-    profile_json = PROFILE_FAILURE in lower and VALUE_FAILURE in lower
-    decode_json = DECODE_FAILURE in lower
-    has_json_cause = any(phrase in lower for phrase in
-                         (OLD_JSON_FAILURE, PROFILE_FAILURE, DECODE_FAILURE))
-    has_exit_cause = EXIT_FAILURE in lower or ("inventory script" in lower
-                                               and "had an execution error" in lower)
+    # Match the complete final fatal record, with case-sensitive path identity.
+    # Retain physical lines: no global flattening or independent cause searches.
+    body, separator, fatal = stderr.rstrip("\n").rpartition("\n")
+    assert separator and fatal in (
+        f"[ERROR]: Completely failed to parse inventory source {provider}",
+        f"ERROR! Completely failed to parse inventory source {provider}",
+    ), stderr
+    # Each warning must establish its own cause/source/help. Repeated complete
+    # same-source records are fine; incomplete, mixed or foreign records are not.
+    events = re.split(r"\n(?=\[WARNING\]:)", body.strip("\n"))
+    families = []
+    for event in events:
+        event = event.strip("\n")
+        family = new_warning_family(event, provider)
+        if family is None:
+            family = old_warning_family(event, provider)
+        assert family is not None, stderr
+        families.append(family)
+    assert len(set(families)) == 1, stderr
     if case == "malformed-json":
-        assert not has_exit_cause and (old_json or profile_json or decode_json), stderr
+        assert families[0] in ("profile", "decode", "old-json"), stderr
     else:
         assert case == "nonzero-provider", "unknown synthetic failure case"
-        assert not has_json_cause, stderr
-        assert re.search(r"\bsynthetic_provider_failure\b", lower), stderr
-        if EXIT_FAILURE in lower:
-            # 2.19.11 emits a numeric exit code; 7. is not 70. or any other code.
-            # Exception-chain display may repeat the same message.
-            exits = re.findall(re.escape(EXIT_FAILURE) + r"([+-]?\d+)\.(?=\s|$)", lower)
-            assert len(exits) == lower.count(EXIT_FAILURE) and set(exits) == {"7"}, stderr
-        else:
-            # 2.18.3 does not report a numeric provider rc. The native caller
-            # independently proves this exact disposable script returns 7.
-            assert old_exit, stderr
+        assert families[0] in ("exit7", "old-exit"), stderr
 
 
 @pytest.mark.parametrize("case,source", [
@@ -489,12 +557,21 @@ def test_ansible_inventory_rejects_failed_provider(isolated, case, source):
     assert_failed_provider(proc, provider, case)
 
 
-# Source-derived, controlled subprocess records, not native Ansible stderr.
+# Source-derived, controlled records. Use the observed D0 event layout for
+# separated/decode alternatives, with source association, not bare cause text.
 OLD_MALFORMED = "failed to parse executable inventory script results from {provider}: invalid JSON"
 OLD_NONZERO = "Inventory script ({provider}) had an execution error: SYNTHETIC_PROVIDER_FAILURE"
-NEW_PROFILE = "Unable to get JSON decoder for inventory script result.\nValue could not be parsed as JSON."
-NEW_DECODE = "Inventory script result could not be parsed as JSON."
-NEW_NONZERO = "Inventory script returned non-zero exit code 7.\nStandard error from inventory script:\nSYNTHETIC_PROVIDER_FAILURE"
+
+
+def source_warning(detail, help_text=""):
+    return (SCRIPT_WARNING + detail + SCRIPT_EXPANDED + detail
+            + "\nOrigin: <inventory plugin 'script' with source '{provider}'>" + help_text)
+
+
+NEW_PROFILE = source_warning("Unable to get JSON decoder for inventory script result.\n"
+                             "Value could not be parsed as JSON.")
+NEW_DECODE = source_warning("Inventory script result could not be parsed as JSON.")
+NEW_NONZERO = source_warning("Inventory script returned non-zero exit code 7.", SCRIPT_HELP)
 
 
 def synthetic_failure(case, detail, rc=1, fatal="{provider}"):
@@ -550,7 +627,7 @@ def test_r2_oracle_rejects_unrelated_failure():
 
 def test_r2_oracle_rejects_new_parse_warning_rc0():
     for detail in (NEW_PROFILE, NEW_DECODE, NEW_NONZERO):
-        proc = synthetic_response(empty_response(), detail.encode("utf-8"))
+        proc = synthetic_response(empty_response(), detail.format(provider="/synthetic/provider.py").encode("utf-8"))
         with pytest.raises(AssertionError, match="inventory source parse failure"):
             effective_inventory_object(proc, "empty")
 
@@ -569,3 +646,142 @@ def test_r2_oracle_accepts_standard_json():
     data["all"]["vars"] = {"values": [None, True, 0, -1, 1.5, "NaN", "Infinity", "-Infinity"]}
     proc = synthetic_response(data, b"[WARNING]: unrelated JSON note\n")
     assert effective_inventory_object(proc, "empty") == data
+
+
+D0_MALFORMED = b"""[WARNING]: Failed to parse inventory with 'script' plugin: Unable to get JSON decoder for inventory script result: Value could not be parsed as JSON: Expecting value: line 1 column 1 (char 0)
+
+Failed to parse inventory with 'script' plugin.
+
+<<< caused by >>>
+
+Unable to get JSON decoder for inventory script result: Value could not be parsed as JSON: Expecting value: line 1 column 1 (char 0)
+Origin: <inventory plugin 'script' with source '/synthetic/malformed-json.py'>
+
+[ERROR]: Completely failed to parse inventory source /synthetic/malformed-json.py
+"""
+
+
+D0_NONZERO = b"""[WARNING]: Failed to parse inventory with 'script' plugin: Inventory script returned non-zero exit code 7.
+
+Failed to parse inventory with 'script' plugin.
+
+<<< caused by >>>
+
+Inventory script returned non-zero exit code 7.
+Origin: <inventory plugin 'script' with source '/synthetic/nonzero-provider.py'>
+
+Standard error from inventory script:
+SYNTHETIC_PROVIDER_FAILURE
+
+[ERROR]: Completely failed to parse inventory source /synthetic/nonzero-provider.py
+"""
+
+
+# D0 QA report #7126334571: exact path-redacted native stderr, including LF.
+# Replaying it here is an oracle regression, not another native Ansible run.
+@pytest.mark.parametrize("case,stderr,length,digest", [
+    ("malformed-json", D0_MALFORMED, 556,
+     "f0dbb9c43a543e65951b16816b2854db3f3205c778923d26241de891705f931f"),
+    ("nonzero-provider", D0_NONZERO, 456,
+     "d69a61587ccb914a79a8a36b597843bb83209c366aba6a4dad2c880cc73b003a"),
+], ids=["malformed-json", "nonzero-provider"])
+def test_r3_oracle_d0_native_replay(case, stderr, length, digest):
+    assert len(stderr) == length and hashlib.sha256(stderr).hexdigest() == digest
+    provider = Path("/synthetic") / f"{case}.py"
+    assert_failed_provider(subprocess.CompletedProcess(["d0-replay-only"], 1, b"", stderr),
+                           provider, case)
+
+
+FOREIGN_ORIGIN = "Origin: <inventory plugin 'script' with source '/synthetic/foreign.py'>"
+
+
+@pytest.mark.parametrize("case,detail", [
+    ("malformed-json", "Unable to get JSON decoder for inventory script result.\n"
+     "Value could not be parsed as JSON.\n" + FOREIGN_ORIGIN + "\nFailed to load inventory plugin"),
+    ("nonzero-provider", "Inventory script returned non-zero exit code 7.\n" + FOREIGN_ORIGIN
+     + "\nStandard error from inventory script:\nSYNTHETIC_PROVIDER_FAILURE\nPermission denied"),
+    ("malformed-json", "failed to parse executable inventory script results from /synthetic/foreign.py: "
+     "invalid JSON\nInventory script result could not be parsed as JSON."),
+], ids=["foreign-profile", "foreign-exit-sentinel", "foreign-old-new-decode"])
+def test_r3_oracle_rejects_mixed_source(case, detail):
+    with pytest.raises(AssertionError):
+        assert_failed_provider(*synthetic_failure(case, detail))
+
+
+def test_r3_oracle_requires_bound_origin():
+    provider = Path("/synthetic/malformed-json.py")
+    origin = b"Origin: <inventory plugin 'script' with source '/synthetic/malformed-json.py'>\n"
+    for bad in (b"", FOREIGN_ORIGIN.encode() + b"\n", origin.replace(b"'script'", b"'yaml'"),
+                origin.replace(b"malformed-json.py", b"malformed-json.py.other")):
+        proc = subprocess.CompletedProcess(["d0-mutant"], 1, b"", D0_MALFORMED.replace(origin, bad))
+        with pytest.raises(AssertionError):
+            assert_failed_provider(proc, provider, "malformed-json")
+
+
+def test_r3_oracle_rejects_cross_event_help():
+    provider = Path("/synthetic/nonzero-provider.py")
+    body, fatal = D0_NONZERO.rsplit(b"[ERROR]:", 1)
+    no_help = body.replace(SCRIPT_HELP.encode(), b"")
+    # Do not allow a later complete event (even same-source) to repair an
+    # incomplete earlier event, or borrow its sentinel from a foreign source.
+    for later in (body, body.replace(str(provider).encode(), b"/synthetic/foreign.py")):
+        stderr = no_help + later + b"[ERROR]:" + fatal
+        with pytest.raises(AssertionError):
+            assert_failed_provider(subprocess.CompletedProcess(["d0-mutant"], 1, b"", stderr),
+                                   provider, "nonzero-provider")
+
+
+def test_r3_oracle_rejects_colon_cause_rc0():
+    # Remove the warning and fatal wrappers: the actual D0 colon cause itself
+    # must not be accepted as a successful empty inventory diagnostic.
+    actual = D0_MALFORMED.split(b"\n\n<<< caused by >>>\n\n", 1)[1].split(b"\nOrigin:", 1)[0]
+    for diagnostic in (actual, b"Inventory script result could not be parsed as JSON: "
+                        b"Expecting value: line 1 column 1 (char 0)"):
+        proc = synthetic_response(empty_response(), diagnostic)
+        with pytest.raises(AssertionError, match="inventory source parse failure"):
+            effective_inventory_object(proc, "empty")
+
+
+def test_r3_oracle_exact_space_and_case_path():
+    provider = Path("/synthetic/Case  Space/malformed-json.py")
+    path = str(provider).encode()
+    original = b"/synthetic/malformed-json.py"
+    stderr = D0_MALFORMED.replace(original, path)
+    assert_failed_provider(subprocess.CompletedProcess(["d0-path-mutant"], 1, b"", stderr),
+                           provider, "malformed-json")
+    for bad in (path.replace(b"  ", b" "), path.lower()):
+        # One altered Origin, with the correct final fatal path.
+        proc = subprocess.CompletedProcess(["d0-path-mutant"], 1, b"", stderr.replace(path, bad, 1))
+        with pytest.raises(AssertionError):
+            assert_failed_provider(proc, provider, "malformed-json")
+
+
+def test_r3_oracle_same_source_repeat_and_conflicts():
+    provider = Path("/synthetic/nonzero-provider.py")
+    body, fatal = D0_NONZERO.rsplit(b"[ERROR]:", 1)
+    good = body + body + b"[ERROR]:" + fatal
+    assert_failed_provider(subprocess.CompletedProcess(["d0-repeat"], 1, b"", good),
+                           provider, "nonzero-provider")
+    for bad in (body.replace(b"code 7.", b"code 70.", 1),
+                body.replace(b"code 7.", b"code 8.", 1),
+                body.replace(b"code 7.", b"code 70."),
+                body.replace(str(provider).encode(), b"/synthetic/foreign.py")):
+        proc = subprocess.CompletedProcess(["d0-mutant"], 1, b"", body + bad + b"[ERROR]:" + fatal)
+        with pytest.raises(AssertionError):
+            assert_failed_provider(proc, provider, "nonzero-provider")
+
+
+def test_r3_oracle_legacy_bound_wrapped_warning():
+    # Source-derived v2.18.3 warning format; wrapping between words is legal.
+    provider = Path("/synthetic/Case  Space/nonzero-provider.py")
+    warning = (f"[WARNING]:\n* Failed to parse {provider} with script plugin:\n"
+               f"Inventory script ({provider}) had an\nexecution error: SYNTHETIC_PROVIDER_FAILURE\n")
+    fatal = f"ERROR! Completely failed to parse inventory source {provider}\n"
+    assert_failed_provider(subprocess.CompletedProcess(["legacy-source-only"], 1, b"",
+                                                       (warning + fatal).encode()), provider, "nonzero-provider")
+    for bad in (warning.replace(str(provider), "/synthetic/foreign.py", 1),
+                warning.replace(str(provider), str(provider).replace("  ", " "), 1),
+                warning.replace("SYNTHETIC_PROVIDER_FAILURE", "other stderr")):
+        with pytest.raises(AssertionError):
+            assert_failed_provider(subprocess.CompletedProcess(["legacy-mutant"], 1, b"",
+                                                               (bad + fatal).encode()), provider, "nonzero-provider")
