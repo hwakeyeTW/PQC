@@ -75,6 +75,10 @@ available. Per-invocation overrides disable fsmonitor, untracked cache and
 case folding; tracing (including file-configured Trace2), paging, replacement
 objects, optional locks and lazy fetch are disabled, and no transport protocol
 is allowed. Diff commands disable external diff/textconv and rename detection.
+Both cached ITA listings also cancel `diff.orderFile` with `-O` and the platform
+null device, without modifying the configured order file or Git configuration.
+The Linux regression uses real Git and inotify open/access events; other
+platforms without this access oracle are NOT_TESTED, not evidence of a pass.
 This is a bounded checker for a trusted Git installation and ordinary checkout,
 not a sandbox for arbitrary malicious repository configuration or executables.
 

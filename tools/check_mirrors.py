@@ -155,8 +155,11 @@ def staged_paths(root, entries):
     empty = git(root, "hash-object", "-t", "tree", "--stdin")
     if not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\n", empty):
         raise CheckError("INVALID_GIT_OUTPUT")
+    # Cancel diff.orderFile for both listings: path order is irrelevant here,
+    # and the configured file may be outside the allowed source domains.
     common = ("diff", "--cached", "--name-only", "-z", "--no-renames",
-              "--no-ext-diff", "--no-textconv", "--no-relative", "--ignore-submodules=none")
+              "--no-ext-diff", "--no-textconv", "--no-relative",
+              "--ignore-submodules=none", "-O" + os.devnull)
     def listing(option):
         paths = set()
         for raw in records(git(root, *common, option, empty[:-1].decode("ascii"), "--", *PATHS)):

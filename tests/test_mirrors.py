@@ -1,8 +1,11 @@
 """Synthetic Git fixtures for the mirror contract (Issue #4, M01-M12)."""
+from contextlib import contextmanager
+import ctypes
 import importlib.util
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -544,3 +547,149 @@ def test_r1_05_malformed_directory_record_rejected(raw):
 def test_r1_05_directory_record_not_valid_index_path():
     with pytest.raises(checker.CheckError, match="INVALID_GIT_OUTPUT"):
         checker.index_entries(b"100644 " + b"a" * 40 + b" 0\tplugins/embedded/\0")
+
+
+# Review R2 regression: observe the excluded synthetic file itself, not stdout.
+@contextmanager
+def watch_orderfile(path):
+    """Linux open/access oracle with a fresh watch for each command."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NOT_TESTED: Linux inotify access oracle unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        init = libc.inotify_init1
+        add_watch = libc.inotify_add_watch
+    except AttributeError:
+        pytest.fail("BLOCKED: inotify access oracle unavailable")
+    init.argtypes = [ctypes.c_int]
+    init.restype = ctypes.c_int
+    add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add_watch.restype = ctypes.c_int
+    fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+    assert fd >= 0, "BLOCKED: inotify init failed"
+    try:
+        # IN_ACCESS | IN_OPEN | IN_DELETE_SELF | IN_MOVE_SELF; reject lost watches
+        # and queue overflow rather than treating missing events as a pass.
+        wd = add_watch(fd, os.fsencode(path), 0xC21)
+        assert wd >= 0, "BLOCKED: inotify watch failed"
+
+        def events():
+            masks = []
+            header = struct.Struct("iIII")
+            while True:
+                try:
+                    raw = os.read(fd, 65536)
+                except BlockingIOError:
+                    break
+                assert raw, "inotify returned an empty event buffer"
+                offset = 0
+                while offset < len(raw):
+                    assert len(raw) - offset >= header.size
+                    watch, mask, _, size = header.unpack_from(raw, offset)
+                    offset += header.size + size
+                    assert offset <= len(raw)
+                    assert watch == wd and not mask & 0xEC00, "inotify watch lost/overflow"
+                    assert mask in (0x20, 0x1), "unexpected inotify event"
+                    masks.append(mask)
+            return masks
+
+        yield events
+    finally:
+        os.close(fd)
+
+
+def configure_orderfile(repo, scope, path):
+    if scope == "local":
+        git(repo, "config", "--local", "diff.orderFile", path)
+    else:
+        # The checker discards GIT_CONFIG_GLOBAL and uses normal HOME discovery.
+        put(Path(os.environ["HOME"]), ".gitconfig",
+            f"[diff]\n\torderFile = {path}\n".encode())
+
+
+def orderfile_fixture(repo, scope):
+    relative = "reports/synthetic-order.txt"
+    order = put(repo, relative, b"# orderfile-private-sentinel\nroles/*\nplugins/*\n")
+    configure_orderfile(repo, scope, relative)
+    return order
+
+
+def checked_without_orderfile_access(repo, order, rc, *reasons):
+    home = Path(os.environ["HOME"])
+    before = all_files(repo), all_files(home)
+    with watch_orderfile(order) as events:
+        out = expect(repo, rc, *reasons)
+        observed = events()
+    assert not observed, f"excluded order file accessed: {observed}"
+    assert "orderfile-private-sentinel" not in out and str(order) not in out
+    assert (all_files(repo), all_files(home)) == before
+    return out
+
+
+@pytest.mark.parametrize("scope", ["local", "user"])
+def test_r2_01_orderfile_no_access(repo, scope):
+    order = orderfile_fixture(repo, scope)
+    empty = checker.git(repo, "hash-object", "-t", "tree", "--stdin").strip().decode()
+    # Positive control: each original R2 command really opens and reads the
+    # excluded dummy file. The explicit override must return the same paths.
+    common = ("diff", "--cached", "--name-only", "-z", "--no-renames",
+              "--no-ext-diff", "--no-textconv", "--no-relative", "--ignore-submodules=none")
+    for option in ("--ita-visible-in-index", "--ita-invisible-in-index"):
+        args = (option, empty, "--", *checker.PATHS)
+        with watch_orderfile(order) as events:
+            original = checker.git(repo, *common, *args)
+            assert events() == [0x20, 0x1]
+        with watch_orderfile(order) as events:
+            corrected = checker.git(repo, *common, "-O" + os.devnull, *args)
+            assert events() == []
+        assert set(checker.records(original)) == set(checker.records(corrected))
+        assert len(checker.records(corrected)) == 22
+    assert checked_without_orderfile_access(repo, order, 0) == "PASS pairs=11\n"
+
+
+@pytest.mark.parametrize("scope", ["local", "user"])
+def test_r2_01_missing_orderfile_does_not_break_check(repo, scope):
+    relative = "reports/missing-order-file"
+    configure_orderfile(repo, scope, relative)
+    home = Path(os.environ["HOME"])
+    before = all_files(repo), all_files(home)
+    assert expect(repo, 0) == "PASS pairs=11\n"
+    assert not (repo / relative).exists()
+    assert (all_files(repo), all_files(home)) == before
+
+
+@pytest.mark.parametrize("data", [b"", b"synthetic intent\n"], ids=["empty", "nonempty"])
+@pytest.mark.parametrize("prefixes", [("",), (C,), ("", C)], ids=["legacy", "canonical", "both"])
+def test_r2_01_orderfile_preserves_ita_and_real_stage(repo, data, prefixes):
+    order = orderfile_fixture(repo, "local")
+    path = "plugins/modules/ordered-intent.py"
+    for prefix in prefixes:
+        put(repo, prefix + path, data)
+    git(repo, "add", "-N", "--", *(prefix + path for prefix in prefixes))
+    out = checked_without_orderfile_access(repo, order, 1, "INTENT_TO_ADD")
+    assert {line for line in out.splitlines() if line.startswith("FAIL INTENT_TO_ADD ")} == {
+        f'FAIL INTENT_TO_ADD "{prefix + path}"' for prefix in prefixes}
+    if len(prefixes) == 1:
+        assert ("MISSING_CANONICAL" if prefixes == ("",) else "MISSING_MIRROR") in out
+    pair(repo, path, data)
+    git(repo, "add", "--", path, C + path)
+    assert checked_without_orderfile_access(repo, order, 0) == "PASS pairs=12\n"
+
+
+def test_r2_01_orderfile_linked_worktree_and_ignores(repo, tmp_path):
+    other = tmp_path / "linked"
+    git(repo, "worktree", "add", "--detach", str(other), "HEAD")
+    order = orderfile_fixture(other, "local")
+    home = Path(os.environ["HOME"])
+    put(home, ".gitconfig", b"[core]\n\texcludesFile = ~/standard-excludes\n")
+    put(home, "standard-excludes", b"global-cache.pyc\n")
+    put(repo, ".git/info/exclude", b"local-cache.pyc\n")
+    put(other, ".gitignore", b"root-cache.pyc\n")
+    for prefix in ("", C):
+        for name in ("global-cache.pyc", "local-cache.pyc", "root-cache.pyc"):
+            put(other, prefix + "plugins/modules/" + name)
+    before = all_files(repo)
+    assert checked_without_orderfile_access(other, order, 0) == "PASS pairs=11\n"
+    put(other, "plugins/modules/not-ignored.py")
+    checked_without_orderfile_access(other, order, 1, "UNTRACKED_SOURCE", "not-ignored.py")
+    assert all_files(repo) == before
