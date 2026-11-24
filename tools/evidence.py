@@ -1,4 +1,4 @@
-"""PQC Evidence V1.0.0: offline model and deterministic identity helpers.
+"""PQC Evidence 1.0.0 / 1.1.0: offline model and deterministic identity helpers.
 
 No file, network, command, schema resolver or assessment-engine dependency.
 The small field declarations below describe this model only (not an arbitrary
@@ -12,7 +12,8 @@ import unicodedata
 from datetime import datetime
 from typing import NamedTuple
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.0.0"  # Stable default for existing producers.
+LATEST_SCHEMA_VERSION = "1.1.0"
 MAX_BYTES = 32 * 1024 * 1024
 MAX_DEPTH = 64
 MAX_COMPONENT = 512
@@ -241,12 +242,12 @@ def _array(field, unique=False):
     return _Field(check, schema)
 
 
-def _record(name, fields, optional=None):
+def _record(name, fields, optional=None, *, defs=None):
     optional = optional or {}
     all_fields = {**fields, **optional}
     schema = {"type": "object", "additionalProperties": False,
               "required": list(fields), "properties": {k: v.schema for k, v in all_fields.items()}}
-    _DEFS[name] = schema
+    (_DEFS if defs is None else defs)[name] = schema
 
     def check(value, p):
         _require(type(value) is dict, "TYPE", p)
@@ -259,11 +260,11 @@ def _record(name, fields, optional=None):
     return _Field(check, {"$ref": "#/$defs/" + name})
 
 
-def _variant(name, variants, nullable=False):
+def _variant(name, variants, nullable=False, *, defs=None):
     # The caller selects the exact variant using the model discriminator.
     # Variant object shapes can overlap; the enclosing conditional selects the type.
     schema = {"anyOf": [x.schema for x in variants.values()] + ([{"type": "null"}] if nullable else [])}
-    _DEFS[name] = schema
+    (_DEFS if defs is None else defs)[name] = schema
     def check(value, p):
         if nullable and value is None:
             return
@@ -311,10 +312,10 @@ USE_FIELDS = {"host_id": IDS["host"], "service_asset_id": IDS["asset"], "busines
               "started_at": STAMP, "finished_at": STAMP}
 NEG = _record("negotiation_conditions", NEG_FIELDS)
 USE = _record("usage_conditions", USE_FIELDS)
+_PACKAGE_FIELDS = {"name": TEXT, "version": _nullable(TEXT), "present": _nullable(_boolean())}
 DATA = {
     "PLATFORM_INFO": _record("platform_data", {"os_family": _nullable(TEXT), "os_version": _nullable(TEXT)}),
-    "PACKAGE_INVENTORY": _record("package_data", {"name": TEXT, "version": _nullable(TEXT),
-                                                   "present": _nullable(_boolean())}),
+    "PACKAGE_INVENTORY": _record("package_data", _PACKAGE_FIELDS),
     "RUNTIME_CAPABILITY": _record("runtime_data", {"capability": SLUG, "supported": _nullable(_boolean())}),
     "EFFECTIVE_CONFIGURATION": _record("configuration_data", {"setting": SLUG, "effective_value": _nullable(TEXT),
                                                                   "allowed": _nullable(_boolean())}),
@@ -327,11 +328,17 @@ DATA = {
         "applicable": _nullable(_boolean())}),
     "LEGACY_OBSERVATION": _record("legacy_data", {"field": SLUG, "value": _legacy_scalar()}),
 }
-EVIDENCE = _record("evidence", {"evidence_id": IDS["evidence"], "host_id": IDS["host"],
-    "collection_id": IDS["collection"], "asset_id": _nullable(IDS["asset"]), "observation_key": KEY,
-    "evidence_kind": _enum(*DATA), "source": SOURCE, "observed_at": _nullable(STAMP),
-    "data": _variant("evidence_data", DATA), "algorithm": _nullable(ALGORITHM)},
-    {"evidence_ref": _nullable(REF), "raw_sha256": _nullable(SHA)})
+
+
+def _evidence_shape(data, *, defs=None):
+    return _record("evidence", {"evidence_id": IDS["evidence"], "host_id": IDS["host"],
+        "collection_id": IDS["collection"], "asset_id": _nullable(IDS["asset"]), "observation_key": KEY,
+        "evidence_kind": _enum(*data), "source": SOURCE, "observed_at": _nullable(STAMP),
+        "data": _variant("evidence_data", data, defs=defs), "algorithm": _nullable(ALGORITHM)},
+        {"evidence_ref": _nullable(REF), "raw_sha256": _nullable(SHA)}, defs=defs)
+
+
+EVIDENCE = _evidence_shape(DATA)
 CLAIM = _record("claim", {"claim_id": IDS["claim"], "subject": SUBJECT, "claim_key": KEY,
     "level": _enum(*LEVELS), "assessment_state": _enum(*ASSESSMENTS), "rule_id": SLUG,
     "rule_version": VERSION, "reason_code": REASON, "evidence_ids": _array(IDS["evidence"], True),
@@ -340,9 +347,15 @@ FINDING = _record("finding", {"finding_id": IDS["finding"], "subject": SUBJECT,
     "condition_key": KEY, "rule_id": SLUG, "rule_version": VERSION,
     "assessment_state": _enum(*ASSESSMENTS), "reason_code": REASON,
     "claim_ids": _array(IDS["claim"], True), "evidence_ids": _array(IDS["evidence"], True)})
-DOCUMENT = _record("document", {"schema_version": _enum(SCHEMA_VERSION), "run": RUN,
-    "hosts": _array(HOST), "collections": _array(COLLECTION), "assets": _array(ASSET),
-    "evidence": _array(EVIDENCE), "claims": _array(CLAIM), "findings": _array(FINDING)})
+
+
+def _document_shape(version, evidence, *, defs=None):
+    return _record("document", {"schema_version": _enum(version), "run": RUN,
+        "hosts": _array(HOST), "collections": _array(COLLECTION), "assets": _array(ASSET),
+        "evidence": _array(evidence), "claims": _array(CLAIM), "findings": _array(FINDING)}, defs=defs)
+
+
+DOCUMENT = _document_shape(SCHEMA_VERSION, EVIDENCE)
 
 # Standard schema conditionals are emitted from the model discriminators.
 def _conditional(field, value, properties):
@@ -363,10 +376,61 @@ _DEFS["host"]["allOf"] = [
 ]
 
 
-def model_schema():
-    """Return an independent copy for generating/checking the local schema."""
+# Build the second version once. Shared definitions are read-only by convention;
+# replace the changed definitions in a separate mapping, never switch global state.
+_DEFS_11 = dict(_DEFS)
+_NORMALIZED_SLUG = _string(64, r"[a-z0-9][a-z0-9_-]{0,63}")
+_DECIMAL_COMPONENT = r"(?:0|[1-9][0-9]{0,15})"
+_OS_VERSION = _string(50, _DECIMAL_COMPONENT + r"(?:\." + _DECIMAL_COMPONENT + r"){0,2}")
+_METADATA_KINDS = ("PLATFORM_INFO", "TOOL_AVAILABILITY")
+_TOOL_IDS = ("rpm", "openssl", "ssh", "sshd", "ssh-keygen", "update-crypto-policies", "timeout")
+_DATA_11 = {
+    **DATA,
+    "PLATFORM_INFO": _record("platform_data", {
+        "os_family": _nullable(_NORMALIZED_SLUG), "os_version": _nullable(_OS_VERSION),
+        "distribution": _nullable(_NORMALIZED_SLUG), "major": _nullable(_count()),
+        "minor": _nullable(_count()), "patch": _nullable(_count()),
+        "architecture": _nullable(_NORMALIZED_SLUG),
+        "platform_status": _enum("UNVERIFIED", "OUT_OF_SCOPE", "UNKNOWN"),
+    }, defs=_DEFS_11),
+    "PACKAGE_INVENTORY": _record("package_data", _PACKAGE_FIELDS, {
+        "release": _nullable(VERSION), "architecture": _nullable(_NORMALIZED_SLUG),
+    }, defs=_DEFS_11),
+    "TOOL_AVAILABILITY": _record("tool_availability_data", {
+        "tool_id": _enum(*_TOOL_IDS), "lookup_scope": _enum("SYSTEM_EXECUTABLE_PATHS"),
+        "available": _nullable(_boolean()),
+    }, defs=_DEFS_11),
+}
+_EVIDENCE_11 = _evidence_shape(_DATA_11, defs=_DEFS_11)
+_DOCUMENT_11 = _document_shape(LATEST_SCHEMA_VERSION, _EVIDENCE_11, defs=_DEFS_11)
+_DEFS_11["evidence"]["allOf"] = [
+    _conditional("evidence_kind", kind, {"data": shape.schema, **(
+        {"asset_id": {"type": "null"}, "algorithm": {"type": "null"}}
+        if kind in _METADATA_KINDS else {})})
+    for kind, shape in _DATA_11.items()
+]
+_DEFS_11["package_data"]["allOf"] = [{
+    "if": {"anyOf": [{"required": [key], "properties": {key: {"not": {"type": "null"}}}}
+                     for key in ("release", "architecture")]},
+    "then": {"properties": {"present": {"const": True}}},
+}]
+_MODELS = {
+    SCHEMA_VERSION: (DOCUMENT, DATA, _DEFS),
+    LATEST_SCHEMA_VERSION: (_DOCUMENT_11, _DATA_11, _DEFS_11),
+}
+
+
+def _model(schema_version):
+    _require(type(schema_version) is str and schema_version in _MODELS,
+             "SCHEMA_VERSION", "$.schema_version")
+    return _MODELS[schema_version]
+
+
+def model_schema(schema_version=SCHEMA_VERSION):
+    """Return an independent local schema snapshot; default remains 1.0.0."""
+    document, _, defs = _model(schema_version)
     return json.loads(json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "urn:pqc:evidence:1.0.0", **DOCUMENT.schema, "$defs": _DEFS}))
+        "$id": "urn:pqc:evidence:" + schema_version, **document.schema, "$defs": defs}))
 
 
 # ID-V1: no path, order index, timestamp or connection-address substitution.
@@ -506,7 +570,10 @@ def _nontrivial(e):
         return (d["applicable"] is False or (d["attempted"] is True and
                 d["coverage"] != "UNKNOWN" and d["observation_count"] is not None))
     if kind == "PLATFORM_INFO":
-        return any(v is not None for v in d.values())
+        # Status is derived metadata, not an acquired observation by itself.
+        return any(v is not None for k, v in d.items() if k != "platform_status")
+    if kind == "TOOL_AVAILABILITY":
+        return d["available"] is not None
     if kind == "ASSET_METADATA":
         return any(v is not None for v in d.values())
     return False  # unclassified legacy metadata is not a direct assertion
@@ -592,13 +659,44 @@ def _supports_claim(claim, row, collections):
             d["outcome"] == ("OBSERVED" if positive else "CONTRADICTED"))
 
 
+def _platform_status(data):
+    distribution, family = data["distribution"], data["os_family"]
+    major, minor = data["major"], data["minor"]
+    if distribution is None:
+        return "UNKNOWN"
+    if distribution != "oracle-linux":
+        return "OUT_OF_SCOPE"
+    if family not in (None, "redhat") or major is None:
+        return "UNKNOWN"
+    if major != 9:
+        return "OUT_OF_SCOPE"
+    return "UNVERIFIED" if minor is not None else "UNKNOWN"
+
+
+def _validate_extended_data(row, p):
+    kind, data = row["evidence_kind"], row["data"]
+    if kind in _METADATA_KINDS:
+        _require(row["asset_id"] is None and row["algorithm"] is None,
+                 "METADATA_ASSOCIATION", p)
+    if kind == "PLATFORM_INFO":
+        major, minor, patch = (data[k] for k in ("major", "minor", "patch"))
+        _require((minor is None or major is not None) and (patch is None or minor is not None),
+                 "PLATFORM_VERSION", p + ".data")
+        expected = ".".join(str(v) for v in (major, minor, patch) if v is not None) or None
+        _require(data["os_version"] == expected, "PLATFORM_VERSION", p + ".data.os_version")
+        _require(data["platform_status"] == _platform_status(data),
+                 "PLATFORM_STATUS", p + ".data.platform_status")
+    if kind == "PACKAGE_INVENTORY" and any(data.get(k) is not None for k in ("release", "architecture")):
+        _require(data["present"] is True, "PACKAGE_PRESENCE", p + ".data.present")
+
+
 def validate_document(document):
     """Validate shape and semantic invariants without mutation; return None."""
     _json_guard(document)
     _encode(document)  # enforce the same byte budget for in-memory callers
-    if type(document) is dict and "schema_version" in document:
-        _require(document["schema_version"] == SCHEMA_VERSION, "SCHEMA_VERSION", "$.schema_version")
-    DOCUMENT.check(document, "$")
+    version = document.get("schema_version", SCHEMA_VERSION) if type(document) is dict else SCHEMA_VERSION
+    shape, data_shapes, _ = _model(version)
+    shape.check(document, "$")
     run = document["run"]
     rid, run_source = run["run_id"], run["source"]
     if run["started_at"] is not None and run["finished_at"] is not None:
@@ -655,7 +753,9 @@ def validate_document(document):
         # Data variants are checked below before reading their typed values.
     for i, e in enumerate(document["evidence"]):
         p = f"$.evidence[{i}]"
-        DATA[e["evidence_kind"]].check(e["data"], p + ".data")
+        data_shapes[e["evidence_kind"]].check(e["data"], p + ".data")
+        if version == LATEST_SCHEMA_VERSION:
+            _validate_extended_data(e, p)
         _lookup(hosts, e["host_id"], p + ".host_id")
         c = _lookup(collections, e["collection_id"], p + ".collection_id")
         _require(c["host_id"] == e["host_id"], "CROSS_HOST", p)

@@ -666,3 +666,362 @@ def test_c02_usage_time_consistent(standard, state, observed, recorded):
     standard.validate(d)
     ev.validate_document(d)
     assert ev.parse_evidence_bytes(ev.canonical_bytes(d))["claims"][0]["assessment_state"] == state
+
+
+# #14 S1 / A01-A03. The complete 1.0.0 suite above is retained verbatim.
+def document_11():
+    d = document()
+    d["schema_version"] = "1.1.0"
+    return d
+
+
+def platform_data(**changes):
+    return dict(os_family="redhat", os_version="9.10", distribution="oracle-linux",
+                major=9, minor=10, patch=None, architecture="x86_64",
+                platform_status="UNVERIFIED") | changes
+
+
+def tool_data(available=True, tool_id="openssl"):
+    return dict(tool_id=tool_id, lookup_scope="SYSTEM_EXECUTABLE_PATHS", available=available)
+
+
+def metadata_document(kind, data, state="COLLECTED"):
+    d = document_11()
+    scope = "platform-info" if kind == "PLATFORM_INFO" else "tool-" + data.get("tool_id", "openssl")
+    c = collector(d, state=state, scope=scope, producer="pqc-platform", version="1.0.0")
+    observation(d, c, kind, data)
+    return d
+
+
+@pytest.fixture(scope="module")
+def standard_11():
+    js = pytest.importorskip("jsonschema", reason="optional standard schema cross-check")
+    schema = json.loads((ROOT / "schemas/evidence-1.1.0.schema.json").read_bytes())
+    js.Draft202012Validator.check_schema(schema)
+    assert schema == ev.model_schema("1.1.0")
+    return js.Draft202012Validator(schema, format_checker=js.FormatChecker())
+
+
+def test_a01_schema_versions_and_immutable_snapshot():
+    import hashlib
+    assert ev.SCHEMA_VERSION == "1.0.0" and ev.LATEST_SCHEMA_VERSION == "1.1.0"
+    original = (ROOT / "schemas/evidence.schema.json").read_bytes()
+    assert hashlib.sha256(original).hexdigest() == "14ba66e6daca7cdf8fda36927e20de2b96d86745e2bee2ea2d8e1736af099e30"
+    assert (json.dumps(ev.model_schema(), ensure_ascii=False, indent=2) + "\n").encode() == original
+    assert ev.model_schema() == ev.model_schema("1.0.0")
+    new = ev.model_schema("1.1.0")
+    assert new["$id"] == "urn:pqc:evidence:1.1.0"
+    assert (json.dumps(new, ensure_ascii=False, indent=2) + "\n").encode() == (
+        ROOT / "schemas/evidence-1.1.0.schema.json").read_bytes()
+    for version in ("1.0.0", "1.1.0"):
+        def check_refs(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "$ref":
+                        assert item.startswith("#/$defs/")
+                    else:
+                        check_refs(item)
+            elif isinstance(value, list):
+                for item in value:
+                    check_refs(item)
+        check_refs(ev.model_schema(version))
+    new["$defs"]["source"]["required"].clear()
+    assert ev.model_schema("1.1.0")["$defs"]["source"]["required"]
+    assert ev.model_schema() == json.loads(original)
+
+
+@pytest.mark.parametrize("version", ["1.1", "1.0.1", "1.2.0", "1.1.0 ", None, True, 1, [], {}])
+def test_a01_unknown_version(version):
+    with pytest.raises(ev.EvidenceError, match="SCHEMA_VERSION"):
+        ev.model_schema(version)
+    d = document()
+    d["schema_version"] = version
+    rejected(d, "SCHEMA_VERSION")
+    with pytest.raises(ev.EvidenceError, match="SCHEMA_VERSION"):
+        ev.parse_evidence_bytes(json.dumps(d).encode())
+
+
+def test_a01_version_isolation():
+    old = document()
+    observation(old, collector(old), "PLATFORM_INFO", dict(os_family="fixture", os_version="9.9-synthetic"))
+    ev.validate_document(old)
+    old["schema_version"] = "1.1.0"
+    rejected(old)
+    for kind, data in [("PLATFORM_INFO", platform_data()), ("TOOL_AVAILABILITY", tool_data())]:
+        d = metadata_document(kind, data)
+        ev.validate_document(d)
+        d["schema_version"] = "1.0.0"
+        rejected(d)
+    d = installed()
+    d["evidence"][0]["data"]["release"] = None
+    rejected(d, "UNKNOWN_FIELD")
+    d["schema_version"] = "1.1.0"
+    ev.validate_document(d)
+
+
+@pytest.mark.parametrize("field", list(platform_data()))
+def test_a01_platform_required(field):
+    data = platform_data()
+    del data[field]
+    rejected(metadata_document("PLATFORM_INFO", data), "MISSING_FIELD")
+
+
+@pytest.mark.parametrize("field", list(tool_data()))
+def test_a01_tool_required(field):
+    data = tool_data()
+    del data[field]
+    rejected(metadata_document("TOOL_AVAILABILITY", data), "MISSING_FIELD")
+
+
+@pytest.mark.parametrize("kind,data", [
+    ("PLATFORM_INFO", platform_data(raw="DUMMY_SECRET_SENTINEL")),
+    ("TOOL_AVAILABILITY", dict(tool_data(), path="/synthetic/path")),
+    ("TOOL_AVAILABILITY", tool_data(1)),
+    ("TOOL_AVAILABILITY", tool_data("false")),
+    ("TOOL_AVAILABILITY", tool_data(True, "unapproved-tool")),
+    ("TOOL_AVAILABILITY", dict(tool_data(), lookup_scope="PATH")),
+    ("UNKNOWN_KIND", {}), ("PLATFORM_INFO", []),
+])
+def test_a01_closed_new_shapes(kind, data):
+    rejected(metadata_document(kind, data))
+
+
+@pytest.mark.parametrize("changes", [
+    dict(minor=7, os_version="9.7"), dict(minor=8, os_version="9.8"),
+    dict(minor=9, os_version="9.9"), {}, dict(patch=2, os_version="9.10.2"),
+    dict(minor=0, os_version="9.0"), dict(os_family=None),
+    dict(major=8, os_version="8.10", platform_status="OUT_OF_SCOPE"),
+    dict(major=10, os_version="10.10", platform_status="OUT_OF_SCOPE"),
+    dict(distribution="rhel", platform_status="OUT_OF_SCOPE"),
+    dict(distribution="debian", os_family="debian", platform_status="OUT_OF_SCOPE"),
+    dict(distribution=None, platform_status="UNKNOWN"),
+    dict(os_family="debian", platform_status="UNKNOWN"),
+    dict(minor=None, os_version="9", platform_status="UNKNOWN"),
+    dict(major=None, minor=None, os_version=None, platform_status="UNKNOWN"),
+])
+def test_a02_platform_status(changes):
+    d = metadata_document("PLATFORM_INFO", platform_data(**changes))
+    ev.validate_document(d)
+    assert ev.parse_evidence_bytes(ev.canonical_bytes(d)) == d
+    assert not d["claims"] and not d["findings"]
+
+
+@pytest.mark.parametrize("changes", [
+    dict(os_version="09.10"), dict(os_version="9.010"), dict(os_version="9.10.0.1"),
+    dict(os_version="9.10-foo"), dict(os_version="9.10\n"), dict(os_version="9.1"),
+    dict(os_version=None), dict(major=None), dict(minor=None, patch=1),
+    dict(minor=True), dict(minor=10.0), dict(minor=-1), dict(minor=9007199254740992),
+    dict(distribution="OracleLinux"), dict(os_family=""), dict(architecture="x"*65),
+    dict(architecture="/synthetic/path"), dict(platform_status="SUPPORTED"),
+    dict(platform_status="OUT_OF_SCOPE"), dict(distribution="rhel"),
+    dict(os_family="debian"), dict(distribution=None),
+])
+def test_a02_invalid_platform(changes):
+    rejected(metadata_document("PLATFORM_INFO", platform_data(**changes)))
+
+
+@pytest.mark.parametrize("kind,data", [
+    ("PLATFORM_INFO", platform_data(os_family=None, os_version=None, distribution=None,
+                                   major=None, minor=None, patch=None, architecture=None,
+                                   platform_status="UNKNOWN")),
+    ("TOOL_AVAILABILITY", tool_data(None)),
+])
+def test_a02_unknown_observation_not_acquired(kind, data):
+    d = metadata_document(kind, data, "UNKNOWN")
+    ev.validate_document(d)
+    c = d["collections"][0]
+    c["collection_state"] = "COLLECTED"
+    rejected(d, "COLLECTION_EVIDENCE_REQUIRED")
+    c.update(collection_state="PARTIAL", reason_code="INCOMPLETE_SCOPE")
+    rejected(d, "PARTIAL_EVIDENCE_REQUIRED")
+
+
+@pytest.mark.parametrize("tool_id", ["rpm", "openssl", "ssh", "sshd", "ssh-keygen", "update-crypto-policies", "timeout"])
+@pytest.mark.parametrize("available", [True, False])
+def test_a02_tool_known_availability(tool_id, available):
+    d = metadata_document("TOOL_AVAILABILITY", tool_data(available, tool_id))
+    ev.validate_document(d)
+    assert d["evidence"][0]["data"]["available"] is available
+    assert not d["claims"] and not d["findings"]
+
+
+@pytest.mark.parametrize("present,changes,valid", [
+    (True, {}, True), (True, dict(release="0.1", architecture="x86_64"), True),
+    (False, dict(release=None, architecture=None), True), (None, {}, True),
+    (False, dict(release="0.1"), False), (None, dict(architecture="x86_64"), False),
+    (True, dict(release="/synthetic/path"), False), (True, dict(architecture="X86_64"), False),
+    (True, dict(release=1), False), (True, dict(extra="DUMMY_SECRET_SENTINEL"), False),
+])
+def test_a02_package_extension(present, changes, valid):
+    d = document_11()
+    c = collector(d, state="UNKNOWN" if present is None else "COLLECTED")
+    data = dict(name="oraclelinux-release", version="9.9", present=present) | changes
+    e = observation(d, c, "PACKAGE_INVENTORY", data)
+    if valid:
+        if present is not None:
+            claim(d, c, refs=[e["evidence_id"]], state="PASS" if present else "FAIL")
+        ev.validate_document(d)
+        assert ev.parse_evidence_bytes(ev.canonical_bytes(d))["evidence"][0]["data"] == data
+    else:
+        rejected(d)
+
+
+@pytest.mark.parametrize("kind,data", [("PLATFORM_INFO", platform_data()), ("TOOL_AVAILABILITY", tool_data(False))])
+def test_a02_metadata_association(kind, data):
+    d = metadata_document(kind, data)
+    e = d["evidence"][0]
+    e["algorithm"] = algorithm()
+    rejected(d, "METADATA_ASSOCIATION")
+    e["algorithm"] = None
+    a = asset(d, d["collections"][0], "platform", "fixture-platform")
+    e["asset_id"] = a["asset_id"]
+    a["evidence_ids"].append(e["evidence_id"])
+    rejected(d, "METADATA_ASSOCIATION")
+
+
+@pytest.mark.parametrize("kind,data", [("PLATFORM_INFO", platform_data()), ("TOOL_AVAILABILITY", tool_data(True)),
+                                        ("TOOL_AVAILABILITY", tool_data(False))])
+@pytest.mark.parametrize("state", ["PASS", "FAIL"])
+def test_a02_metadata_not_readiness(kind, data, state):
+    d = metadata_document(kind, data)
+    c, e = d["collections"][0], d["evidence"][0]
+    for level in ("L1", "L2", "L3"):
+        cl = claim(d, c, refs=[e["evidence_id"]], level=level, state=state)
+        rejected(d, "CLAIM_EVIDENCE_REQUIRED")
+        d["claims"].clear()
+    finding(d, cl, refs=[e["evidence_id"]], claims=False)
+    rejected(d, "FINDING_EVIDENCE_REQUIRED")
+    for level in ("L4", "L5"):
+        actual = negotiated(level, state)
+        actual["schema_version"] = "1.1.0"
+        c = collector(actual, scope="metadata")
+        e = observation(actual, c, kind, copy.deepcopy(data))
+        actual["claims"][0]["evidence_ids"] = [e["evidence_id"]]
+        rejected(actual, "UNRELATED_ASSET")
+
+
+@pytest.mark.parametrize("field,value,code", [
+    ("observed_at", None, "OBSERVED_AT_REQUIRED"),
+    ("source", source(producer="other-producer"), "EVIDENCE_SOURCE"),
+    ("collection_id", "c-"+"0"*64, "COLLECTION_BACKREF"),
+    ("observation_key", "other-observation", "ID_MISMATCH"),
+])
+def test_a02_new_row_association_errors(field, value, code):
+    d = metadata_document("TOOL_AVAILABILITY", tool_data())
+    d["evidence"][0][field] = value
+    rejected(d, code)
+
+
+def test_a02_11_retains_scope_and_time_semantics():
+    d = metadata_document("PLATFORM_INFO", platform_data())
+    other = host(d, "Host-B.example.invalid")
+    d["evidence"][0]["host_id"] = other
+    rejected(d, "CROSS_HOST")
+    d = metadata_document("PLATFORM_INFO", platform_data())
+    e = summary(d, collector(d, scope="fixture-summary"), count=1)
+    e["data"]["scope"] = "other-scope"
+    rejected(d, "SCOPE_MISMATCH")
+    d = usage_times("PASS", TS, END, "2026-01-01T00:01:00.000000001Z", END)
+    d["schema_version"] = "1.1.0"
+    rejected(d, "USAGE_TIME_ORDER")
+
+
+def test_a01_standard_11_parity(standard, standard_11):
+    for d in (metadata_document("PLATFORM_INFO", platform_data()),
+              metadata_document("TOOL_AVAILABILITY", tool_data()),
+              metadata_document("TOOL_AVAILABILITY", tool_data(None), "UNKNOWN")):
+        ev.validate_document(d)
+        standard_11.validate(d)
+        assert not standard.is_valid(d)
+    for factory in (installed, negotiated, lambda: negotiated("L5")):
+        old = factory()
+        standard.validate(old)
+        assert not standard_11.is_valid(old)
+        new = copy.deepcopy(old)
+        new["schema_version"] = "1.1.0"
+        standard_11.validate(new)
+        ev.validate_document(new)
+    for data in (platform_data(architecture="X86_64"), platform_data(os_version="09.9"),
+                 platform_data(platform_status="SUPPORTED"), platform_data(major=True)):
+        d = metadata_document("PLATFORM_INFO", data)
+        rejected(d)
+        assert not standard_11.is_valid(d)
+    d = metadata_document("PLATFORM_INFO", platform_data())
+    d["evidence"][0]["algorithm"] = algorithm()
+    assert not standard_11.is_valid(d)
+    d = installed(False, "FAIL")
+    d["schema_version"] = "1.1.0"
+    d["evidence"][0]["data"]["release"] = "0.1"
+    assert not standard_11.is_valid(d)
+    rejected(d, "PACKAGE_PRESENCE")
+    d = metadata_document("PLATFORM_INFO", platform_data(os_version="9.1"))
+    standard_11.validate(d)  # semantic consistency is checked by Python
+    rejected(d, "PLATFORM_VERSION")
+
+
+def test_a03_document_examples_and_old_canonical_bytes():
+    import hashlib
+    import re
+    blocks = re.findall(r"```json\n(.*?)\n```", (ROOT / "docs/specifications/evidence-model.md").read_text(encoding="utf-8"), re.S)
+    assert len(blocks) == 3
+    hashes = ("5e4d44a8ab8ba304f17523a1c27c1ecd5e33f783eb91c7ea480aeb3dd4bb5cd2",
+              "687664d30fba2dc9c62082590a0d437ccd3d120a840a28a195a6d855842d2bdc")
+    for block, expected in zip(blocks[:2], hashes):
+        d = ev.parse_evidence_bytes(block.encode())
+        assert d["schema_version"] == "1.0.0"
+        assert hashlib.sha256(ev.canonical_bytes(d)).hexdigest() == expected
+    d = document_11()
+    data = json.loads(blocks[2])
+    for kind, scope in [("PLATFORM_INFO", "platform-info"), ("PACKAGE_INVENTORY", "release-rpm-oraclelinux-release"),
+                        ("TOOL_AVAILABILITY", "tool-openssl")]:
+        c = collector(d, scope=scope, producer="pqc-platform", version="1.0.0")
+        observation(d, c, kind, data[kind])
+    snapshot = copy.deepcopy(d)
+    raw = ev.canonical_bytes(d)
+    assert d == snapshot and ev.canonical_bytes(ev.parse_evidence_bytes(raw)) == raw
+    assert ev.parse_evidence_bytes(raw)["schema_version"] == "1.1.0"
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "1.1.0"])
+def test_a03_offline_roundtrip_and_version_isolation(monkeypatch, version):
+    d = installed()
+    d["schema_version"] = version
+    if version == "1.1.0":
+        d["evidence"][0]["data"].update(release="0.1", architecture="x86_64")
+        c = collector(d, scope="platform-info")
+        observation(d, c, "PLATFORM_INFO", platform_data())
+    snapshot = copy.deepcopy(d)
+    def forbidden(*a, **kw):
+        raise AssertionError("unexpected external I/O")
+    with monkeypatch.context() as m:
+        for module, attr in [(builtins, "open"), (io, "open"), (socket, "socket"),
+                             (socket, "create_connection"), (subprocess, "Popen")]:
+            m.setattr(module, attr, forbidden)
+        assert ev.validate_document(d) is None
+        ev.model_schema(version)
+        raw = ev.canonical_bytes(d)
+        parsed = ev.parse_evidence_bytes(raw)
+        assert parsed["schema_version"] == version
+        assert ev.canonical_bytes(parsed) == raw and d == snapshot
+        assert set(parsed["run"]["expected_host_ids"]) == set(d["run"]["expected_host_ids"])
+        for registry, field in ev.REGISTRIES.items():
+            assert {r[field] for r in parsed[registry]} == {r[field] for r in d[registry]}
+
+
+def test_a02_distinct_release_rpm_observations():
+    import hashlib
+    d = document_11()
+    c = collector(d, scope="release-rpm-oraclelinux-release", producer="pqc-platform", version="1.0.0")
+    for release in ("0.1", "0.2"):
+        data = dict(name="oraclelinux-release", version="9.9", release=release, architecture="x86_64", present=True)
+        components = [data[k] for k in ("name", "version", "release", "architecture")]
+        key = "r-" + hashlib.sha256(json.dumps(components, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        row = observation(d, c, "PACKAGE_INVENTORY", data, key=key)
+        assert row["asset_id"] is None and row["algorithm"] is None
+        assert row["evidence_id"] == ev.evidence_id(RID, c["host_id"], c["collection_id"], key)
+    ev.validate_document(d)
+    assert len(set(c["evidence_ids"])) == 2
+    raw = ev.canonical_bytes(d)
+    d["evidence"].reverse()
+    c["evidence_ids"].reverse()
+    assert ev.canonical_bytes(d) == raw
