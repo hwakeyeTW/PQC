@@ -486,10 +486,34 @@
                     self.root, self.deadline = root, deadline
                     self.entries = self.sources = self.blocks = self.bytes = self.file_bytes = self.projected = 0
                     self.cache, self.target_seen = {}, {}
+                    self.cleanup_failed = False
                     if not trusted(os.fstat(root)) or not stat.S_ISDIR(os.fstat(root).st_mode):
                         fail("UNSAFE_SOURCE")
 
+                def abort_cleanup(self):
+                    # Sticky fatal: descriptor unwinding must not mask cleanup failure.
+                    self.cleanup_failed = True
+                    fail("CLEANUP_FAILED")
+
+                def acquisition_reason(self, exc):
+                    if self.cleanup_failed or reason(exc) == "CLEANUP_FAILED":
+                        self.abort_cleanup()
+                    return reason(exc)
+
+                def parse_block(self, der):
+                    try:
+                        row = parse(der, self.deadline)
+                    except Fault as exc:
+                        if exc.reason == "CLEANUP_FAILED":
+                            self.abort_cleanup()
+                        raise
+                    if row["reason"] == "CLEANUP_FAILED":
+                        self.abort_cleanup()
+                    return row
+
                 def tick(self):
+                    if self.cleanup_failed:
+                        self.abort_cleanup()
                     if time.monotonic() >= self.deadline:
                         fail("TIMEOUT")
 
@@ -594,8 +618,10 @@
                                 der = base64.b64decode(payload, validate=True)
                                 if base64.b64encode(der) != payload:
                                     fail("INVALID_PEM")
-                                row = parse(der, self.deadline)
+                                row = self.parse_block(der)
                             except Fault as exc:
+                                if exc.reason == "CLEANUP_FAILED":
+                                    raise
                                 row = block_error(exc.reason)
                             except ValueError:
                                 row = block_error("INVALID_PEM")
@@ -646,7 +672,7 @@
                                         self.take_block()
                                         try:
                                             certificate_envelope(lambda p, n: self.read_at(fd, p, n), st.st_size)
-                                            row = parse(self.read_at(fd, 0, st.st_size), self.deadline)
+                                            row = self.parse_block(self.read_at(fd, 0, st.st_size))
                                         except Fault as exc:
                                             if exc.reason not in ("INVALID_DER", "LIMIT_REACHED"):
                                                 raise
@@ -671,20 +697,18 @@
                                 src["blocks"].append(block_error("INVALID_PEM"))
                             src["gaps"] = sorted(set(src["gaps"]))
                             if any(b["reason"] == "CLEANUP_FAILED" for b in src["blocks"]):
-                                fail("CLEANUP_FAILED")
+                                self.abort_cleanup()
                             # Cache only complete source traversal (no limit/timeout/invalid
                             # read); no raw bytes, no digest of mixed or private content.
                             if not src["gaps"] and all(b["certificate"] for b in src["blocks"]):
                                 self.cache[key] = dict(format=src["format"], gaps=[], blocks=list(src["blocks"]))
                     except (Fault, OSError) as exc:
-                        why = reason(exc)
+                        why = self.acquisition_reason(exc)
                         # A read error or drift discards the entire source, not a stale winner.
                         # Retain identified-block counts and actual rc, not rejected metadata.
                         old = src["blocks"]
                         src.update(gaps=[why], blocks=[block_error(why, old[i]["rc"] if i < len(old) else None)
                                                        for i in range(self.blocks - before_blocks)])
-                        if why == "CLEANUP_FAILED":
-                            raise
                     return src
 
                 def walk(self, root, resolved, rel, row):
@@ -737,8 +761,8 @@
                                     if stat.S_ISLNK(st.st_mode):
                                         row["gaps"].append("DIRECTORY_LINK")
                             except (Fault, OSError) as exc:
-                                why = reason(exc)
-                                if why in ("SOURCE_CHANGED", "TIMEOUT", "CLEANUP_FAILED"):
+                                why = self.acquisition_reason(exc)
+                                if why in ("SOURCE_CHANGED", "TIMEOUT"):
                                     raise
                                 row["gaps"].append(why)
                         if identity(os.fstat(fd)) != identity(before):
@@ -760,9 +784,7 @@
                                     if target != resolved or identity(st) != identity(after):
                                         fail("SOURCE_CHANGED")
                         except (Fault, OSError) as exc:
-                            why = reason(exc)
-                            if why == "CLEANUP_FAILED":
-                                raise
+                            why = self.acquisition_reason(exc)
                             if why == "SOURCE_CHANGED":
                                 for src in row["sources"]:
                                     src.update(gaps=[why], blocks=[block_error(why, b["rc"]) for b in src["blocks"]])
@@ -783,14 +805,17 @@
                 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
                     signal.signal(sig, interrupt)
                 signal.setitimer(signal.ITIMER_REAL, 25)
+                reader = None
                 try:
                     fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
                     try:
-                        rows = Reader(fd, deadline).collect()
+                        reader = Reader(fd, deadline)
+                        rows = reader.collect()
                     finally:
                         os.close(fd)
                 except (Fault, OSError) as exc:
-                    rows = {k: empty(gap=reason(exc)) for k in ROOTS}
+                    why = "CLEANUP_FAILED" if reader is not None and reader.cleanup_failed else reason(exc)
+                    rows = {k: empty(gap=why) for k in ROOTS}
                 finally:
                     signal.setitimer(signal.ITIMER_REAL, 0)
                 payload = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))

@@ -488,3 +488,145 @@ def test_unknown_and_conflicting_algorithms_not_readiness(observed, rules):
     evaluated = assessment.evaluate_document(merged(d, out), rules)
     assert not evaluated["claims"] and not any(f["assessment_state"] in ("PASS", "FAIL") for f in evaluated["findings"])
     ca.validate_cert_details(evaluated, out["details"], rules)
+
+
+# F-R1-01: exercise the complete fixed helper, including its final projection.
+# Inject a capture failure, never launch a second child after that failure.
+@pytest.mark.parametrize("layout,fail_index,failure_rc,unwind", [
+    ("buffered", 1, 0, None),
+    ("chunked", 1, None, None),
+    ("after-valid", 2, 0, None),
+    ("after-source", 2, 0, None),
+    ("der", 1, 0, None),
+    ("buffered", 1, 0, "READ_ERROR"),
+    ("buffered", 1, 0, "TIMEOUT"),
+    ("der", 1, 0, "READ_ERROR"),
+    ("der", 1, 0, "TIMEOUT"),
+])
+def test_r1_cleanup_failure_stops_all_acquisition(helper, certs, rules, tmp_path,
+                                                  monkeypatch, capsys, layout,
+                                                  fail_index, failure_rc, unwind):
+    import signal
+
+    p = tree(helper, tmp_path)
+    q = loc(helper, p)
+    ca_pem, leaf_pem = certs["ca"][0], certs["leaf"][0]
+    assert len(ca_pem + leaf_pem) < 4096
+    if layout == "der":
+        (q / "b-failure.der").write_bytes(certs["ca"][1])
+    else:
+        payload = ca_pem + leaf_pem
+        if layout == "chunked":
+            payload = ca_pem + b"# padding\n" * 500 + leaf_pem
+            assert len(ca_pem) < 4096 < len(payload)
+        elif layout == "after-valid":
+            payload += ca_pem
+        elif layout == "after-source":
+            (q / "a-prior.pem").write_bytes(ca_pem)
+        (q / "b-failure.pem").write_bytes(payload)
+    (q / "z-later.pem").write_bytes(leaf_pem)
+    for slot in ca.ROOTS[1:]:
+        (loc(helper, p, slot) / "later.pem").write_bytes(leaf_pem)
+
+    state = dict(failed=False, captures=0, parses=0, actual_children=0,
+                 post=[], unwind_injections=0, roots=0)
+    actual_parse, actual_capture = helper["parse"], helper["capture"]
+
+    def observe(operation):
+        if state["failed"]:
+            state["post"].append(operation)
+            pytest.fail("Acquisition after cleanup failure: " + operation)
+
+    def capture(argv, data, deadline):
+        observe("capture")
+        state["captures"] += 1
+        if state["captures"] == fail_index:
+            state["failed"] = True
+            return failure_rc, None, "CLEANUP_FAILED"
+        state["actual_children"] += 1
+        result = actual_capture(argv, data, deadline)
+        assert result[0] == 0 and result[2] is None
+        return result
+
+    def parse(data, deadline):
+        observe("parse")
+        state["parses"] += 1
+        row = actual_parse(data, deadline)
+        if not state["failed"]:
+            assert row["reason"] == "OK" and row["certificate"]
+        return row
+
+    class ObservedOS:
+        # Redirect only the fixed helper's root open; all other operations use
+        # the real FD implementation against synthetic files. Close is cleanup,
+        # not acquisition, and may fail while the fatal exception unwinds.
+        def __getattr__(self, name):
+            original = getattr(os, name)
+            if name == "close":
+                def close(fd):
+                    original(fd)
+                    if state["failed"] and unwind:
+                        state["unwind_injections"] += 1
+                        if unwind == "TIMEOUT":
+                            helper["fail"]("TIMEOUT")
+                        raise OSError(5, "synthetic close failure")
+                return close
+            if name not in ("open", "pread", "read", "stat", "fstat", "scandir",
+                            "readlink", "dup", "listdir"):
+                return original
+            def guarded(*args, **kwargs):
+                observe("os." + name)
+                if name == "open" and args[0] == "/" and "dir_fd" not in kwargs:
+                    state["roots"] += 1
+                    args = (str(p), *args[1:])
+                return original(*args, **kwargs)
+            return guarded
+
+    monkeypatch.setitem(helper, "capture", capture)
+    monkeypatch.setitem(helper, "parse", parse)
+    monkeypatch.setitem(helper, "os", ObservedOS())
+    cls = helper["Reader"]
+    for method in ("tick", "take_block", "read_at", "pin", "read_source", "walk"):
+        def guard(original, name):
+            def checked(self, *args, **kwargs):
+                observe("Reader." + name)
+                return original(self, *args, **kwargs)
+            return checked
+        monkeypatch.setattr(cls, method, guard(getattr(cls, method), method))
+    original_lines = cls.lines
+    def lines(self, *args):
+        stream = original_lines(self, *args)
+        while True:
+            observe("Reader.lines.next")
+            try:
+                line = next(stream)
+            except StopIteration:
+                return
+            yield line
+    monkeypatch.setattr(cls, "lines", lines)
+
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+    try:
+        helper["main"]()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    snap = json.loads(captured.out)
+    assert state["failed"] and state["roots"] == 1
+    assert state["captures"] == state["parses"] == fail_index
+    assert state["actual_children"] == fail_index - 1 and state["post"] == []
+    assert bool(state["unwind_injections"]) == bool(unwind)
+    assert snap == {slot: helper["empty"](gap="CLEANUP_FAILED") for slot in ca.ROOTS}
+    ca.validate_snapshot(snap)
+    d = doc()
+    result = build(d, snap, rules)
+    assert not result["assets"] and not result["evidence"]
+    assert len(result["collections"]) == 3
+    assert all(c["collection_state"] == "ERROR" for c in result["collections"])
+    assert result["details"]["snapshot"] == snap and not result["details"]["occurrences"]
+    ev.validate_document(merged(d, result))
+    ca.validate_cert_details(merged(d, result), result["details"], rules)
