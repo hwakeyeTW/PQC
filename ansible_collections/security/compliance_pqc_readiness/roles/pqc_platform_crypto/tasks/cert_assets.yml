@@ -1,0 +1,861 @@
+---
+# Internal tasks_from: cert_assets only. A trusted future dispatcher owns
+# authorization, native connection context, time and storage. No live entry.
+- name: Acquire bounded system certificate assets
+  become: false
+  no_log: true
+  vars:
+    cert_scopes: [system-tls-certs, system-ca-anchors, system-ssl-certs]
+    decision: "{{ pqc_profile_decision | default({}) }}"
+    requested: "{{ (decision.requested_flags | default({})).system_certs | default(none) }}"
+    flag_rows: "{{ decision.per_collector | default([]) | selectattr('id', 'equalto', 'system_certs') | list }}"
+    flag_reason: "{{ (flag_rows | first | default({})).reason_code | default('NOT_ATTEMPTED') }}"
+    platform_projection: "{{ pqc_platform_snapshot | default({}) }}"
+    facts: "{{ platform_projection.facts | default({}) }}"
+    tools: "{{ platform_projection.tools | default({}) }}"
+    openssl_slots: "{{ tools.openssl | default([]) }}"
+    timeout_slots: "{{ tools.timeout | default([]) }}"
+    openssl_slot: "{{ openssl_slots | first | default({}) }}"
+    timeout_slot: "{{ timeout_slots | first | default({}) }}"
+    tools_ready: >-
+      {{ openssl_slots | length == 1 and timeout_slots | length == 1
+         and openssl_slot.state | default('UNKNOWN') == 'OK'
+         and openssl_slot.exists | default(none) is sameas true and openssl_slot.isreg | default(none) is sameas true
+         and openssl_slot.islnk | default(none) is sameas false and openssl_slot.executable | default(none) is sameas true
+         and timeout_slot.state | default('UNKNOWN') == 'OK'
+         and timeout_slot.exists | default(none) is sameas true and timeout_slot.isreg | default(none) is sameas true
+         and timeout_slot.islnk | default(none) is sameas false and timeout_slot.executable | default(none) is sameas true }}
+    eligible: >-
+      {{ platform_projection.facts_state | default('UNKNOWN') == 'OK'
+         and facts.distribution | default(none) is string and facts.distribution | lower in ['oraclelinux', 'oracle linux', 'oracle-linux']
+         and (facts.os_family | default(none) is none or (facts.os_family is string and facts.os_family | lower == 'redhat'))
+         and facts.distribution_version | default(none) is string
+         and facts.distribution_version is regex('9[.](?:0|[1-9][0-9]{0,15})(?:[.](?:0|[1-9][0-9]{0,15}))?', match_type='fullmatch')
+         and facts.distribution_version.split('.')[1] | int <= 9007199254740991
+         and facts.distribution_version.split('.')[-1] | int <= 9007199254740991
+         and (facts.distribution_major_version | default(none) is none or
+              (facts.distribution_major_version is string and facts.distribution_major_version == '9') or
+              (facts.distribution_major_version is integer and facts.distribution_major_version == 9)) }}
+    outside: >-
+      {{ platform_projection.facts_state | default('UNKNOWN') == 'OK'
+         and facts.distribution | default(none) is string
+         and (facts.distribution | lower in ['redhat', 'red hat enterprise linux', 'rhel', 'rocky', 'rocky linux', 'almalinux', 'alma linux', 'centos', 'centos stream', 'fedora', 'debian', 'ubuntu', 'sles', 'suse', 'opensuse']
+              or (facts.distribution | lower in ['oraclelinux', 'oracle linux', 'oracle-linux']
+                  and (facts.os_family | default(none) is none or (facts.os_family is string and facts.os_family | lower == 'redhat'))
+                  and facts.distribution_version | default(none) is string
+                  and facts.distribution_version is regex('(?:0|[1-9][0-9]{0,15})(?:[.](?:0|[1-9][0-9]{0,15})){0,2}', match_type='fullmatch')
+                  and facts.distribution_version.split('.')[0] | int != 9
+                  and facts.distribution_version.split('.') | map('int') | max <= 9007199254740991
+                  and (facts.distribution_major_version | default(none) is none or
+                       (facts.distribution_major_version is string and facts.distribution_major_version == facts.distribution_version.split('.')[0]) or
+                       (facts.distribution_major_version is integer and facts.distribution_major_version == facts.distribution_version.split('.')[0] | int)))) }}
+    gate: "{{ decision.decision | default('DENIED') == 'VALIDATED' and requested is sameas true and eligible and tools_ready }}"
+    skip_reason: >-
+      {{ (flag_reason if flag_reason in ['DISABLED_BY_USER', 'DISABLED_BY_PROFILE'] else 'NOT_ATTEMPTED') if requested is sameas false
+         else 'PROFILE_NOT_VALIDATED' if decision.decision | default('DENIED') != 'VALIDATED' or requested is not sameas true
+         else 'PLATFORM_OUT_OF_SCOPE' if outside else 'PLATFORM_UNKNOWN' if not eligible
+         else 'TOOL_UNAVAILABLE' if not tools_ready else 'NOT_ATTEMPTED' }}
+    skipped_root: "{{ dict(attempted=false, rc=none, entries=0, directories=0, skipped=0, root_target_id=none, gaps=[skip_reason], sources=[]) }}"
+    python_stat: "{{ pqc_cert_assets_python_stat.stat | default({}) }}"
+  block:
+    - name: Initialize independent scopes before any acquisition
+      ansible.builtin.set_fact:
+        pqc_cert_assets_snapshot: "{{ dict(cert_scopes | zip([skipped_root] * 3)) }}"
+        pqc_cert_assets_python_available: false
+        cacheable: false
+
+    - name: Confirm the fixed trusted system interpreter
+      ansible.builtin.stat:
+        path: /usr/bin/python3
+        follow: true
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: pqc_cert_assets_python_stat
+      failed_when: false
+      when: gate
+
+    - name: Project the interpreter positive check only
+      ansible.builtin.set_fact:
+        pqc_cert_assets_python_available: >-
+          {{ python_stat.exists | default(none) is sameas true and python_stat.isreg | default(none) is sameas true
+             and python_stat.executable | default(none) is sameas true and python_stat.uid | default(-1) == 0
+             and python_stat.mode | default('') is regex('[0-7][0-7][0145][0145]', match_type='fullmatch') }}
+        cacheable: false
+      when: gate
+
+    - name: Record a missing or untrusted system interpreter
+      ansible.builtin.set_fact:
+        pqc_cert_assets_snapshot: "{{ dict(cert_scopes | zip([dict(attempted=false, rc=none, entries=0, directories=0, skipped=0, root_target_id=none, gaps=['TOOL_UNAVAILABLE'], sources=[])] * 3)) }}"
+        cacheable: false
+      when: gate and not pqc_cert_assets_python_available
+
+    - name: Read only fixed certificate roots and parse public certificate envelopes
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/timeout
+          - --signal=TERM
+          - --kill-after=2s
+          - 27s
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            # Fixed internal Linux helper; no caller paths, commands or environment.
+            import base64
+            import ctypes
+            import hashlib
+            import json
+            import os
+            import posixpath as path
+            import re
+            import selectors
+            import signal
+            import stat
+            import subprocess
+            import time
+            from contextlib import contextmanager
+            from datetime import datetime
+
+            ROOTS = {"system-tls-certs": "/etc/pki/tls/certs",
+                     "system-ca-anchors": "/etc/pki/ca-trust/source/anchors",
+                     "system-ssl-certs": "/etc/ssl/certs"}
+            BUNDLES = {"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                       "/etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt"}
+            MAX_ENTRIES, MAX_SOURCES, MAX_BLOCKS = 512, 128, 256
+            MAX_FILE, MAX_INPUT, MAX_DER = 1048576, 8388608, 65536
+            MAX_OUTPUT, MAX_PROJECTION = 16384, 262144
+            NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}\Z")
+            TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+@-]{0,127}\Z")
+            CERT_FIELDS = ("fingerprint", "public_key_algorithm", "public_key_bits", "signature_inner",
+                           "signature_outer", "issuer", "subject", "not_before", "not_after", "gaps")
+            BEGIN, END = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+
+
+            class Fault(Exception):
+                def __init__(self, reason):
+                    self.reason = reason
+                    super().__init__(reason)
+
+
+            def fail(reason):
+                raise Fault(reason)
+
+
+            def reason(exc):
+                if isinstance(exc, Fault):
+                    return exc.reason
+                if isinstance(exc, PermissionError):
+                    return "PERMISSION_DENIED"
+                if isinstance(exc, FileNotFoundError):
+                    return "SOURCE_ABSENT"
+                return "UNSAFE_SOURCE" if isinstance(exc, OSError) and exc.errno in (20, 40) else "READ_ERROR"
+
+
+            def trusted(st):
+                return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+            def identity(st):
+                return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size,
+                        st.st_mtime_ns, st.st_ctime_ns, st.st_nlink)
+
+
+            def safe_name(name):
+                return (bool(NAME.fullmatch(name)) and ".key." not in name.lower()
+                        and name.lower() not in ("private", "private-keys", "private_keys", "privatekey", "private_key", "keys", "key", "secrets"))
+
+
+            def candidate(name):
+                return name.lower().endswith((".pem", ".crt", ".cer", ".der"))
+
+
+            def allowed_file(p):
+                if p in BUNDLES:
+                    return True
+                for root in ROOTS.values():
+                    if p.startswith(root + "/"):
+                        parts = p[len(root) + 1:].split("/")
+                        if 1 <= len(parts) <= 4 and all(safe_name(x) for x in parts) and candidate(parts[-1]):
+                            return True
+                return False
+
+
+            def source_id(p):
+                return "src-" + hashlib.sha256(p.encode("ascii")).hexdigest()
+
+
+            def target_path(p, target):
+                if not target.isascii() or not 0 < len(target) <= 512:
+                    fail("UNSAFE_SOURCE")
+                parts = target.split("/")
+                if target.startswith("/"):
+                    parts = parts[1:]
+                else:
+                    while parts and parts[0] == "..":
+                        parts.pop(0)
+                # Do not collapse arbitrary intermediate symlink/.. pairs.
+                if not parts or any(not safe_name(x) for x in parts):
+                    fail("UNSAFE_SOURCE")
+                return path.normpath(path.join(path.dirname(p), target))
+
+
+            def empty(attempted=True, gap=None, rc=0):
+                return dict(attempted=attempted, rc=rc, entries=0, directories=0, skipped=0, root_target_id=None,
+                            gaps=[gap] if gap else [], sources=[])
+
+
+            def block_error(reason, rc=None):
+                return dict(rc=rc, reason=reason, certificate=None)
+
+
+            def tlv(read, offset, end):
+                # Only definite, minimally encoded, low-tag-length framing. Never decode
+                # private key values. OpenSSL owns actual X.509/ASN.1 semantic parsing.
+                if offset + 2 > end:
+                    fail("INVALID_DER")
+                head = read(offset, 2)
+                if len(head) != 2 or head[0] & 31 == 31:
+                    fail("INVALID_DER")
+                tag, size = head
+                start = offset + 2
+                if size & 128:
+                    n = size & 127
+                    if not 1 <= n <= 3 or start + n > end:
+                        fail("INVALID_DER")
+                    raw = read(start, n)
+                    size = int.from_bytes(raw, "big")
+                    if len(raw) != n or raw[0] == 0 or size < 128:
+                        fail("INVALID_DER")
+                    start += n
+                if start + size > end:
+                    fail("INVALID_DER")
+                return tag, start, start + size
+
+
+            def expect(read, offset, end, tag):
+                t, a, b = tlv(read, offset, end)
+                if t != tag:
+                    fail("INVALID_DER")
+                return a, b
+
+
+            def algorithm_envelope(read, start, end):
+                a, b = expect(read, start, end, 6)
+                if a == b:
+                    fail("INVALID_DER")
+                if b < end:
+                    _, _, b = tlv(read, b, end)
+                if b != end:
+                    fail("INVALID_DER")
+
+
+            def certificate_envelope(read, size):
+                if not 0 < size <= MAX_DER:
+                    fail("LIMIT_REACHED")
+                a, end = expect(read, 0, size, 48)
+                if end != size:
+                    fail("INVALID_DER")
+                tbs, tbs_end = expect(read, a, end, 48)
+                alg, alg_end = expect(read, tbs_end, end, 48)
+                algorithm_envelope(read, alg, alg_end)
+                bit, bit_end = expect(read, alg_end, end, 3)
+                if bit_end != end or bit_end - bit < 2:
+                    fail("INVALID_DER")
+                if tbs >= tbs_end:
+                    fail("INVALID_DER")
+                if read(tbs, 1) == b"\xa0":
+                    v, tbs = expect(read, tbs, tbs_end, 160)
+                    _, v_end = expect(read, v, tbs, 2)
+                    if v_end != tbs:
+                        fail("INVALID_DER")
+                serial, pos = expect(read, tbs, tbs_end, 2)
+                if serial == pos:
+                    fail("INVALID_DER")
+                inner, pos = expect(read, pos, tbs_end, 48)
+                algorithm_envelope(read, inner, pos)
+                for _ in range(3):  # issuer, validity, subject
+                    _, pos = expect(read, pos, tbs_end, 48)
+                spki, pos = expect(read, pos, tbs_end, 48)
+                a, b = expect(read, spki, pos, 48)
+                algorithm_envelope(read, a, b)
+                a, b = expect(read, b, pos, 3)
+                if b != pos or b - a < 2:
+                    fail("INVALID_DER")
+                previous = 0
+                while pos < tbs_end:
+                    tag, _, pos = tlv(read, pos, tbs_end)
+                    if tag not in (129, 130, 163) or tag <= previous:
+                        fail("INVALID_DER")
+                    previous = tag
+
+
+            def reap(proc, terminate):
+                deadline = time.monotonic() + 1.0
+                residual = False
+                while True:
+                    rc = proc.poll()
+                    if rc is not None:
+                        while time.monotonic() < deadline:
+                            try:
+                                pid, _ = os.waitpid(-proc.pid, os.WNOHANG)
+                            except ChildProcessError:
+                                break
+                            if not pid:
+                                break
+                    try:
+                        os.killpg(proc.pid, 0)
+                    except ProcessLookupError:
+                        return rc is not None and not residual
+                    if rc is not None:
+                        residual = True
+                    if terminate or residual:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.01)
+
+
+            def capture(argv, data, deadline):
+                # Private test seam; production parse() always selects fixed x509 argv.
+                # Bounded simultaneous stdin/stdout/stderr, direct and same-group cleanup.
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.prctl(36, 1, 0, 0, 0) != 0:
+                    return None, None, "CLEANUP_FAILED"
+                parent = os.getpid()
+                blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGALRM}
+                mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+                proc, error, clean = None, None, False
+                buffers = [bytearray(), bytearray()]
+                sent = 0
+                def child_setup():
+                    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+                        os._exit(126)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                try:
+                    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True, preexec_fn=child_setup, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                        "LANG": "C", "OPENSSL_CONF": "/dev/null", "HOME": "/nonexistent"})
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                    with selectors.DefaultSelector() as sel:
+                        for i, pipe in enumerate((proc.stdout, proc.stderr)):
+                            os.set_blocking(pipe.fileno(), False)
+                            sel.register(pipe, selectors.EVENT_READ, i)
+                        os.set_blocking(proc.stdin.fileno(), False)
+                        if data:
+                            sel.register(proc.stdin, selectors.EVENT_WRITE, 2)
+                        else:
+                            proc.stdin.close()
+                        while sel.get_map():
+                            left = deadline - time.monotonic()
+                            if left <= 0:
+                                fail("TIMEOUT")
+                            for key, _ in sel.select(left):
+                                if key.data == 2:
+                                    try:
+                                        sent += os.write(key.fd, data[sent:sent + 4096])
+                                    except BrokenPipeError:
+                                        fail("COMMAND_FAILED")
+                                    except BlockingIOError:
+                                        continue
+                                    if sent == len(data):
+                                        sel.unregister(key.fileobj)
+                                        proc.stdin.close()
+                                else:
+                                    room = MAX_OUTPUT - sum(map(len, buffers))
+                                    try:
+                                        chunk = os.read(key.fd, min(4096, room + 1))
+                                    except BlockingIOError:
+                                        continue
+                                    if len(chunk) > room:
+                                        fail("OUTPUT_LIMIT")
+                                    if chunk:
+                                        buffers[key.data].extend(chunk)
+                                    else:
+                                        sel.unregister(key.fileobj)
+                        try:
+                            proc.wait(timeout=max(0, deadline - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            fail("TIMEOUT")
+                except Fault as exc:
+                    error = exc.reason
+                except FileNotFoundError:
+                    error = "TOOL_UNAVAILABLE"
+                except PermissionError:
+                    error = "PERMISSION_DENIED"
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    error = "COMMAND_FAILED"
+                finally:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+                    try:
+                        if proc is not None:
+                            clean = reap(proc, error is not None)
+                            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                                pipe.close()
+                    finally:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                rc = proc.returncode if proc is not None else None
+                if proc is not None and not clean:
+                    return rc, None, "CLEANUP_FAILED"
+                if error or rc != 0 or sent != len(data):
+                    return rc, None, ("AMBIGUOUS_OUTPUT" if rc == 0 and error not in ("TIMEOUT", "OUTPUT_LIMIT") else error or "COMMAND_FAILED")
+                if buffers[1]:
+                    return rc, None, "AMBIGUOUS_OUTPUT"
+                return rc, bytes(buffers[0]), None
+
+
+            def safe_dn(value):
+                return (0 < len(value) <= 512 and value.isascii() and all(32 <= ord(c) < 127 for c in value)
+                        and not any(s in value.upper() for s in ("{" * 2, "{" + "%", "{" + "#", "-----BEGIN", "PRIVATE KEY"))
+                        and re.search(r"\\(?:0[0-9a-fA-F]|1[0-9a-fA-F]|7[fF])", value) is None)
+
+
+            def metadata_gaps(cert):
+                gaps = [k.upper() + "_UNKNOWN" for k in CERT_FIELDS[1:-1] if cert[k] is None]
+                if cert["signature_inner"] is not None and cert["signature_outer"] is not None:
+                    if cert["signature_inner"] != cert["signature_outer"]:
+                        gaps.append("SIGNATURE_CONFLICT")
+                if cert["not_before"] and cert["not_after"] and cert["not_before"] > cert["not_after"]:
+                    gaps.append("VALIDITY_CONFLICT")
+                return sorted(gaps)
+
+
+            def parse(der, deadline):
+                try:
+                    certificate_envelope(lambda p, n: der[p:p + n], len(der))
+                except Fault as exc:
+                    return block_error(exc.reason)
+                argv = ["/usr/bin/openssl", "x509", "-inform", "DER", "-noout", "-sha256", "-fingerprint",
+                        "-subject", "-issuer", "-dates", "-nameopt", "RFC2253", "-text"]
+                rc, raw, error = capture(argv, der, min(deadline, time.monotonic() + 3.5))
+                if error:
+                    return block_error(error, rc)
+                try:
+                    text = raw.decode("ascii")
+                except UnicodeError:
+                    return block_error("AMBIGUOUS_OUTPUT", rc)
+                summary, sep, body = text.partition("\nCertificate:\n")
+                if not sep or not body.startswith("    Data:\n"):
+                    return block_error("AMBIGUOUS_OUTPUT", rc)
+                prefix, sep, spki = body.partition("        Subject Public Key Info:\n")
+                if not sep:
+                    return block_error("AMBIGUOUS_OUTPUT", rc)
+                def unique(pattern, segment=summary):
+                    matches = re.findall(pattern, segment, re.MULTILINE)
+                    return matches[0] if len(matches) == 1 else None
+                fingerprint = unique(r"^(?:SHA256|sha256) Fingerprint=([0-9A-F]{2}(?::[0-9A-F]{2}){31})$")
+                if fingerprint is None:
+                    return block_error("AMBIGUOUS_OUTPUT", rc)
+                fp = fingerprint.replace(":", "").lower()
+                if fp != hashlib.sha256(der).hexdigest():
+                    return block_error("FINGERPRINT_MISMATCH", rc)
+                def token(pattern, segment):
+                    value = unique(pattern, segment)
+                    return value if value and TOKEN.fullmatch(value) else None
+                def dn(label):
+                    value = unique(r"^" + label + r"=([^\r\n]*)$")
+                    return value if value and safe_dn(value) else None
+                def stamp(label):
+                    value = unique(r"^" + label + r"=([A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4} GMT)$")
+                    try:
+                        if value:
+                            dt = datetime.strptime(value, "%b %d %H:%M:%S %Y GMT")
+                            return dt.isoformat(timespec="seconds") + "Z"
+                        return None
+                    except ValueError:
+                        return None
+                key_header = "\n".join(spki.split("\n", 2)[:2])
+                bits = unique(r"^ {16}Public-Key: \(([1-9][0-9]{0,6}) bit\)$", key_header)
+                bits = int(bits) if bits and int(bits) <= 1048576 else None
+                cert = dict(fingerprint=fp, public_key_algorithm=token(r"^ {12}Public Key Algorithm: ([^\r\n]+)$", key_header),
+                            public_key_bits=bits, signature_inner=token(r"^ {8}Signature Algorithm: ([^\r\n]+)$", prefix),
+                            signature_outer=token(r"^ {4}Signature Algorithm: ([^\r\n]+)$", spki),
+                            issuer=dn("issuer"), subject=dn("subject"), not_before=stamp("notBefore"), not_after=stamp("notAfter"))
+                cert["gaps"] = metadata_gaps(cert)
+                return dict(rc=0, reason="METADATA_GAP" if cert["gaps"] else "OK", certificate=cert)
+
+
+            class Reader:
+                # Tests may supply an already opened private synthetic root FD. main()
+                # always opens '/' itself; no root/path/command arguments or fallback.
+                def __init__(self, root, deadline):
+                    self.root, self.deadline = root, deadline
+                    self.entries = self.sources = self.blocks = self.bytes = self.file_bytes = self.projected = 0
+                    self.cache, self.target_seen = {}, {}
+                    self.cleanup_failed = False
+                    if not trusted(os.fstat(root)) or not stat.S_ISDIR(os.fstat(root).st_mode):
+                        fail("UNSAFE_SOURCE")
+
+                def abort_cleanup(self):
+                    # Sticky fatal: descriptor unwinding must not mask cleanup failure.
+                    self.cleanup_failed = True
+                    fail("CLEANUP_FAILED")
+
+                def acquisition_reason(self, exc):
+                    if self.cleanup_failed or reason(exc) == "CLEANUP_FAILED":
+                        self.abort_cleanup()
+                    return reason(exc)
+
+                def parse_block(self, der):
+                    try:
+                        row = parse(der, self.deadline)
+                    except Fault as exc:
+                        if exc.reason == "CLEANUP_FAILED":
+                            self.abort_cleanup()
+                        raise
+                    if row["reason"] == "CLEANUP_FAILED":
+                        self.abort_cleanup()
+                    return row
+
+                def tick(self):
+                    if self.cleanup_failed:
+                        self.abort_cleanup()
+                    if time.monotonic() >= self.deadline:
+                        fail("TIMEOUT")
+
+                @contextmanager
+                def directory(self, p, listing=False):
+                    parts = p.strip("/").split("/") if p != "/" else []
+                    if len(parts) > 12 or any(not safe_name(x) for x in parts):
+                        fail("UNSAFE_SOURCE")
+                    fd = os.dup(self.root)
+                    try:
+                        for i, part in enumerate(parts):
+                            self.tick()
+                            flags = os.O_RDONLY if listing and i == len(parts) - 1 else os.O_PATH
+                            new = os.open(part, flags | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                            os.close(fd)
+                            fd = new
+                            if not trusted(os.fstat(fd)):
+                                fail("UNSAFE_SOURCE")
+                        yield fd
+                    finally:
+                        os.close(fd)
+
+                @contextmanager
+                def pin(self, p, root=False):
+                    seen = set()
+                    for _ in range(5):
+                        self.tick()
+                        if p in seen or (p not in ROOTS.values() if root else not allowed_file(p)):
+                            fail("UNSAFE_SOURCE")
+                        seen.add(p)
+                        with self.directory(path.dirname(p)) as fd:
+                            entry = os.open(path.basename(p), os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                        try:
+                            st = os.fstat(entry)
+                            if stat.S_ISLNK(st.st_mode):
+                                if st.st_uid != 0:
+                                    fail("UNSAFE_SOURCE")
+                                p = target_path(p, os.readlink("", dir_fd=entry))
+                                continue
+                            if not trusted(st) or (not stat.S_ISDIR(st.st_mode) if root else not stat.S_ISREG(st.st_mode) or st.st_nlink != 1):
+                                fail("UNSAFE_SOURCE")
+                            yield entry, st, p
+                            return
+                        finally:
+                            os.close(entry)
+                    fail("UNSAFE_SOURCE")
+
+                def read_at(self, fd, offset, size):
+                    self.tick()
+                    if size > MAX_INPUT - self.bytes or size > MAX_FILE - self.file_bytes:
+                        fail("LIMIT_REACHED")
+                    data = os.pread(fd, size, offset)
+                    self.bytes += len(data)
+                    self.file_bytes += len(data)
+                    if len(data) != size:
+                        fail("SOURCE_CHANGED")
+                    return data
+
+                def lines(self, fd, size):
+                    buf = b""
+                    for off in range(0, size, 4096):
+                        buf += self.read_at(fd, off, min(4096, size - off))
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            if len(line) > 8192:
+                                fail("UNKNOWN_FORMAT")
+                            yield line.removesuffix(b"\r")
+                        if len(buf) > 8192:
+                            fail("UNKNOWN_FORMAT")
+                    if buf:
+                        yield buf
+
+                def take_block(self):
+                    if self.blocks >= MAX_BLOCKS:
+                        fail("LIMIT_REACHED")
+                    self.blocks += 1
+
+                def pem(self, fd, size, src):
+                    payload = None
+                    invalid = None
+                    for line in self.lines(fd, size):
+                        self.tick()
+                        if line == BEGIN:
+                            if payload is not None:
+                                src["blocks"].append(block_error("INVALID_PEM"))
+                            payload = None
+                            self.take_block()
+                            payload, invalid = bytearray(), None
+                        elif line.startswith(b"-----BEGIN") or (line.startswith(b"-----END") and line != END):
+                            if payload is not None:
+                                src["blocks"].append(block_error("INVALID_PEM"))
+                                payload = None
+                            src["gaps"].append("UNSUPPORTED_TRUSTED_CERTIFICATE" if line == b"-----BEGIN TRUSTED CERTIFICATE-----" else "NON_PUBLIC_BLOCK")
+                            break  # Never decode or hash a non-certificate body.
+                        elif line == END:
+                            if payload is None:
+                                src["gaps"].append("INVALID_PEM")
+                                continue
+                            try:
+                                if invalid or not payload:
+                                    fail(invalid or "INVALID_PEM")
+                                der = base64.b64decode(payload, validate=True)
+                                if base64.b64encode(der) != payload:
+                                    fail("INVALID_PEM")
+                                row = self.parse_block(der)
+                            except Fault as exc:
+                                if exc.reason == "CLEANUP_FAILED":
+                                    raise
+                                row = block_error(exc.reason)
+                            except ValueError:
+                                row = block_error("INVALID_PEM")
+                            src["blocks"].append(row)
+                            payload = None
+                        elif payload is not None:
+                            if len(payload) + len(line) > 4 * ((MAX_DER + 2) // 3):
+                                invalid = "LIMIT_REACHED"
+                            elif not re.fullmatch(rb"[A-Za-z0-9+/=]+", line) and invalid is None:
+                                invalid = "INVALID_PEM"
+                            if not invalid:
+                                payload.extend(line)
+                        elif line.strip() and not line.startswith(b"#"):
+                            src["gaps"].append("UNKNOWN_FORMAT")
+                            break
+                    if payload is not None:
+                        src["blocks"].append(block_error("INVALID_PEM"))
+                    if not src["blocks"] and not src["gaps"]:
+                        src["gaps"].append("UNKNOWN_FORMAT")
+
+                def read_source(self, p, original):
+                    src = dict(source_id=source_id(original), target_id=None, format="UNKNOWN", gaps=[], blocks=[])
+                    self.file_bytes = 0
+                    before_blocks = self.blocks
+                    try:
+                        with self.pin(p) as (pin, st, target):
+                            src["target_id"] = source_id(target)
+                            if st.st_size > MAX_FILE or st.st_size > MAX_INPUT - self.bytes:
+                                fail("LIMIT_REACHED")
+                            key = (target, identity(st))
+                            if target in self.target_seen and self.target_seen[target] != key[1]:
+                                fail("SOURCE_CHANGED")
+                            self.target_seen[target] = key[1]
+                            # Cache only normalized public metadata. Count every occurrence.
+                            if key in self.cache:
+                                cached = self.cache[key]
+                                if self.blocks + len(cached["blocks"]) > MAX_BLOCKS:
+                                    fail("LIMIT_REACHED")
+                                self.blocks += len(cached["blocks"])
+                                src.update(format=cached["format"], gaps=list(cached["gaps"]), blocks=list(cached["blocks"]))
+                            else:
+                                fd = os.open("/proc/self/fd/" + str(pin), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                                try:
+                                    if identity(os.fstat(fd)) != identity(st):
+                                        fail("SOURCE_CHANGED")
+                                    if st.st_size and self.read_at(fd, 0, 1) == b"\x30":
+                                        src["format"] = "DER"
+                                        self.take_block()
+                                        try:
+                                            certificate_envelope(lambda p, n: self.read_at(fd, p, n), st.st_size)
+                                            row = self.parse_block(self.read_at(fd, 0, st.st_size))
+                                        except Fault as exc:
+                                            if exc.reason not in ("INVALID_DER", "LIMIT_REACHED"):
+                                                raise
+                                            row = block_error(exc.reason)
+                                        src["blocks"].append(row)
+                                    else:
+                                        src["format"] = "PEM"
+                                        try:
+                                            self.pem(fd, st.st_size, src)
+                                        except Fault as exc:
+                                            if exc.reason not in ("LIMIT_REACHED", "UNKNOWN_FORMAT"):
+                                                raise
+                                            src["gaps"].append(exc.reason)
+                                    if identity(os.fstat(fd)) != identity(st):
+                                        fail("SOURCE_CHANGED")
+                                finally:
+                                    os.close(fd)
+                            with self.pin(p) as (_, after, target_after):
+                                if target_after != target or identity(after) != identity(st):
+                                    fail("SOURCE_CHANGED")
+                            while len(src["blocks"]) < self.blocks - before_blocks:
+                                src["blocks"].append(block_error("INVALID_PEM"))
+                            src["gaps"] = sorted(set(src["gaps"]))
+                            if any(b["reason"] == "CLEANUP_FAILED" for b in src["blocks"]):
+                                self.abort_cleanup()
+                            # Cache only complete source traversal (no limit/timeout/invalid
+                            # read); no raw bytes, no digest of mixed or private content.
+                            if not src["gaps"] and all(b["certificate"] for b in src["blocks"]):
+                                self.cache[key] = dict(format=src["format"], gaps=[], blocks=list(src["blocks"]))
+                    except (Fault, OSError) as exc:
+                        why = self.acquisition_reason(exc)
+                        # A read error or drift discards the entire source, not a stale winner.
+                        # Retain identified-block counts and actual rc, not rejected metadata.
+                        old = src["blocks"]
+                        src.update(gaps=[why], blocks=[block_error(why, old[i]["rc"] if i < len(old) else None)
+                                                       for i in range(self.blocks - before_blocks)])
+                    return src
+
+                def walk(self, root, resolved, rel, row):
+                    p = path.join(resolved, *rel)
+                    with self.directory(p, listing=True) as fd:
+                        before = os.fstat(fd)
+                        names = []
+                        if self.entries >= MAX_ENTRIES:
+                            row["gaps"].append("LIMIT_REACHED")
+                            return
+                        with os.scandir(fd) as scan:
+                            for entry in scan:
+                                self.tick()
+                                self.entries += 1
+                                row["entries"] += 1
+                                names.append(entry.name)
+                                if self.entries == MAX_ENTRIES:
+                                    row["gaps"].append("LIMIT_REACHED")
+                                    break
+                        for name in sorted(names):
+                            self.tick()
+                            if not safe_name(name):
+                                row["skipped"] += 1
+                                row["gaps"].append("UNSAFE_SOURCE")
+                                continue
+                            try:
+                                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                                if stat.S_ISDIR(st.st_mode):
+                                    if len(rel) >= 3:
+                                        row["skipped"] += 1
+                                        row["gaps"].append("DEPTH_LIMIT")
+                                    else:
+                                        row["directories"] += 1
+                                        self.walk(root, resolved, (*rel, name), row)
+                                elif candidate(name):
+                                    if self.sources >= MAX_SOURCES:
+                                        row["skipped"] += 1
+                                        row["gaps"].append("LIMIT_REACHED")
+                                        continue
+                                    self.sources += 1
+                                    src = self.read_source(path.join(p, name), path.join(root, *rel, name))
+                                    n = len(json.dumps(src, ensure_ascii=True, separators=(",", ":")))
+                                    if self.projected + n > 192 * 1024:
+                                        src.update(gaps=["PROJECTION_LIMIT"], blocks=[block_error("PROJECTION_LIMIT", b["rc"]) for b in src["blocks"]])
+                                    else:
+                                        self.projected += n
+                                    row["sources"].append(src)
+                                else:
+                                    row["skipped"] += 1
+                                    if stat.S_ISLNK(st.st_mode):
+                                        row["gaps"].append("DIRECTORY_LINK")
+                            except (Fault, OSError) as exc:
+                                why = self.acquisition_reason(exc)
+                                if why in ("SOURCE_CHANGED", "TIMEOUT"):
+                                    raise
+                                row["gaps"].append(why)
+                        if identity(os.fstat(fd)) != identity(before):
+                            fail("SOURCE_CHANGED")
+                        with self.directory(p) as after:
+                            if identity(os.fstat(after)) != identity(before):
+                                fail("SOURCE_CHANGED")
+
+                def collect(self):
+                    rows = {}
+                    for slot, root in ROOTS.items():
+                        row = empty()
+                        try:
+                            self.tick()
+                            with self.pin(root, root=True) as (_, st, resolved):
+                                row["root_target_id"] = source_id(resolved)
+                                self.walk(root, resolved, (), row)
+                                with self.pin(root, root=True) as (_, after, target):
+                                    if target != resolved or identity(st) != identity(after):
+                                        fail("SOURCE_CHANGED")
+                        except (Fault, OSError) as exc:
+                            why = self.acquisition_reason(exc)
+                            if why == "SOURCE_CHANGED":
+                                for src in row["sources"]:
+                                    src.update(gaps=[why], blocks=[block_error(why, b["rc"]) for b in src["blocks"]])
+                                row["root_target_id"] = None
+                            row["gaps"].append(why)
+                        row["gaps"] = sorted(set(row["gaps"]))
+                        row["sources"].sort(key=lambda s: s["source_id"])
+                        rows[slot] = row
+                    return rows
+
+
+            def interrupt(_signum, _frame):
+                fail("TIMEOUT")
+
+
+            def main():
+                deadline = time.monotonic() + 23
+                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
+                    signal.signal(sig, interrupt)
+                signal.setitimer(signal.ITIMER_REAL, 25)
+                reader = None
+                try:
+                    fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try:
+                        reader = Reader(fd, deadline)
+                        rows = reader.collect()
+                    finally:
+                        os.close(fd)
+                except (Fault, OSError) as exc:
+                    why = "CLEANUP_FAILED" if reader is not None and reader.cleanup_failed else reason(exc)
+                    rows = {k: empty(gap=why) for k in ROOTS}
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                payload = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
+                if len(payload) > MAX_PROJECTION:
+                    payload = json.dumps({k: empty(gap="PROJECTION_LIMIT") for k in ROOTS}, separators=(",", ":"))
+                print(payload)
+
+
+            if __name__ == "__main__":
+                main()
+        expand_argument_vars: false
+      environment:
+        LC_ALL: C
+        LANG: C
+      register: pqc_cert_assets_acquisition
+      changed_when: false
+      failed_when: false
+      when: gate and pqc_cert_assets_python_available
+
+    - name: Project bounded typed results or a constant command failure
+      when: gate and pqc_cert_assets_python_available
+      block:
+        - name: Convert only bounded helper stdout
+          ansible.builtin.set_fact:
+            pqc_cert_assets_snapshot: "{{ pqc_cert_assets_acquisition.stdout | from_json if accepted else dict(cert_scopes | zip([failure_root] * 3)) }}"
+            cacheable: false
+          vars:
+            accepted: "{{ pqc_cert_assets_acquisition.rc | default(-1) == 0 and pqc_cert_assets_acquisition.stdout | default('') | length <= 262144 }}"
+            failure_root: >-
+              {{ dict(attempted=true, rc=pqc_cert_assets_acquisition.rc | default(none), entries=0, directories=0, skipped=0, root_target_id=none,
+                      gaps=['TIMEOUT' if pqc_cert_assets_acquisition.rc | default(-1) in [124, 137] else ('PROJECTION_LIMIT' if pqc_cert_assets_acquisition.rc | default(-1) == 0 else 'COMMAND_FAILED')], sources=[]) }}
+        - name: Require exact root projection shape before controller validation
+          ansible.builtin.assert:
+            that:
+              - pqc_cert_assets_snapshot is mapping
+              - pqc_cert_assets_snapshot.keys() | sort == cert_scopes | sort
+              - pqc_cert_assets_snapshot.values() | selectattr('attempted', 'sameas', true) | list | length == 3
+            quiet: true
+      rescue:
+        - name: Reject malformed helper output without disclosure
+          ansible.builtin.set_fact:
+            pqc_cert_assets_snapshot: "{{ dict(cert_scopes | zip([dict(attempted=true, rc=pqc_cert_assets_acquisition.rc | default(none), entries=0, directories=0, skipped=0, root_target_id=none, gaps=['COMMAND_FAILED'], sources=[])] * 3)) }}"
+            cacheable: false
