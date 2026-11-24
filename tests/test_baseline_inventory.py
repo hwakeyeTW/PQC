@@ -497,9 +497,12 @@ def old_warning_family(event, provider):
     path = re.escape(str(provider))
     header = (diagnostic_words("[WARNING]: * Failed to parse") + r"\s+" + path
               + r"\s+" + diagnostic_words("with script plugin:") + r"\s+")
+    # v2.18.3 AnsibleParserError may append the same original JSON exception.
+    # Allow exactly one or two known details, never a different or extra cause.
+    json_detail = diagnostic_words(JSON_DETAIL)
     json_reason = (diagnostic_words(OLD_JSON_FAILURE) + r"\s+" + path + r":\s+"
                    + "(?:" + diagnostic_words("invalid JSON") + "|"
-                   + diagnostic_words(JSON_DETAIL) + ")")
+                   + json_detail + "|" + json_detail + r"\.\s+" + json_detail + ")")
     exit_reason = (diagnostic_words("Inventory script") + r"\s+\(" + path + r"\)\s+"
                    + diagnostic_words("had an execution error:")
                    + r"\s+SYNTHETIC_PROVIDER_FAILURE")
@@ -785,3 +788,60 @@ def test_r3_oracle_legacy_bound_wrapped_warning():
         with pytest.raises(AssertionError):
             assert_failed_provider(subprocess.CompletedProcess(["legacy-mutant"], 1, b"",
                                                                (bad + fatal).encode()), provider, "nonzero-provider")
+
+
+# R4: upstream-derived v2.18.3, NOT a native capture. The JSON-only loader
+# passes both the original message and orig_exc to AnsibleParserError;
+# errors/__init__.py appends '. %s' % to_native(self.orig_exc). The script
+# plugin binds the resulting reason to the provider path. Fixed upstream:
+# parsing/utils/yaml.py 98a9f94ff73d206b0b47e03095f4aa1c219e0ef7
+# errors/__init__.py 78853757f8a670b3c62305ffb67bea44b4ee2d6d
+# plugins/inventory/script.py 9b4c316ebdd3aa3e64888ed4006ad41a8b1a8ca7
+# Exact wrapped record from Review R4 #6036904725; D0 above remains native-derived.
+R4_LEGACY_DOUBLE_JSON = b"""[WARNING]:  * Failed to parse /synthetic/m.py with script plugin: failed to
+parse executable inventory script results from /synthetic/m.py: Expecting
+value: line 1 column 1 (char 0). Expecting value: line 1 column 1 (char 0)
+ERROR! Completely failed to parse inventory source /synthetic/m.py
+"""
+
+
+@pytest.mark.parametrize("layout", ["wrapped", "double-space-path"])
+def test_r4_oracle_accepts_legacy_double_json(layout):
+    provider = Path("/synthetic/m.py")
+    stderr = R4_LEGACY_DOUBLE_JSON
+    if layout == "double-space-path":
+        exact_path = b"/synthetic/Case  Space/m.py"
+        stderr = stderr.replace(str(provider).encode(), exact_path)
+        provider = Path(exact_path.decode())
+    assert_failed_provider(subprocess.CompletedProcess(["r4-source-only"], 1, b"", stderr),
+                           provider, "malformed-json")
+    # Also accept an unwrapped pair and the previously valid single detail.
+    for detail in (stderr.replace(b"failed to\nparse", b"failed to parse")
+                   .replace(b"Expecting\nvalue", b"Expecting value"),
+                   stderr.replace(b". Expecting value: line 1 column 1 (char 0)", b"")):
+        assert_failed_provider(subprocess.CompletedProcess(["r4-source-only"], 1, b"", detail),
+                               provider, "malformed-json")
+
+
+# Controlled adversarial mutations of the upstream-derived record, not native runs.
+@pytest.mark.parametrize("old,new,rc", [
+    (b". Expecting value: line 1 column 1 (char 0)",
+     b". Expecting value: line 1 column 2 (char 1)", 1),
+    (b"results from /synthetic/m.py:", b"results from /synthetic/foreign.py:", 1),
+    (b"Failed to parse /synthetic/m.py with", b"Failed to parse /synthetic/foreign.py with", 1),
+    (b"inventory source /synthetic/m.py\n", b"inventory source /synthetic/foreign.py\n", 1),
+    (b"(char 0)\nERROR!", b"(char 0). Expecting value: line 1 column 1 (char 0)\nERROR!", 1),
+    (b"(char 0)\nERROR!", b"(char 0)\nPermission denied\nERROR!", 1),
+    (b"/synthetic/m.py", b"/synthetic/m.py", 0),
+], ids=["different-second-detail", "foreign-reason", "foreign-header", "foreign-fatal",
+        "third-detail", "unrelated-cause", "rc0"])
+def test_r4_oracle_rejects_legacy_double_json_mutation(old, new, rc):
+    assert old in R4_LEGACY_DOUBLE_JSON
+    stderr = R4_LEGACY_DOUBLE_JSON.replace(old, new, 1)
+    provider = Path("/synthetic/m.py")
+    with pytest.raises(AssertionError):
+        assert_failed_provider(subprocess.CompletedProcess(["r4-mutant"], rc, b"", stderr),
+                               provider, "malformed-json")
+    if rc == 0:
+        with pytest.raises(AssertionError, match="inventory source parse failure"):
+            effective_inventory_object(synthetic_response(empty_response(), stderr, rc), "empty")
