@@ -1,6 +1,7 @@
-"""Controller-only SCOPE-R1 launcher. No managed execution is implemented."""
+"""Controller-only scope/profile planner. No managed execution is implemented."""
 import argparse
 import ctypes
+import importlib.util
 import ipaddress
 import json
 import os
@@ -39,6 +40,10 @@ INTERNAL_FIELDS = frozenset({
     'pqc_plan_only', 'pqc_execution_allowed', 'pqc_active_dispatch_allowed',
     'pqc_target_ids', 'pqc_runtime_targets', 'pqc_scope_plan', 'pqc_guard',
     'report_root', 'report_dir',
+    'pqc_profile_policy', 'pqc_profile_request', 'pqc_profile_result',
+    'profile_decision_version', 'profile_status', 'profile_decisions',
+    'decision', 'requested_flags', 'per_collector', 'active_intent_validated',
+    'inventory_flags_source', 'connection_status',
 })
 HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,254}\Z')
 GROUP = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,254}\Z')
@@ -185,16 +190,24 @@ def parse_scope(raw, forks=2):
     run_id = raw.get('pqc_run_id')
     require('pqc_run_id' not in raw or type(run_id) is str and RUN_ID.fullmatch(run_id),
             2, 'INVALID_RUN_ID')
-    profile = raw.get('pqc_scan_profile')
+    profile = raw.get('pqc_scan_profile', 'baseline')
+    require(type(profile) is str and profile in ('baseline', 'extended', 'active'),
+            2, 'INVALID_PROFILE')
     opt_in = raw.get('pqc_active_opt_in', False)
+    if type(opt_in) is str and opt_in.lower() in ('true', 'false'):
+        opt_in = opt_in.lower() == 'true'
     endpoints = raw.get('pqc_active_endpoints', [])
     require(type(opt_in) is bool and type(endpoints) is list, 2, 'INVALID_ACTIVE_INTENT')
-    require(profile != 'active' and not opt_in and not endpoints, 2, 'PROFILE_INTEGRATION_REQUIRED')
-    require('pqc_scan_profile' not in raw or profile in ('baseline', 'extended'), 2, 'INVALID_PROFILE')
+    require(len(endpoints) <= 200, 2, 'ENDPOINT_INVALID')
+    if profile == 'active':
+        require(opt_in, 2, 'ACTIVE_OPT_IN_REQUIRED')
+        require(endpoints, 2, 'ENDPOINT_INVALID')
+    else:
+        require(not opt_in and not endpoints, 2, 'PROFILE_CONFLICT')
     return {'hosts': hosts, 'groups': groups, 'max_hosts': cap, 'forks': forks,
             'run_id': run_id, 'profile': profile, 'plan_only': True,
             'run_flags': {k: flag(raw[k]) for k in sorted(FLAGS & raw.keys())},
-            'active_opt_in': False, 'active_endpoints': []}
+            'active_opt_in': opt_in, 'active_endpoints': endpoints}
 
 
 def strict_json(data):
@@ -323,8 +336,150 @@ def resolve_targets(inventory, request):
     return targets, inventory_flags, connection_status
 
 
+# Fixed installation-relative sources. Neither scope nor inventory can select
+# a policy, module, loader path or an alternative resolver implementation.
+PROFILE_MODULE = ('ansible_collections/security/compliance_pqc_readiness/'
+                  'plugins/modules/resolve_scan_profile.py')
+PROFILE_POLICY = 'config/scan_profiles.yml'
+PROFILE_FIELDS = frozenset({
+    'profile_decision_version', 'profile', 'decision', 'reason_code', 'plan_only',
+    'requested_flags', 'per_collector', 'active_intent_validated',
+    'active_dispatch_allowed', 'execution_allowed',
+})
+ROW_FIELDS = frozenset({'id', 'requested', 'allowed_by_profile', 'planned_scope',
+                        'request_source', 'collection_state', 'reason_code'})
+DENIAL_REASONS = frozenset({'INVALID_INPUT', 'INVALID_POLICY', 'PROFILE_CONFLICT',
+                            'ACTIVE_OPT_IN_REQUIRED', 'ENDPOINT_INVALID',
+                            'TARGET_NOT_AUTHORIZED', 'ACTIVE_NOT_AVAILABLE_V2_0'})
+ROW_REASONS = frozenset({'DISABLED_BY_USER', 'DISABLED_BY_PROFILE',
+                         'NARROWED_BY_INVENTORY', 'PLAN_ONLY',
+                         'ADAPTER_NOT_AVAILABLE', 'ACTIVE_NOT_AVAILABLE_V2_0'})
+
+
+def fixed_source(root, relative, limit, reason):
+    path = root / relative
+    try:
+        # The trusted repository root is resolved from this launcher, not cwd.
+        # Refuse redirected/nonregular sources and bound reads even on failure.
+        require(path.resolve(strict=True) == path, 3, reason)
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), 'rb') as stream:
+            require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), 3, reason)
+            raw = stream.read(limit + 1)
+        require(len(raw) <= limit, 3, reason)
+        return path, raw.decode('utf-8', errors='strict')
+    except (OSError, ValueError, RuntimeError):
+        raise Denied(3, reason) from None
+
+
+def load_profile_contract():
+    root = Path(__file__).resolve().parents[1]
+    path, source = fixed_source(root, PROFILE_MODULE, 65536, 'PROFILE_RESOLVER_ERROR')
+    try:
+        spec = importlib.util.spec_from_file_location('_pqc_profile_resolver', path)
+        module = importlib.util.module_from_spec(spec)
+        # Import the fixed trusted source, without module search or cached pyc.
+        # This is never evaluation of scope, inventory or endpoint data.
+        exec(compile(source, str(path), 'exec'), module.__dict__)
+        resolver, loader = module.resolve_scan_profile, module.load_policy
+        if not callable(resolver) or not callable(loader):
+            raise TypeError
+    except (Exception, SystemExit):
+        raise Denied(3, 'PROFILE_RESOLVER_ERROR') from None
+    _, raw = fixed_source(root, PROFILE_POLICY, 16384, 'PROFILE_POLICY_ERROR')
+    try:
+        policy = loader(raw)
+    except (Exception, SystemExit):
+        raise Denied(3, 'PROFILE_POLICY_ERROR') from None
+    return policy, resolver
+
+
+def checked_profile(resolver, policy, request, inventory_layer):
+    """Check the closed V1 output boundary, not a second policy engine."""
+    reason = 'PROFILE_RESOLVER_ERROR'
+    try:
+        decision = resolver(policy, request)
+    except (Exception, SystemExit):
+        raise Denied(3, reason) from None
+    try:
+        require(type(decision) is dict and decision.keys() == PROFILE_FIELDS, 3, reason)
+        profile = request['profile']
+        status, code = decision['decision'], decision['reason_code']
+        require(type(status) is str and status in ('VALIDATED', 'DEFERRED', 'DENIED')
+                and type(code) is str, 3, reason)
+        require(type(decision['profile_decision_version']) is int
+                and decision['profile_decision_version'] == 1
+                and type(decision['profile']) is str and decision['profile'] == profile
+                and decision['plan_only'] is True
+                and decision['execution_allowed'] is False
+                and decision['active_dispatch_allowed'] is False
+                and type(decision['active_intent_validated']) is bool, 3, reason)
+        denied = status == 'DENIED'
+        if denied:
+            require(code in DENIAL_REASONS and not decision['active_intent_validated'], 3, reason)
+        else:
+            expected = ('DEFERRED', 'ACTIVE_NOT_AVAILABLE_V2_0') if profile == 'active' else (
+                'VALIDATED', 'PLAN_ONLY')
+            require((status, code) == expected
+                    and decision['active_intent_validated'] is (profile == 'active'), 3, reason)
+        flags, rows = decision['requested_flags'], decision['per_collector']
+        require(type(flags) is dict and flags.keys() == FLAGS
+                and all(type(value) is bool for value in flags.values())
+                and type(rows) is list and len(rows) == len(FLAGS), 3, reason)
+        seen = set()
+        for row in rows:
+            require(type(row) is dict and row.keys() == ROW_FIELDS, 3, reason)
+            key = row['id']
+            require(type(key) is str and key in FLAGS and key not in seen, 3, reason)
+            seen.add(key)
+            require(row['requested'] is flags[key] and type(row['allowed_by_profile']) is bool
+                    and (not row['requested'] or row['allowed_by_profile'])
+                    and type(row['planned_scope']) is str
+                    and row['planned_scope'] in ('baseline', 'extended', 'active')
+                    and type(row['request_source']) is str
+                    and row['request_source'] in ('PROFILE_DEFAULT', 'RUN', 'INVENTORY_EFFECTIVE', 'NARROWED')
+                    and row['collection_state'] == 'NOT_SCANNED'
+                    and type(row['collection_state']) is str
+                    and type(row['reason_code']) is str, 3, reason)
+            if denied:
+                require(not row['requested'] and not row['allowed_by_profile']
+                        and row['reason_code'] == code, 3, reason)
+            else:
+                require(row['reason_code'] in ROW_REASONS, 3, reason)
+        require(seen == FLAGS, 3, reason)
+    except Denied:
+        raise
+    except (Exception, SystemExit):
+        raise Denied(3, reason) from None
+    if denied:
+        if code == 'INVALID_POLICY':
+            raise Denied(3, 'PROFILE_POLICY_ERROR')
+        raise Denied(4 if inventory_layer or code == 'TARGET_NOT_AUTHORIZED' else 2, code)
+    return decision
+
+
+def profile_plan(targets, flags, request):
+    policy, resolver = load_profile_contract()
+    # Always pass the complete fixed manifest and run-level intent, but only
+    # the current host's effective eight flags. No cross-host borrowing.
+    common = {'profile': request['profile'], 'plan_only': True,
+              'run_flags': request['run_flags'], 'target_ids': targets,
+              'active_opt_in': request['active_opt_in'],
+              'active_endpoints': request['active_endpoints']}
+    run = checked_profile(resolver, policy, dict(common, inventory_flags={}), False)
+    decisions = {}
+    for host in targets:
+        decision = checked_profile(resolver, policy, dict(common, inventory_flags=flags[host]), True)
+        require(decision['decision'] == run['decision'], 3, 'PROFILE_RESOLVER_ERROR')
+        decisions[host] = decision
+    require(set(decisions) == set(targets) and len(decisions) == len(targets),
+            3, 'PROFILE_RESOLVER_ERROR')
+    return {'profile_decision_version': 1, 'profile': run['profile'],
+            'profile_status': run['decision'], 'profile_decisions': decisions}
+
+
 def build_plan(inventory, request):
     targets, flags, connection_status = resolve_targets(inventory, request)
+    profiles = profile_plan(targets, flags, request)
     plan = {'scope_plan_version': 1, 'plan_status': 'READY', 'reason_code': 'TARGET_PLAN_READY',
             'plan_only': True, 'execution_allowed': False, 'active_dispatch_allowed': False,
             'target_ids': targets, 'target_count': len(targets),
@@ -332,10 +487,11 @@ def build_plan(inventory, request):
                        'serial': 2, 'ssh_timeout_s': 15, 'command_timeout_s': 30},
             'run_flags': request['run_flags'], 'inventory_flags': flags,
             'inventory_flags_source': 'INVENTORY_EFFECTIVE', 'connection_status': connection_status,
-            'active_opt_in': False, 'active_endpoints': []}
-    for key in ('profile', 'run_id'):
-        if request[key] is not None:
-            plan[key] = request[key]
+            'active_opt_in': request['active_opt_in']}
+    if request['run_id'] is not None:
+        plan['run_id'] = request['run_id']
+    # No endpoint tuple is retained in the plan, even in the internal result.
+    plan.update(profiles)
     return plan
 
 
@@ -507,7 +663,8 @@ def load_effective_inventory(source):
 
 
 PUBLIC_FIELDS = ('scope_plan_version', 'plan_status', 'reason_code', 'plan_only',
-                 'execution_allowed', 'active_dispatch_allowed', 'target_ids', 'target_count')
+                 'execution_allowed', 'active_dispatch_allowed', 'target_ids', 'target_count',
+                 'profile_decision_version', 'profile', 'profile_status', 'profile_decisions')
 
 
 def main(argv=None):
