@@ -219,7 +219,7 @@ summary or arbitrary attachment names are not accepted.
 | assessed_evidence.json | Actual canonical evaluation | 32 MiB |
 | assessment_rules.json | Exact supplied rules bytes (existing JSON-form rules) | 64 KiB |
 | batch_manifest.json | Original selected B04 terminal bytes | 16 MiB |
-| cff_projection.json | S1 synthetic CFF + companion pair | 128 MiB |
+| cff_projection.json | S1 synthetic pair or actual I3 legacy CFF + mandatory companion | 128 MiB outer; actual I3 wire 32 MiB |
 | legacy_provenance.json | Closed original-source provenance | 1 MiB |
 | details/<host_id>/<slot>.json | S1 synthetic typed detail | 1 MiB |
 | run_manifest.json | Last immutable commit marker | 16 MiB |
@@ -241,9 +241,10 @@ CFF requires assessment. Detail requirements are exact `{host_id, slot}`
 rows (use an explicit run ID for run-scoped IDs). Slots are platform,
 openssl-runtime, crypto-policy, ssh-posture, certificate-inventory and
 service-inventory. Assessment and raw rules are all-or-nothing; the fixed
-actual evaluator recomputes canonical bytes and rejects mismatches. CFF
-and typed detail are **SYNTHETIC only in S1**. Unknown producer formats or
-versions fail closed. Required detail cannot be missing from a COMPLETE
+actual evaluator recomputes canonical bytes and rejects mismatches. Typed
+detail and the S1 CFF pair remain **SYNTHETIC only**. The explicitly required
+I3 legacy projection below is a separate narrow contract. Unknown producer
+formats or versions fail closed. Required detail cannot be missing from a COMPLETE
 host, even within a PARTIAL run. Publication, reading and recovery enforce
 this same per-host requirement. A COMPLETE run cannot omit any required
 artifact; a partial/error run records permitted missing paths and fixed reasons.
@@ -270,6 +271,22 @@ individual Collector wire contracts. Actual producer-specific typed
 validation and required slots will be bound by the authorized integration
 work, not by accepting opaque attachments or loading validators dynamically.
 
+I3 enables actual #13 CFF only for explicit `LEGACY_IMPORT`, Evidence 1.0.0,
+`requirements.assessment=true`, `requirements.cff=true` and empty details.
+The fixed existing `tools.cff.validate_projection` replays against the exact
+assessed Evidence and the parsed saved rules; both CFF and its companion,
+versions, host/registry links, evidence hash and score semantics must match.
+No S1 pair or arbitrary projection/validator is accepted on this path. The
+actual producer retains its stricter 32 MiB wire and 20,000-row limits in
+addition to the unchanged store caps. Normal publication requires assessment,
+exact rules bytes and the complete actual CFF pair even for historical
+PARTIAL or ERROR. Unprepared recovery still reports missing required artifacts
+explicitly without inventing assessment or automatically recreating the pair;
+prepared recovery and the published reader enforce the same actual validator.
+Older legacy publications with no CFF requirement remain readable, and the
+native V1 and synthetic fixture contracts are unchanged. No schema/version,
+artifact slot, `PublishedRun`, lock, or safe-helper interface changes.
+
 For legacy, `begin` requires the exact original `legacy_raw` bytes and
 `legacy_provenance`: `format_version`, `source` (same frozen source),
 `original_run_id` (only for legacy-ol-run-summary), `original_generated_at`
@@ -279,8 +296,9 @@ legacy-ol-run-summary; actual original SHA256 must match. The original
 report is retained separately by the Owner; the store does not copy it.
 Every legacy collection/evidence source must bind the same original digest.
 Missing hosts remain present; no native batch/attempt facts are manufactured.
-This is the S1 common provenance contract, not a direct import of #12 code.
-Existing legacy reports and normalization interfaces remain unchanged.
+The I3 `tools.import_reports` CLI supplies this provenance from the actual #12
+ImportResult. Existing legacy reports and pure normalization interfaces remain
+unchanged; see `import-legacy.md` for the explicit CLI and trusted rules source.
 
 ## Verification and handoff
 
@@ -328,11 +346,11 @@ The trusted test orchestrator freezes the scope before execute_batch, persists
 intent before native queueing, validates separately acquired synthetic
 Evidence, and records the actual returned terminal rows. This does not implement
 production per-dispatch orchestration or register live collectors. Real #57
-producer IDs, scope-specific mapping and typed detail/CFF integration remain
-unqualified; the native path accepts only the fixed synthetic short-ID scope.
+producer IDs, scope-specific mapping and native typed detail/CFF integration
+remain unqualified; the native path accepts only the fixed synthetic short-ID scope.
 Run store does not authorize any host connection. S2 review and Owner-approved
 merge are required before #9 DEV_COMPLETE.
-Production native/legacy/CFF/collector wiring, reader/catalog/Portal,
+Production native collector wiring, native CFF/details, reader/catalog/Portal,
 actual Controller/OL, approved local filesystem durability and power loss,
 permissions/load and integrated release/offline QA remain for the authorized
 later work and #28. This local engineering test is not formal support for

@@ -3,11 +3,73 @@
 `tools/import_legacy.py` is a pure Controller-side adapter. It accepts already
 acquired bytes from a known legacy producer and trusted caller metadata, not a
 file name, URL, directory, archive, Ansible inventory or remote host. It does
-not run the old producer. There is no new CLI, live dispatch, report store or
-network dependency. The caller must retain original bytes and manage private
-storage; use the #2 data handling policy (directories 0700, files 0600). Never
+not run the old producer. The pure adapter itself performs no I/O or network
+access. The I3 controller CLI below composes it with the existing private Run
+Store. The operator must retain original bytes and manage private storage; use the #2 data handling policy (directories 0700, files 0600). Never
 commit or transmit real report data, identities, diagnostics or derived reports
 to the public repository. IDs and SHA-256 are not anonymization.
+
+## I3: Publish one historical report offline
+
+From the trusted repository or installed code root, use the existing private
+local POSIX report root (owned by the effective UID, mode `0700`):
+
+```sh
+python -m tools.import_reports \
+  --input /private/input/fixture.json \
+  --format legacy-per-host \
+  --run-id import-fixture-01 \
+  --recorded-at 2026-01-03T00:00:00Z \
+  --origin-ref private-fixture-ref \
+  --report-root /private/reports
+```
+
+`--source-version` is optional trusted producer metadata. Choose exactly one
+of the three explicit formats below. Use a new run ID, not the historical
+summary ID. No auto-detection, URL, archive, glob, stdin, external Inventory,
+remote acquisition or report-directed path is supported. The input must be an
+absolute local regular file with no traversal or symlink components. A pinned
+directory walk, nonblocking/no-follow file open, bounded read and before/after
+identity, size and timestamp checks reject unsafe or changed sources. The
+original input is neither copied into the store nor changed by the importer.
+
+The fixed trusted rules source is `config/assessment_rules.yml` relative to
+installed repository code, not the working directory or report. The existing
+#11 `load_rules` accepts only JSON-compatible policy within 64 KiB. There is
+no CLI rules override, alternate upstream CFF rules path, YAML conversion or
+fallback. The single acquired raw rules byte sequence is parsed once for the
+importer, evaluator and actual #13 CFF projection; the exact original bytes
+are also passed to Run Store. Missing, unsafe or invalid rules fail before
+reservation. On this development baseline the rule and taxonomy versions are
+1.0.0. The saved `assessment_rules.json` is not a reserialization: its bytes
+and SHA-256 are bound by the manifest; offline readers replay using those
+saved rules, not the rules currently installed on the Controller.
+
+The CLI validates the full normalization, assessment and CFF/mandatory
+companion projection, including the tighter producer and store capacity
+limits, before reserving the ID. Each expected host (including any missing
+report) receives its actual Evidence checkpoint, with no native dispatch
+intent, attempt or terminal. The five core artifacts are `evidence.json`,
+`assessed_evidence.json`, `assessment_rules.json`, `cff_projection.json`, and
+`legacy_provenance.json`. The provenance includes the exact original input
+SHA-256, source, original run/time metadata and all validated diagnostic
+counts. The original report remains separately held by the Owner. The
+manifest is published last, and `RunStore.open` must read back the same
+validated publication after the writer closes. See `report-storage.md` for
+locking, recovery and private-file requirements.
+
+CLI exit 0 means verified publication, not a successful scan or PQC readiness:
+the historical `PARTIAL` or `ERROR` state is preserved in the fixed JSON
+summary. Exit 2 is invalid arguments/input/rules/normalization/projection or
+preflight capacity; exit 3 is storage or verification failure; caught
+interruption returns 130. Error output contains fixed reason codes, not raw
+report data or paths. A failed writer may leave a reserved incomplete run;
+use the existing explicit recovery procedure, never automatically retry,
+repair or overwrite a run ID. Case-insensitive collisions are refused.
+Producer bounds (32 MiB Evidence and CFF wire, 20,000 projection rows per
+registry/list) and existing store limits remain in force. A legacy input
+that normalizes successfully may still exceed a later limit; it is rejected
+as a whole rather than truncated or marked complete.
 
 ## L01: Explicit formats and caller contract
 
