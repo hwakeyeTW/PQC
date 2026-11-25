@@ -317,7 +317,9 @@ A stop reason is independent of host coverage. This is a synthetic batch
 result contract, not Evidence, scan readiness, report storage, a recovery
 journal, a release QA verdict or an alternative live entry point. #9 S2
 and #57 I1 may consume the actual API only after the required Planner/Owner
-integration decision; no storage or producer integration is implemented.
+integration decision. No storage is implemented in this module. The
+separately approved I1a private producer-aware path is described below;
+it does not change the V1 contract.
 
 ### Focused S2 verification and limits
 
@@ -344,3 +346,32 @@ Both are synthetic proof, not real OpenSSH qualification. Actual fixed-path
 HOLD; real SSH transport and live execution remain hard closed. Actual
 Controller/OL9.7-9.9, legitimate native SSH/ProxyJump, remote lifetime,
 performance and offline deployment are required release QA (#28).
+
+
+## I1a private Producer-aware V2 (R2)
+
+The separate `execute_producer_batch(ctx, rules)` entry point uses the
+same frozen context and native scheduler/guard/worker lifecycle. The real
+producer registry and real transport remain closed. It returns
+`(rc, manifest, bundle)` for the restricted synthetic path only. The V1
+`execute_batch(ctx)` path and its V1 validator/8-per-slot/16-per-host
+reference limits remain unchanged; V1 never consumes a V2 receipt.
+
+See [collector integration](collector-integration.md) for the closed V2
+outcomes, exact producer-scope/Evidence association, R2 5+P/38+P capacity,
+and private typed-handoff contract. The native IPC is still at most 3500
+bytes per message; it carries a small length/hash/identity receipt rather
+than collection references or typed projection bytes. The private
+0700/0600 per-host slot has a hard 1 MiB cap and ten hosts have a hard 10 MiB
+aggregate cap. The original 16 KiB raw command output limit is independent.
+No raw output, arbitrary paths, snapshot, or assessment is added to IPC.
+
+Only confirmed normal worker reap and validated receipts establish a safe
+terminal. Duplicate receipts invalidate that host terminal while preserving
+validated observations, and stop subsequent dispatch; a malformed receipt
+never becomes Evidence. The V2 close/final normalization phases remain
+bounded, including caught interrupt handling. Platform prerequisite is
+separate from the eight flags and is not counted as requested-scan success.
+V2 is not a public CLI, a V1 fallback, a persistent store interface or an
+actual acquisition adapter. I1b/I2 and formal compatibility/security/release
+qualification remain separate, with no live opening.

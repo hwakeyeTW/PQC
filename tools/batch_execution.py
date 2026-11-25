@@ -950,7 +950,7 @@ def _task(ctx, names):
 
 
 @contextlib.contextmanager
-def _worker_boundary(ctx, name, registry):
+def _worker_boundary(ctx, name, registry, collect=None):
     """Inherited only by the next native fork; never invoke original SSH _run."""
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.connection import ssh
@@ -998,7 +998,7 @@ def _worker_boundary(ctx, name, registry):
             actual = _native_argv(conn)
             require(actual == expected[:2] and _effective_ssh(tuple(argv), expected[1]) == expected[2],
                     4, 'BATCH_GUARD_DENIED')
-        result = _collect(name, flags, registry)
+        result = _collect(name, flags, registry) if collect is None else collect(name, flags, registry)
         raw = json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')
         require(len(raw) <= _QUEUE_BYTES - 350, 3, 'INVALID_NATIVE_RESULT')
         return 0, raw, b''
@@ -1017,7 +1017,7 @@ def _worker_boundary(ctx, name, registry):
         ssh.Connection._run = original_run
 
 
-def _make_queue():
+def _make_queue(receipt_validator=None):
     from ansible.executor.task_queue_manager import FinalQueue
     class ClosedQueue(FinalQueue):
         # The actual WorkerProcess calls this native result boundary. Do not
@@ -1043,7 +1043,10 @@ def _make_queue():
             if not isinstance(task_id, str) or not re.fullmatch(r'[0-9a-f-]{1,128}', task_id):
                 task_id = 'invalid-task'
                 row = None
-            if row is not None:
+            if row is not None and receipt_validator is not None:
+                if not receipt_validator(row, name):
+                    row = None
+            elif row is not None:
                 try:
                     rows = row['collectors']
                     flags = {f: c['requested'] for f, c in zip(_COLLECTORS, rows)}
@@ -1089,11 +1092,13 @@ def _queue_strategy(tqm):
     return FixedQueue(tqm)
 
 
-def _drain(queue, ledger):
+def _drain(queue, ledger, after_accept=None):
     while queue._reader.poll(0):
         raw = queue.get()
         require(type(raw) is bytes and len(raw) <= _QUEUE_BYTES, 3, 'INVALID_NATIVE_RESULT')
         ledger.accept(_scope.strict_json(raw))
+        if after_accept is not None:
+            after_accept()
 
 
 def _stop_workers(workers):
@@ -1169,8 +1174,14 @@ class _WorkerWave:
         self.faults.setdefault(name, reason)
         self.ledger.fail(reason)
 
-    def poll(self):
+    def _drain_receipts(self):
         _drain(self.queue, self.ledger)
+
+    def _grace_changed(self):
+        pass
+
+    def poll(self):
+        self._drain_receipts()
         for n, worker in self.workers.items():
             if n in self.confirmed or n in self.faults:
                 continue
@@ -1178,7 +1189,7 @@ class _WorkerWave:
             if not worker.is_alive():
                 # SimpleQueue sends synchronously. Drain again after exit so
                 # a last legitimate callback is not mistaken for a lost one.
-                _drain(self.queue, self.ledger)
+                self._drain_receipts()
                 _scope.reap_group(worker.pid)
                 if n not in self.ledger.rows:
                     self.fail(n, 'OUTCOME_UNKNOWN')
@@ -1192,6 +1203,7 @@ class _WorkerWave:
                 now = time.monotonic()
                 if n in self.ledger.rows:
                     self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
+                    self._grace_changed()
                 if now >= min(self.ends[n], self.grace.get(n, self.ends[n])):
                     self.fail(n, 'CONTROLLER_TIMEOUT')
 
@@ -1221,12 +1233,77 @@ class _WorkerWave:
         return quiet
 
 
+class _ProducerWorkerWave(_WorkerWave):
+    """V2 receipt work shares the scheduler's existing deadline."""
+    def __init__(self, ledger, queue, phase):
+        super().__init__(ledger, queue)
+        self.phase = phase
+
+    def _drain_receipts(self):
+        # Includes queue read, receipt validation and actual normalization.
+        # An exit drain may follow a newly established shorter grace.
+        with self.phase():
+            _drain(self.queue, self.ledger, self._receipt_accepted)
+
+    def _receipt_accepted(self):
+        # Establish grace before another queued receipt can start expensive
+        # projection work, not only after the complete queue drain.
+        now = time.monotonic()
+        for n, worker in self.workers.items():
+            if n not in self.confirmed and n not in self.faults and n in self.ledger.rows and worker.is_alive():
+                self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
+        self._grace_changed()
+
+    def _grace_changed(self):
+        with self.phase():
+            pass
+
+    def poll(self):
+        with self.phase():
+            super().poll()
+
+    def finish(self, workers):
+        # A timeout/cancellation/fatal stop is not permission for another
+        # normalization. Even a normal final poll must use the original limit.
+        try:
+            if self.ledger.stop is None:
+                self.poll()
+        except _Cancelled:
+            self.ledger.fail('INTERRUPTED')
+        except _Deadline:
+            self.ledger.fail('CONTROLLER_TIMEOUT')
+        except (Exception, SystemExit):
+            self.ledger.fail('INVALID_NATIVE_RESULT')
+        finally:
+            # The phase has unwound. This is the separate bounded termination
+            # budget, not a new worker/receipt deadline. Do not consume late
+            # receipts after forced termination; retain already validated rows.
+            try:
+                quiet = _stop_workers(workers)
+            except (Exception, SystemExit):
+                quiet = False
+        if not quiet:
+            self.ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+        for n in self.workers:
+            if not quiet or n not in self.confirmed:
+                stopped = self.ledger.stop
+                reason = ('CONTROLLER_CLEANUP_UNCONFIRMED' if not quiet else
+                          self.faults.get(n, stopped if stopped in ('CONTROLLER_TIMEOUT', 'INTERRUPTED')
+                                          else 'CONTROLLER_WORKER_FAILED'))
+                self.ledger.worker_failed(n, reason)
+        return quiet
+
+
 def execute_batch(ctx):
     """One private native batch invocation -> (rc, closed terminal manifest).
 
     Denied(2/3/4) before dispatch is a preflight rejection, not a run.
     There is no public adapter/transport parameter or live execution grant.
     """
+    return _execute_batch(ctx)
+
+
+def _execute_batch(ctx, producer_session=None):
     import threading
     import ctypes
     from ansible import context
@@ -1242,8 +1319,11 @@ def execute_batch(ctx):
     started = time.monotonic()
     deadline = started + _GUARD_SECONDS
     interrupted = phase_active = fork_critical = False
+    active_phase_end = None
     controller_pid = os.getpid()
     handlers = {}
+    if producer_session is not None:
+        producer_session.handlers = handlers
     tqm = queue = ledger = None
     wave = None
     subreaper = scheduling = False
@@ -1262,21 +1342,43 @@ def execute_batch(ctx):
 
     @contextlib.contextmanager
     def phase():
-        nonlocal phase_active
+        nonlocal phase_active, active_phase_end
         end = min(deadline, time.monotonic() + _GUARD_SECONDS,
                   wave.limit() if wave is not None else float('inf'))
-        remaining = end - time.monotonic()
         if interrupted:
             raise _Cancelled()
+        if phase_active and producer_session is not None:
+            # Polling inside the native pre-fork phase, and drain/grace checks
+            # inside a poll, borrow the outer alarm. Never restore a longer
+            # timer, renew an expired one, or install another handler.
+            end = min(end, active_phase_end)
+            remaining = end - time.monotonic()
+            timer = signal.getitimer(signal.ITIMER_REAL)[0]
+            if remaining <= 0 or timer <= 0:
+                raise _Deadline()
+            if end < active_phase_end:
+                active_phase_end = end
+                if remaining < timer:
+                    signal.setitimer(signal.ITIMER_REAL, remaining)
+            yield active_phase_end
+            if interrupted:
+                raise _Cancelled()
+            if time.monotonic() >= active_phase_end:
+                raise _Deadline()
+            return
+        remaining = end - time.monotonic()
         if remaining <= 0:
             raise _Deadline()
         with _deadline(remaining, lambda: fork_critical):
             phase_active = True
+            active_phase_end = end
             try:
                 if interrupted:
                     raise _Cancelled()
                 yield end
             finally:
+                end = active_phase_end
+                active_phase_end = None
                 phase_active = False
         if interrupted:
             raise _Cancelled()
@@ -1284,6 +1386,13 @@ def execute_batch(ctx):
             raise _Deadline()
 
     def poll():
+        if producer_session is not None:
+            if interrupted:
+                ledger.fail('INTERRUPTED')
+            if time.monotonic() >= deadline:
+                ledger.fail('CONTROLLER_TIMEOUT')
+            if ledger.stop is not None:
+                return False
         if wave is not None:
             wave.poll()
         if interrupted:
@@ -1311,7 +1420,8 @@ def execute_batch(ctx):
                     if not poll():
                         raise _Cancelled() if interrupted else Denied(3, 'INVALID_NATIVE_RESULT')
                     require(worker is tqm._workers[slot], 3, 'INVALID_NATIVE_RESULT')
-                    launch_end = min(phase_end, wave.limit())
+                    launch_end = min(phase_end, wave.limit(),
+                                     active_phase_end if producer_session is not None else phase_end)
                     remaining = launch_end - time.monotonic()
                     if remaining <= 0:
                         raise _Deadline()
@@ -1332,7 +1442,9 @@ def execute_batch(ctx):
                     if time.monotonic() >= launch_end:
                         raise _Deadline()
                 BaseProcess.start = start_worker
-                with _worker_boundary(ctx, name, registry):
+                boundary = (_worker_boundary(ctx, name, registry) if producer_session is None else
+                            _worker_boundary(ctx, name, registry, producer_session.collect))
+                with boundary:
                     strategy._queue_task(host, task, vals, pc)
         finally:
             BaseProcess.start = original_start
@@ -1354,10 +1466,13 @@ def execute_batch(ctx):
                 require(_request(ctx._request) == ctx._request and _source_identity(ctx._source) == ctx._source_id
                         and _project(ctx._inventory, ctx._variables, ctx._request)
                         == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
-                registry = _passive_adapters()
-                require(type(registry) is dict and registry.keys() <= _PASSIVE
-                        and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
-                ledger = _Ledger(ctx, registry)
+                if producer_session is None:
+                    registry = _passive_adapters()
+                    require(type(registry) is dict and registry.keys() <= _PASSIVE
+                            and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+                    ledger = _Ledger(ctx, registry)
+                else:
+                    registry, ledger = producer_session.prepare(ctx)
         except _Deadline:
             if not interrupted:
                 raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
@@ -1395,7 +1510,8 @@ def execute_batch(ctx):
                         signal.signal(sig, interrupt)
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 tqm._final_q.close()
-                queue = tqm._final_q = _make_queue()
+                queue = tqm._final_q = (_make_queue() if producer_session is None else
+                                        _make_queue(producer_session.bridge.valid_receipt))
             with _quiet():
                 for offset in range(0, len(names), width):
                     if not poll():
@@ -1404,7 +1520,8 @@ def execute_batch(ctx):
                     with phase():
                         tqm._initialize_processes(len(selected))
                         strategy = _queue_strategy(tqm)
-                    wave = _WorkerWave(ledger, queue)
+                    wave = (_WorkerWave(ledger, queue) if producer_session is None else
+                            _ProducerWorkerWave(ledger, queue, phase))
                     try:
                         for n in selected:
                             if not poll():
@@ -1419,8 +1536,12 @@ def execute_batch(ctx):
                                     host = ctx._inventory.hosts[n]
                                     vals = ctx._variables.get_vars(play=play, host=host, task=task,
                                                                     include_hostvars=False, use_cache=False)
-                            except (Denied, _Deadline):
-                                poll()
+                            except (Denied, _Deadline) as exc:
+                                if producer_session is None:
+                                    poll()
+                                elif isinstance(exc, _Deadline) and time.monotonic() >= min(deadline, wave.limit()):
+                                    ledger.fail('CONTROLLER_TIMEOUT')
+                                    break
                                 ledger.fail('GUARD_REJECTED')
                                 break
                             if not poll():
@@ -1446,7 +1567,8 @@ def execute_batch(ctx):
                         ledger.fail('INTERRUPTED')
     except _Cancelled:
         if ledger is None:
-            ledger = _Ledger(ctx, {})
+            ledger = (_Ledger(ctx, {}) if producer_session is None else
+                      producer_session.cancelled_before_prepare(ctx))
             ledger.rows.clear()
         ledger.fail('INTERRUPTED')
     except _Deadline:
@@ -1481,10 +1603,312 @@ def execute_batch(ctx):
                             ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
                 tqm.terminate()
         finally:
-            for sig, previous in handlers.items():
-                signal.signal(sig, previous)
+            if producer_session is None:
+                for sig, previous in handlers.items():
+                    signal.signal(sig, previous)
             if subreaper:
                 require(libc.prctl(36, old.value, 0, 0, 0) == 0, 3, 'NATIVE_CONTEXT_UNVERIFIED')
     if interrupted:
         ledger.fail('INTERRUPTED')
+    if producer_session is not None:
+        return producer_session.finish(ctx, ledger, lambda: interrupted)
     return _manifest(ctx, ledger.finish(), ledger.stop)
+
+
+# I1a: the same guarded queue, worker deadlines and lifecycle, with a distinct
+# private receipt path. V1 never consumes a V2 result or its reference limits.
+def _v2_base_row(row):
+    result = {k: v for k, v in row.items() if k != 'platform'}
+    result['collectors'] = [{**c, 'collection_ids': [],
+        'reason_code': 'COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else c['reason_code']}
+        for c in row['collectors']]
+    return result
+
+
+def _valid_v2_outcome(row, flag, requested, cap):
+    if type(row) is not dict or type(row.get('collection_ids')) is not list:
+        return False
+    ids = row['collection_ids']
+    if (len(ids) > cap or any(type(x) is not str or not re.fullmatch(r'c-[0-9a-f]{64}', x) for x in ids)
+            or ids != sorted(set(ids))):
+        return False
+    reduced = {**row, 'collection_ids': []}
+    # V2 can report an aggregate collection error without inventing a command
+    # rc. Reuse V1's state/rc shape, not its collection-reference capacity.
+    if reduced.get('reason_code') == 'COLLECTION_ERROR':
+        if reduced.get('state') != 'ERROR' or reduced.get('rc') is not None:
+            return False
+        reduced['reason_code'] = 'COMMAND_IO_FAILED'
+    return _valid_outcome(reduced, flag, requested) and (row['state'] != 'UNREACHABLE' or not ids)
+
+
+def validate_producer_manifest(manifest, rc):
+    """V2 terminal shape only; exact Evidence binding is a separate check."""
+    from tools import scan_collectors as bridge
+    require(type(manifest) is dict and type(manifest.get('batch_manifest_version')) is int
+            and manifest['batch_manifest_version'] == 2 and type(manifest.get('hosts')) is list
+            and 1 <= len(manifest['hosts']) <= 10, 3, 'INVALID_TERMINAL_MANIFEST')
+    caps = {bridge.PLATFORM: 10, bridge.PACKAGES: 2, bridge.SSL: 261, bridge.POLICY_FLAG: 9,
+            bridge.SSHD: 8, bridge.KEYS: 1, bridge.CERT_FLAG: 3, bridge.NGINX: 0, bridge.TLS: 0}
+    reduced = []
+    refs = set()
+    for row in manifest['hosts']:
+        require(type(row) is dict and row.keys() == {'target_id', 'host_state', 'attempted', 'reason_code', 'collectors', 'platform'}
+                and type(row['collectors']) is list and len(row['collectors']) == len(_COLLECTORS)
+                and all(type(c) is dict and type(c.get('requested')) is bool for c in row['collectors']),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        flags = {f: c['requested'] for f, c in zip(_COLLECTORS, row['collectors'])}
+        require(not flags[bridge.NGINX] and not flags[bridge.TLS]
+                and _valid_v2_outcome(row['platform'], bridge.PLATFORM, any(flags.values()), 10)
+                and all(_valid_v2_outcome(c, f, flags[f], caps[f]) for c, f in zip(row['collectors'], _COLLECTORS)),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
+        require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)
+                and (row['attempted'] or (not ids and row['platform']['state'] == 'NOT_SCANNED')),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        refs.update(ids)
+        reduced.append(_v2_base_row(row))
+    require(len(refs) <= bridge.MAX_REFS * 10, 3, 'INVALID_TERMINAL_MANIFEST')
+    validate_terminal_manifest({**manifest, 'batch_manifest_version': 1, 'hosts': reduced}, rc)
+    return None
+
+
+class _ProducerLedger(_Ledger):
+    """Retain validated snapshots independently of the provisional terminal."""
+    def __init__(self, ctx, session, eligible):
+        self.session = session
+        self.targets = ctx._targets
+        self.flags = {n: dict(ctx._decisions[n]['requested_flags']) for n in self.targets}
+        self.eligible = eligible
+        self.started = {}
+        self.rows = {n: _blank(n, self.flags[n], 'NO_EXECUTABLE_COLLECTORS')
+                     for n in self.targets if not eligible[n]}
+        self.stop = None
+        self.ids = set()
+        self.projections = {}
+        self.metrics = {}
+
+    def accept(self, message):
+        require(type(message) is dict and message.keys() == {'target_id', 'task_uuid', 'row'}
+                and type(message['target_id']) is str, 3, 'INVALID_NATIVE_RESULT')
+        n, receipt = message['target_id'], message['row']
+        if n in self.started and n in self.rows:
+            # Duplicate receipt invalidates the host terminal, not its
+            # previously validated observations. Never continue dispatch.
+            self.worker_failed(n, 'INVALID_NATIVE_RESULT')
+            raise Denied(3, 'INVALID_NATIVE_RESULT')
+        require(n in self.started and n not in self.rows and self.started[n] == message['task_uuid']
+                and self.session.bridge.valid_receipt(receipt, n), 3, 'INVALID_NATIVE_RESULT')
+        # Only the V2 scheduler may authorize receipt work. In particular,
+        # an expired/missing alarm must not turn into a fresh guard interval.
+        if signal.getitimer(signal.ITIMER_REAL)[0] <= 0:
+            raise _Deadline()
+        try:
+            envelope = self.session.handoff.read(n, receipt)
+            projection = self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
+                                                                self.session.started_at, self.session.rules)
+        except Exception:
+            # Never send a raw parsing/normalizer exception or retained snapshot
+            # through the queue. Known earlier valid hosts remain available.
+            self.fail('INVALID_NATIVE_RESULT')
+            raise Denied(3, 'INVALID_NATIVE_RESULT') from None
+        row = _host(n, True, [projection.outcomes[f] for f in _COLLECTORS], projection.special)
+        row['platform'] = projection.outcomes[self.session.bridge.PLATFORM]
+        ids = {i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']}
+        require(not self.ids & ids, 3, 'INVALID_NATIVE_RESULT')
+        merged_ids = self.ids | ids
+        metrics = {'typed_bytes': receipt['byte_count'],
+                   'ipc_bytes': len(json.dumps(message, separators=(',', ':'), ensure_ascii=True).encode('ascii'))}
+        # Publish the validated observation and its terminal/metric together.
+        # Mask only these in-memory assignments, never read/normalize or stop
+        # workers. An interrupted projection must not leave partial bindings.
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGALRM, signal.SIGINT, signal.SIGTERM))
+        try:
+            if signal.getitimer(signal.ITIMER_REAL)[0] <= 0:
+                raise _Deadline()
+            self.ids = merged_ids
+            self.projections[n] = projection
+            self.metrics[n] = metrics
+            self.rows[n] = row
+            if row['reason_code'] in _FATAL:
+                self.fail(row['reason_code'])
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+    def worker_failed(self, name, reason):
+        old = self.rows.get(name, {}).get('platform')
+        super().worker_failed(name, reason)
+        if old is not None:
+            self.rows[name]['platform'] = (_outcome(self.session.bridge.PLATFORM, True, 'ERROR', 'OUTCOME_UNKNOWN')
+                                          if old['state'] == 'UNREACHABLE' else old)
+
+    def finish(self):
+        rows = super().finish()
+        for row in rows:
+            if 'platform' not in row:
+                enabled = any(self.flags[row['target_id']].values())
+                reason = row['reason_code']
+                row['platform'] = (_outcome(self.session.bridge.PLATFORM, enabled, 'ERROR', 'OUTCOME_UNKNOWN')
+                                   if row['attempted'] else
+                                   _outcome(self.session.bridge.PLATFORM, enabled, 'NOT_SCANNED',
+                                            'DISABLED' if not enabled else reason if reason in _OUTCOMES['NOT_SCANNED'] else 'STOPPED'))
+        return rows
+
+
+class _ProducerSession:
+    def __init__(self, rules):
+        from tools import scan_collectors as bridge
+        self.bridge = bridge
+        self.rules = copy.deepcopy(rules)
+        bridge.assessment.validate_rules(self.rules)
+        self.handoff = None
+        self.run_id = None
+        self.started_at = None
+        self.handlers = {}
+
+    def _identity(self, ctx):
+        import uuid
+        self.run_id = ctx._request['run_id'] or 'i1a-' + uuid.uuid4().hex
+        self.started_at = self.bridge.stamp()
+
+    def prepare(self, ctx):
+        self._identity(ctx)
+        registry = self.bridge._producer_adapters()
+        require(type(registry) is dict and registry.keys() <= set(self.bridge.PRODUCERS)
+                and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+        try:
+            eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
+        except self.bridge.BridgeError:
+            raise Denied(2, 'UNSUPPORTED_PRODUCER') from None
+        require(all(set(v) <= registry.keys() for v in eligible.values()), 2, 'PRODUCER_ADAPTER_NOT_AVAILABLE')
+        ledger = _ProducerLedger(ctx, self, eligible)
+        targets = [n for n in ctx._targets if eligible[n]]
+        if targets:
+            self.handoff = self.bridge.Handoff(self.run_id, targets)
+        return registry, ledger
+
+    def cancelled_before_prepare(self, ctx):
+        if self.run_id is None:
+            self._identity(ctx)
+        return _ProducerLedger(ctx, self, {n: () for n in ctx._targets})
+
+    def collect(self, name, flags, registry):
+        """Called only after the unchanged native per-dispatch/argv guard."""
+        b = self.bridge
+        records = []
+        try:
+            with _deadline(_SSH_SECONDS):
+                connected = _restricted_connection(name)
+        except (_Deadline, Exception):
+            connected = 'REMOTE_CLEANUP_UNCONFIRMED'
+        if connected not in b.CONNECTIONS:
+            connected = 'INVALID_ADAPTER_RESULT'
+        if connected == 'CONNECTED':
+            platform_snapshot = None
+            for producer in b.requested(flags):
+                value = None
+                try:
+                    # One bounded synthetic surrogate per producer. I1b must
+                    # separately prove each actual remote command and cleanup.
+                    with _deadline(_COMMAND_SECONDS + 1):
+                        gap = producer != b.PLATFORM and b._platform_status(platform_snapshot) != 'UNVERIFIED'
+                        if gap:
+                            value = dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                                         snapshot=b._gap_snapshot(producer, flags, b._platform_status(platform_snapshot)))
+                        else:
+                            value = registry[producer](name, copy.deepcopy(flags), copy.deepcopy(platform_snapshot))
+                        row = b.record(producer, value, flags, platform_snapshot, self.run_id, name, gap=gap)
+                except _Deadline:
+                    row = b.failed_record(producer, 'REMOTE_CLEANUP_UNCONFIRMED')
+                except Exception:
+                    # A malformed projection is not a successful acquisition.
+                    # Only a genuine adapter cleanup receipt permits the less
+                    # severe invalid-result classification.
+                    clean = type(value) is dict and value.get('cleanup_confirmed') is True
+                    row = b.failed_record(producer, 'INVALID_ADAPTER_RESULT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
+                records.append(row)
+                if producer == b.PLATFORM:
+                    platform_snapshot = row['snapshot']
+                    if platform_snapshot is None:
+                        break
+                if b.record_stop(row):
+                    break
+        envelope = dict(handoff_version=b.WIRE_VERSION, run_id=self.run_id, target_id=name,
+                        connection=connected, records=records)
+        return self.handoff.write(name, envelope)
+
+    def close(self):
+        if self.handoff is not None:
+            handoff, self.handoff = self.handoff, None
+            try:
+                with _deadline(_WORKER_GRACE):
+                    return handoff.close()
+            except (_Deadline, OSError, self.bridge.BridgeError):
+                return False
+        return True
+
+    def finish(self, ctx, ledger, interrupted):
+        if not self.close():
+            ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+            for name in ledger.started:
+                ledger.worker_failed(name, 'CONTROLLER_CLEANUP_UNCONFIRMED')
+        if interrupted():
+            ledger.fail('INTERRUPTED')
+        rows = ledger.finish()
+        # Use the original B05 classification with platform excluded. Only
+        # the actual V2 row contains expanded collection references.
+        rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
+        manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
+        validate_producer_manifest(manifest, rc)
+        b = self.bridge
+        hosts = [b.host_record(self.run_id, r['target_id'], r['host_state'], r['reason_code']) for r in rows]
+        doc = b.document(self.run_id, self.started_at, hosts, manifest['run_state'], b.stamp())
+        companions = {}
+        for name, projection in ledger.projections.items():
+            doc = b._append(doc, projection.document)
+            companions[name] = projection.companions
+        # Existing validator and evaluator keep their own document limits.
+        # No truncation, second evaluator or fake Evidence on overflow.
+        try:
+            with _deadline(_GUARD_SECONDS):
+                b.validate_bindings(manifest, doc, companions, ledger.projections)
+                raw = b.evidence.canonical_bytes(doc)
+                doc = b.evidence.parse_evidence_bytes(raw)
+                assessed = b.assessment.evaluate_document(doc, self.rules)
+                assessed = b.evidence.parse_evidence_bytes(b.evidence.canonical_bytes(assessed))
+                # Keep the original interrupt handler active throughout the
+                # bounded final evaluation. The evaluator's results depend on
+                # host/evidence rows, not run_state; only update the run state.
+                if interrupted() and rc != 7:
+                    ledger.fail('INTERRUPTED')
+                    rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
+                    manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
+                    validate_producer_manifest(manifest, rc)
+                    doc['run']['run_state'] = assessed['run']['run_state'] = manifest['run_state']
+                    b.validate_bindings(manifest, doc, companions, ledger.projections)
+                    b.evidence.validate_document(assessed)
+        except _Deadline:
+            raise Denied(3, 'PRODUCER_VALIDATION_TIMEOUT') from None
+        except b.evidence.EvidenceError as exc:
+            raise Denied(3, 'PRODUCER_EVIDENCE_SIZE_LIMIT' if exc.code == 'SIZE_LIMIT' else 'INVALID_PRODUCER_PROJECTION') from None
+        return rc, manifest, dict(document=doc, assessed=assessed, companions=companions,
+                                  handoff_metrics=ledger.metrics)
+
+
+def execute_producer_batch(ctx, rules):
+    """I1a private V2 API -> (rc, manifest, typed Controller bundle).
+
+    No adapter/transport/path argument. Product registry remains empty; the
+    only positive route is a trusted test-injected synthetic adapter.
+    """
+    session = _ProducerSession(rules)
+    try:
+        return _execute_batch(ctx, session)
+    finally:
+        # Covers before-dispatch denial and initialization/validation errors.
+        try:
+            if not session.close():
+                raise Denied(3, 'CONTROLLER_CLEANUP_UNCONFIRMED') from None
+        finally:
+            for sig, previous in session.handlers.items():
+                signal.signal(sig, previous)
