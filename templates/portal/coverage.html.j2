@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coverage | Run {{ p.run.run_id }}</title><link rel="stylesheet" href="../portal.css"></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<header class="masthead"><div class="wrap"><p class="brand">PQC Report Portal</p><nav aria-label="Breadcrumb"><a href="../../index.html">History</a> / <a href="../index.html">{{ p.run.run_id }}</a> / Coverage</nav></div></header>
+{% macro value(v) -%}{{ 'Unknown / not recorded' if v is none else v }}{%- endmacro %}
+{% macro refs(ids, table) -%}{% for id in ids or [] %}<a href="{{ table[id].href }}">{{ id }}</a>{% if not loop.last %}<br>{% endif %}{% else %}None recorded{% endfor %}{%- endmacro %}
+<main class="wrap" id="main">
+<section class="hero"><h1>Coverage</h1><p>{{ p.run.run_kind }} / {{ p.run.run_state }} / {{ p.run.reason_code }}</p>
+<p>Host denominator: {{ p.expected_host_ids|length }} expected hosts. COMPLETE is an acquisition state, not a security verdict. Recorded collection and asset sets do not measure every asset on a host.</p>
+<p>Requested slots use the frozen flags. Missing terminal results are not successful. Collector attempts are indicated only by recorded acquisition results, not proof of command execution.</p>
+{% if not p.flags_known %}<p id="flags-unknown" class="empty">Legacy request flags and collector denominators are unknown.</p>{% endif %}
+{% if not p.assessed %}<p id="not-assessed" class="empty">Assessment not present; no assessed denominator or verdict.</p>{% endif %}
+<p>Evidence schema: {{ p.run.evidence_schema_version }} / Rules: {{ value(p.run.rule_version) }} / Source: {{ p.run.source.source_kind }} / {{ p.run.source.producer_id }} / {{ value(p.run.source.producer_version) }}</p>
+<nav class="jump"><a href="hosts.html">Host list</a><a href="findings.html">Findings</a><a href="algorithms.html">Algorithms</a><a href="#summary-metrics">Summary metrics</a><a href="#collector-results">Collector results</a><a href="#recorded-collections">Collections</a><a href="#recorded-assets">Assets</a><a href="#artifact-status">Artifact status</a></nav>
+<p>Read-only preview; publication and download integration are separate.</p></section>
+<section id="host-results"><h2>Host states and attempts</h2><div class="scroll"><table><thead><tr><th>Host</th><th>State / reason</th><th>Attempt status</th><th>Dispatch intent</th></tr></thead><tbody>
+{% for id in p.expected_host_ids %}{% set h=p.hosts[id] %}<tr id="{{ id }}"><th><a href="{{ h.href }}">{{ value(h.target_id) }}</a><small>{{ id }}</small></th><td>{{ h.host_state }} / {{ h.reason_code }}</td><td>{{ h.attempt_status }}</td><td>{{ value(h.dispatch_intent) }}</td></tr>{% endfor %}
+</tbody></table></div></section>
+<section id="summary-metrics"><h2>Recorded metrics and denominators</h2><p>Each count is a recorded set cardinality; group counts can overlap. Unknown is not zero. L1 through L5 are independent saved assessment levels. NOT_APPLICABLE is not PASS.</p>
+<div class="scroll"><table id="metrics"><thead><tr><th>Dimension</th><th>Group</th><th>Metric</th><th>State / version</th><th>Count</th><th>Denominator</th><th>Reason</th></tr></thead><tbody>
+{% for r in p.metrics %}<tr><td>{{ r.dimension }}</td><td>{{ r.group_id }}</td><td>{{ r.metric }}</td><td>{{ value(r.state) }}</td><td>{{ value(r.count) }}</td><td>{{ value(r.denominator) }}</td><td>{{ value(r.reason_code) }}</td></tr>{% endfor %}
+</tbody></table></div></section>
+<section id="collector-results"><h2>Frozen requests and terminal records</h2>{% if p.flags_known %}<div class="scroll"><table><thead><tr><th>Host</th><th>Collector</th><th>Requested</th><th>Terminal</th><th>Attempt evidence</th><th>State / reason / rc</th><th>Collections</th></tr></thead><tbody>
+{% for r in p.collector_rows %}<tr><td><a href="{{ p.hosts[r.host_id].href }}">{{ r.host_id }}</a></td><td>{{ r.collector_id }}</td><td>{{ r.requested }}</td><td>{{ 'PRESENT' if r.terminal_present else 'MISSING' }}</td><td>{{ r.attempt_status }}</td><td>{{ value(r.state) }} / {{ value(r.reason_code) }} / {{ value(r.rc) }}</td><td>{{ refs(r.collection_ids,p.collections) }}</td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p>No frozen collector request scope recorded.</p>{% endif %}</section>
+<section id="recorded-collections"><h2>Recorded collections</h2>{% if p.collections %}<div class="scroll"><table><thead><tr><th>Collection</th><th>Host / collector</th><th>State / reason</th><th>Producer version</th><th>Evidence</th></tr></thead><tbody>
+{% for id,c in p.collections|dictsort %}<tr><th><a href="{{ c.href }}">{{ id }}</a></th><td><a href="{{ p.hosts[c.host_id].href }}">{{ c.host_id }}</a> / {{ c.collector_id }}</td><td>{{ c.collection_state }} / {{ c.reason_code }}</td><td>{{ c.source.source_kind }} / {{ c.source.producer_id }} / {{ value(c.source.producer_version) }}</td><td>{{ refs(c.evidence_ids,p.evidence) }}</td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="empty">No collections recorded. Expected scope coverage is unknown.</p>{% endif %}</section>
+<section id="recorded-assets"><h2>Known assets only</h2>{% if p.assets %}<div class="scroll"><table><thead><tr><th>Asset</th><th>Host</th><th>Kind / identity scope</th><th>Collections</th><th>Evidence</th></tr></thead><tbody>
+{% for id,a in p.assets|dictsort %}<tr><th><a href="{{ a.href }}">{{ id }}</a></th><td><a href="{{ p.hosts[a.host_id].href }}">{{ a.host_id }}</a></td><td>{{ a.asset_kind }} / {{ a.identity_scope }}</td><td>{{ refs(a.collection_ids,p.collections) }}</td><td>{{ refs(a.evidence_ids,p.evidence) }}</td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="empty">No assets recorded; not proof of absence.</p>{% endif %}</section>
+<section id="artifact-status"><h2>Artifact status</h2><p>{{ p.artifacts|length }} verified artifacts; {{ p.missing_artifacts|length }} required missing artifacts.</p>
+{% for a in p.missing_artifacts %}<p class="empty">Missing: {{ a.path }} / {{ a.reason_code }}</p>{% else %}<p>No required missing artifact recorded.</p>{% endfor %}
+<p>Unresolved algorithm claims: {% if p.assessed %}{{ p.unresolved_algorithm_claim_ids|length }}. {{ refs(p.unresolved_algorithm_claim_ids,p.claims) }}{% else %}Unknown / not assessed{% endif %}</p></section>
+<section id="algorithm-summary"><h2>Existing algorithm groups</h2><p>Same recorded groups as the crypto index; observations are not assessment verdicts. <a href="algorithms.html">Open algorithm references</a>.</p>
+<div class="scroll"><table id="algorithm-metrics"><thead><tr><th>Group</th><th>Algorithm / classification</th><th>Family / primitive / taxonomy</th><th>Metric / level / state</th><th>Observed name</th><th>Source context</th><th>Count</th><th>Denominator</th></tr></thead><tbody>
+{% for r in p.algorithm_rows %}<tr><td>{% if r.algorithm_group_id %}<a href="algorithms.html#{{ r.algorithm_group_id }}">{{ r.algorithm_group_id }}</a>{% else %}Unresolved{% endif %}</td><td>{{ value(r.algorithm_id) }} / {{ value(r.classification) }}</td><td>{{ value(r.family) }} / {{ value(r.primitive) }} / {{ value(r.taxonomy_version) }}</td><td>{{ r.metric }} / {{ value(r.get('level')) }} / {{ value(r.get('state')) }}</td><td>{{ value(r.get('observed_name')) }}</td><td>{{ value(r.get('source_kind')) }} / {{ value(r.get('producer_id')) }} / {{ value(r.get('producer_version')) }} / {{ value(r.get('collector_id')) }}</td><td>{{ value(r.count) }}</td><td>{{ value(r.denominator) }}</td></tr>{% endfor %}
+</tbody></table></div></section>
+</main><footer class="wrap">PQC read-only summary preview. No new assessment or publication.</footer></body></html>
