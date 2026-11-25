@@ -1,0 +1,10 @@
+{% extends "base.html.j2" %}
+{% macro value(x) -%}{% if x is none %}Unknown / not recorded{% elif x is sameas true %}Yes{% elif x is sameas false %}No{% else %}{{ x }}{% endif %}{%- endmacro %}
+{% block title %}Hosts | Run {{ v.run.run_id }}{% endblock %}
+{% block content %}
+<section class="hero"><p class="eyebrow">{{ v.run.run_kind }} &middot; {{ v.run.run_state }}</p><h1>Expected hosts</h1>
+<p>{{ hosts|length }} expected hosts. Includes failed, unreachable and not attempted hosts.</p><nav class="jump"><a href="../index.html">Back to batch dashboard</a></nav></section>
+<section><h2>Host list</h2><div class="scroll"><table id="host-list"><thead><tr><th>Target / Host ID</th><th>State</th><th>Reason</th><th>Attempt status</th><th>Attempted</th><th>Dispatch intent</th><th>Recorded collections</th></tr></thead><tbody>
+{% for h in hosts %}<tr id="{{ h.host_id }}"><th scope="row"><a href="{{ h.host_id }}.html">{{ value(h.target_id) }}</a><small>{{ h.host_id }}</small></th><td>{{ h.host_state }}</td><td>{{ h.reason_code }}</td><td>{{ h.attempt_status }}</td><td>{{ 'Not applicable' if h.attempt_status == 'NOT_APPLICABLE' else value(h.attempted) }}</td><td>{{ 'Not applicable' if h.attempt_status == 'NOT_APPLICABLE' else value(h.dispatch_intent) }}</td><td>{{ h.scopes }}</td></tr>{% else %}<tr><td colspan="7">No hosts recorded.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

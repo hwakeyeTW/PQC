@@ -271,13 +271,20 @@ class Page(HTMLParser):
                 self.text[ident] += data
 
 
-def snapshot(root):
+def snapshot(root, published=None):
+    # Exclude only the fixed derived slots for this validated run. Never
+    # exclude arbitrary descendants of a generation or core artifact names.
+    derived = {f'{RID}/index.html', f'{RID}/portal.css'}
+    if published is not None:
+        derived.update(f'{RID}/portal-v2/{name}' for name in (
+            'hosts.html', 'portal_receipt.json',
+            *(hid + '.html' for hid in published.manifest['expected_host_ids'])))
     return {str(p.relative_to(root)): (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino)
-            for p in root.rglob('*') if p.is_file() and p.name not in ('index.html', 'portal.css')}
+            for p in root.rglob('*') if p.is_file() and str(p.relative_to(root)) not in derived}
 
 
 def check_page(root, published):
-    before = snapshot(root)
+    before = snapshot(root, published)
     path = portal.render_run(root, RID)
     assert path == root / RID / 'index.html'
     page = Page(path)
@@ -295,7 +302,9 @@ def check_page(root, published):
         assert row['host_state'] in page.text[row['host_id']]
         assert row['reason_code'] in page.text[row['host_id']]
         assert row['attempt_status'] in page.text[row['host_id']]
-    assert set(page.links) - {x for x in page.links if x.startswith('#')} == set(published.artifacts) | {'portal.css'}
+    assert set(page.links) - {x for x in page.links if x.startswith('#')} == set(published.artifacts) | {
+        'portal.css', 'portal-v2/hosts.html',
+        *('portal-v2/' + hid + '.html' for hid in m['expected_host_ids'])}
     for href in page.links:
         u = urlsplit(href)
         assert not u.scheme and not u.netloc and not u.query
@@ -309,7 +318,7 @@ def check_page(root, published):
                    for tag, attrs in page.tags)
     css = (path.parent / 'portal.css').read_bytes()
     assert not re.search(rb'(?i)url\s*\(|@import|https?:|@font-face', css)
-    assert snapshot(root) == before
+    assert snapshot(root, published) == before
     for p in (path, path.parent / 'portal.css'):
         assert stat.S_IMODE(p.stat().st_mode) == 0o600 and p.stat().st_nlink == 1
     with rs.RunStore(root) as store:
@@ -391,7 +400,7 @@ def test_recovered_unknown_attempt_empty_scope_required_gaps(root):
 def test_css_only_resume_and_preflight_collision(root, monkeypatch):
     published = publish(root)
     run = root / RID
-    before = snapshot(root)
+    before = snapshot(root, published)
     original = rs._write
     def interrupted(fd, name, content, device, **kwargs):
         if name == 'index.html':
@@ -404,7 +413,7 @@ def test_css_only_resume_and_preflight_collision(root, monkeypatch):
     monkeypatch.setattr(rs, '_write', original)
     css_inode = (run / 'portal.css').stat().st_ino
     check_page(root, published)
-    assert (run / 'portal.css').stat().st_ino == css_inode and snapshot(root) == before
+    assert (run / 'portal.css').stat().st_ino == css_inode and snapshot(root, published) == before
     (run / 'index.html').write_bytes(b'old historical page')
     with pytest.raises(rs.StoreError, match='PORTAL_OUTPUT_COLLISION'):
         portal.render_run(root, RID)

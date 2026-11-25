@@ -15,7 +15,7 @@
   <h1 id="overview-title">Run {{ v.run.run_id }}</h1>
   <p><span class="pill">{{ v.run.publication_state }}</span> <strong id="run-state">{{ v.run.run_state }}</strong> &middot; {{ v.run.reason_code }}{% if v.run.recovery %} &middot; Recovered publication{% endif %}</p>
   <p>Publication confirms stored artifacts, not PQC readiness. Historical run catalog is not yet available.</p>
-  <nav class="jump" aria-label="Run sections"><a href="#hosts">Hosts</a><a href="#coverage">Coverage</a><a href="#capability">Runtime</a><a href="#negotiation">Negotiation</a><a href="#assessment">Assessment</a><a href="#artifacts">Artifacts</a></nav>
+  <nav class="jump" aria-label="Run sections"><a href="#hosts">Hosts</a>{% if portal_v2|default(false) %}<a href="portal-v2/hosts.html">Host list</a>{% endif %}<a href="#coverage">Coverage</a><a href="#capability">Runtime</a><a href="#negotiation">Negotiation</a><a href="#assessment">Assessment</a><a href="#artifacts">Artifacts</a></nav>
 </section>
 <section aria-labelledby="metadata-heading"><h2 id="metadata-heading">Run metadata</h2>
 <dl class="metadata">
@@ -27,7 +27,7 @@
 <p><strong id="expected-hosts">{{ v.expected }}</strong> expected hosts. Execution state and attempt status are independent of assessment.</p>
 {{ count_cards(v.host_counts, 'host') }}
 <div class="scroll"><table id="host-rows"><thead><tr><th scope="col">Target / Host ID</th><th scope="col">State</th><th scope="col">Reason</th><th scope="col">Attempt status</th><th scope="col">Attempted</th><th scope="col">Dispatch intent</th><th scope="col">Recorded collections</th></tr></thead><tbody>
-{% for h in v.hosts %}<tr id="{{ h.host_id }}"><th scope="row">{{ value(h.target_id) }}<small>{{ h.host_id }}</small></th><td>{{ h.host_state }}</td><td>{{ h.reason_code }}</td><td>{{ h.attempt_status }}</td><td>{% if h.attempt_status == 'NOT_APPLICABLE' %}Not applicable{% else %}{{ value(h.attempted) }}{% endif %}</td><td>{% if h.attempt_status == 'NOT_APPLICABLE' %}Not applicable{% else %}{{ value(h.dispatch_intent) }}{% endif %}</td><td>{{ h.scopes }}</td></tr>{% endfor %}
+{% for h in v.hosts %}<tr id="{{ h.host_id }}"><th scope="row">{% if portal_v2|default(false) %}<a href="portal-v2/{{ h.host_id }}.html">{{ value(h.target_id) }}</a>{% else %}{{ value(h.target_id) }}{% endif %}<small>{{ h.host_id }}</small></th><td>{{ h.host_state }}</td><td>{{ h.reason_code }}</td><td>{{ h.attempt_status }}</td><td>{% if h.attempt_status == 'NOT_APPLICABLE' %}Not applicable{% else %}{{ value(h.attempted) }}{% endif %}</td><td>{% if h.attempt_status == 'NOT_APPLICABLE' %}Not applicable{% else %}{{ value(h.dispatch_intent) }}{% endif %}</td><td>{{ h.scopes }}</td></tr>{% endfor %}
 </tbody></table></div></section>
 <section id="coverage" aria-labelledby="coverage-title"><h2 id="coverage-title">Collection coverage</h2>
 <p><strong id="collection-total">{{ v.collection_total }}</strong> recorded collection scopes. This denominator is recorded collections, not all expected scopes or a readiness percentage.</p>
@@ -54,7 +54,7 @@
 <div class="scroll"><table id="claim-counts"><thead><tr><th scope="col">Evidence level</th>{% for state in v.assessment_states %}<th scope="col">{{ state }}</th>{% endfor %}<th scope="col">Total</th></tr></thead><tbody>{% for row in v.levels %}<tr id="claims-{{ row.level }}"><th scope="row">{{ row.level }} {{ row.label }}</th>{% for n in row.counts %}<td>{{ n }}</td>{% endfor %}<td>{{ row.total }}</td></tr>{% endfor %}</tbody></table></div>
 <h3>Finding states</h3>{% if not v.finding_total %}<p class="empty">No findings recorded; no verdict implied.</p>{% endif %}{{ count_cards(v.findings, 'finding') }}
 {% endif %}</section>
-<section id="artifacts" aria-labelledby="artifact-title"><h2 id="artifact-title">Published artifacts</h2><p>Only verified present artifacts have links. The history entry and detailed Portal pages belong to later work packages.</p>
+<section id="artifacts" aria-labelledby="artifact-title"><h2 id="artifact-title">Published artifacts</h2><p>Only verified present artifacts have links. {% if portal_v2|default(false) %}Run-wide files are batch-level; host pages also link their present details. History and CBOM pages are not available in this slice.{% else %}The history entry and detailed Portal pages belong to later work packages.{% endif %}</p>
 <div class="scroll"><table id="artifact-rows"><thead><tr><th scope="col">Artifact</th><th scope="col">Relative path</th><th scope="col">Version</th><th scope="col">Bytes</th></tr></thead><tbody>{% for item in v.links %}<tr><th scope="row">{{ item.label }}</th><td><a href="{{ item.path }}">{{ item.path }}</a></td><td>{{ item.version }}</td><td>{{ item.size }}</td></tr>{% endfor %}</tbody></table></div>
 <h3>Missing required artifacts</h3>{% if v.missing %}<ul id="missing-artifacts">{% for item in v.missing %}<li>{{ item.path }} &mdash; {{ item.reason_code }}</li>{% endfor %}</ul>{% else %}<p>No required artifact gaps recorded. This is not a security PASS.</p>{% endif %}
 {% if v.optional_missing %}<p class="empty">Not present (not required): {{ v.optional_missing | join(', ') }}.</p>{% endif %}</section>
