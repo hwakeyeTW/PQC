@@ -118,17 +118,21 @@ def _portal_status(fd, device, published, marker, budget):
     has_css = rs._exists(fd, 'portal.css')
     has_v2 = rs._exists(fd, portal._GENERATION)
     has_v3 = rs._exists(fd, portal._HISTORY_GENERATION)
-    if not (has_index or has_css or has_v2 or has_v3):
+    has_v4 = rs._exists(fd, portal._CRYPTO_GENERATION)
+    if not (has_index or has_css or has_v2 or has_v3 or has_v4):
         return 'NOT_GENERATED', None
     try:
         index_size = budget.file(fd, HTML, device, portal._MAX_HTML) if has_index else None
         css_size = budget.file(fd, 'portal.css', device, portal._MAX_CSS) if has_css else None
         rs.require(has_index and has_css, 'PORTAL_GENERATION_INCOMPLETE')
+        index_signature = portal._index_stat(fd, device)
+        css_signature = portal._file_signature(fd, 'portal.css', device)
         current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
         css = rs._read(fd, 'portal.css', device, portal._MAX_CSS, css_size)
+        crypto = current.startswith(portal._CRYPTO_MARKER)
         history = current.startswith(portal._HISTORY_MARKER)
         try:
-            if history:
+            if history or crypto:
                 old, expected_css = None, portal._render_css()
             else:
                 old, expected_css = portal._render(published)
@@ -143,33 +147,41 @@ def _portal_status(fd, device, published, marker, budget):
         if current == old:
             # Neither unreferenced v2 nor v3 staging is opened.
             return 'AVAILABLE', 'portal-v1'
-        generation = portal._HISTORY_GENERATION if history else portal._GENERATION
-        rs.require(has_v3 if history else has_v2, 'PORTAL_GENERATION_INCOMPLETE')
+        generation = portal._CRYPTO_GENERATION if crypto else (
+            portal._HISTORY_GENERATION if history else portal._GENERATION)
+        rs.require(has_v4 if crypto else has_v3 if history else has_v2,
+                   'PORTAL_GENERATION_INCOMPLETE')
         with rs._directory(fd, (generation,), device) as gen:
             names = {'hosts.html', *(h + '.html' for h in published.manifest['expected_host_ids'])}
+            if crypto:
+                names.update((*portal._CRYPTO_PAGES, portal._CRYPTO_JSON))
             expected = names | {portal._RECEIPT}
             present = set(rs._entries(gen, len(expected)))
             total = index_size
             # Charge every admitted fixed derived slot, even when later invalid.
             for name in sorted(present & expected):
-                cap = portal._MAX_RECEIPT if name == portal._RECEIPT else portal._MAX_HTML
-                size = budget.file(gen, name, device, cap)
-                if name != portal._RECEIPT:
+                size = budget.file(gen, name, device, portal._page_cap(name))
+                if name not in (portal._RECEIPT, portal._CRYPTO_JSON):
                     total += size
             _capacity_if(total > portal._MAX_TOTAL_HTML)
             rs.require(present == expected, 'PORTAL_GENERATION_INCOMPLETE')
             try:
-                render = portal._render_v3 if history else portal._render_v2
+                render = portal._render_v4 if crypto else portal._render_v3 if history else portal._render_v2
                 index, pages, receipt = render(published, marker, expected_css)
             except rs.StoreError as exc:
                 # In this fixed renderer, these are generated HTML and receipt
                 # byte limits, not a persisted page/receipt mismatch.
-                if exc.code in ('PORTAL_SIZE_LIMIT', 'SIZE_LIMIT'):
+                if exc.code in ('PORTAL_SIZE_LIMIT', 'SIZE_LIMIT') or (crypto and exc.code == 'CRYPTO_INDEX_SIZE_LIMIT'):
                     raise CapacityError('CATALOG_CAPACITY') from None
                 raise
             rs.require(current == index, 'PORTAL_OUTPUT_COLLISION')
-            portal._generation(gen, device, pages, receipt, complete=True)
+            portal._generation(gen, device, pages, receipt, complete=True,
+                               signatures={} if crypto else None)
             _same_entry(fd, generation, gen)
+            if crypto:
+                rs.require(portal._index_stat(fd, device) == index_signature and
+                           portal._file_signature(fd, 'portal.css', device) == css_signature,
+                           'ARTIFACT_CHANGED')
         return 'AVAILABLE', generation
     except CapacityError:
         raise
@@ -464,7 +476,7 @@ def _validate_row(row):
     rs._int(row['missing_artifact_count'], 0, rs.MAX_SLOTS)
     rs.require(rs._match(row['manifest_sha256'], rs.HEX), 'INVALID_CATALOG')
     if pstatus == 'AVAILABLE':
-        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3'))
+        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3', 'portal-v4'))
         rs.require(row['href'] == rid + '/index.html' and row['reason_code'] == 'PUBLISHED', 'INVALID_CATALOG')
     else:
         rs.require(pstatus in ('NOT_GENERATED', 'INVALID') and row['portal_generation'] is None and

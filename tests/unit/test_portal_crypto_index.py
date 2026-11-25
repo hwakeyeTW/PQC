@@ -460,3 +460,543 @@ def test_fixed_openssl_producer_scope_only(published):
     assert indexes._provider_status(active, pc, provider['data']['name'])
     assert not indexes._provider_status(active, dict(pc, scope_key='openssl-kem'), provider['data']['name'])
     assert not indexes._provider_status(dict(active, algorithm=classified('ML-KEM-768', 'KEM_CAPABILITY')), pc, provider['data']['name'])
+
+
+# B-slice: fixed N golden, captured with the unmodified renderer and real
+# multi-host publish_crypto fixture before adding the v4 code.
+N_PORTAL_GOLDEN = {'1': {'index.html': 'a9fa06ad0a902e06265e0d9b270d46ef43b9716da17c85574c75f9714f7b0823',
+       'portal.css': 'f4d7737a3f86617d69542b477a2e4b3775ad113e75d34677a2dc01eb9e24089f',
+       'run_manifest.json': '29ffcb3a7e42bc04398a74bc57bf696735c2e99a20d526c0df7ef0f2dccf8f93'},
+ '2': {'index.html': '820fcafe82b88c16e29ec84d39e9f94b71b217fab402e3a83400caf43f6aa1e0',
+       'portal-v2/h-6d2ff9a0eef70ae56bdc5a87219edc8e8fd64b0ab5daa25c7060278f2ff29ab5.html': 'f851e2588ac288779f08e43c67e5194b37b49ff7f4118b22531580b640d0429b',
+       'portal-v2/h-d8e5f515397f29bc313a3fe0a24f704c474b33e1b2deca64e4e3586479957f7f.html': '1561eec2c5879163c0a3c688ef3cc708a98b0b814980586599658270ee80a823',
+       'portal-v2/hosts.html': 'b8c8766db6a5c16c7ff3e5eb44e9a68d5218b2a4b9d96fc5d9e9b4d07e35bf5e',
+       'portal-v2/portal_receipt.json': 'e582d61f8aaefdea37cdaeb94e651a5d8db3117239f0984721da4e36817bc1c7',
+       'portal.css': 'f4d7737a3f86617d69542b477a2e4b3775ad113e75d34677a2dc01eb9e24089f',
+       'run_manifest.json': '29ffcb3a7e42bc04398a74bc57bf696735c2e99a20d526c0df7ef0f2dccf8f93'},
+ '3': {'index.html': '01de7f3558dfb4a306289f9fa0031ecc4cedea5bd879aacbf545ab12d73a3f5f',
+       'portal-v3/h-6d2ff9a0eef70ae56bdc5a87219edc8e8fd64b0ab5daa25c7060278f2ff29ab5.html': '53a60f8ef45e0bcc4cfd44bffe4620d00c9cb75c8b7bc292b00fabcdfd431649',
+       'portal-v3/h-d8e5f515397f29bc313a3fe0a24f704c474b33e1b2deca64e4e3586479957f7f.html': '9d62d3c15939c2c5d5f74f8be975acf5b5bb61658261d38ba68cc8ae46f96704',
+       'portal-v3/hosts.html': '25a520f24075663e9363c52675c03b8272510c9d08a37d91fc6f8b7adb7cf578',
+       'portal-v3/portal_receipt.json': '66e7a0bab73f6a2fc371f6d25c0154ec39b40f9af219754912f37bb56c6b1c9e',
+       'portal.css': 'f4d7737a3f86617d69542b477a2e4b3775ad113e75d34677a2dc01eb9e24089f',
+       'run_manifest.json': '29ffcb3a7e42bc04398a74bc57bf696735c2e99a20d526c0df7ef0f2dccf8f93'}}
+
+# Publication tests reuse the actual Store fixtures and the original parsers.
+import errno
+import fcntl
+import os
+import shutil
+import stat
+import time
+from collections import defaultdict
+from contextlib import contextmanager
+from itertools import product
+
+import test_run_catalog as history_tests
+from test_portal_navigation import NavigationPage
+from tools import run_catalog as cat
+
+V4 = 'portal-v4'
+V4_JSON = 'crypto_indexes.json'
+V4_RECEIPT = 'portal_receipt.json'
+
+
+def assert_v4_publication(root, pub):
+    rid = pub.manifest['run_id']; run = root / rid; gen = run / V4
+    names = {'hosts.html', 'algorithms.html', 'libraries.html', V4_JSON,
+             *(hid + '.html' for hid in pub.manifest['expected_host_ids'])}
+    assert set(p.name for p in gen.iterdir()) == names | {V4_RECEIPT}
+    assert stat.S_IMODE(gen.stat().st_mode) == 0o700
+    index = run / 'index.html'; css = run / 'portal.css'
+    assert index.read_bytes().startswith(b'<!-- PQC portal-v4 -->\n')
+    def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+    assert json.loads((gen / V4_RECEIPT).read_bytes()) == {
+        'format': 4, 'run_id': rid, 'manifest_sha256': digest(run / 'run_manifest.json'),
+        'index_sha256': digest(index), 'css_sha256': digest(css),
+        'pages': [{'name': n, 'size': (gen / n).stat().st_size, 'sha256': digest(gen / n)} for n in sorted(names)]}
+    for path in [index, css, *gen.iterdir()]:
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600
+        assert info.st_uid == os.geteuid() and info.st_nlink == 1
+    expected, original_pages = indexes.render_crypto_indexes(pub)
+    data = (gen / V4_JSON).read_bytes()
+    assert json.loads(data) == expected
+    assert data == json.dumps(expected, ensure_ascii=True, sort_keys=True,
+                              separators=(',', ':'), allow_nan=False).encode('ascii')
+    assert all((gen / name).read_bytes() == content for name, content in original_pages.items())
+    pages = {index: NavigationPage(index), **{gen / n: NavigationPage(gen / n) for n in names if n.endswith('.html')}}
+    allowed = set(pages) | {root / 'index.html', css, gen / V4_JSON, *(run / p for p in pub.artifacts)}
+    for path, page in pages.items():
+        assert ('../index.html' if path == index else '../../index.html') in page.links
+        assert not any(tag in {'script', 'iframe', 'object', 'embed', 'base', 'form'} or
+                       any(k.startswith('on') or k in ('src', 'srcset', 'action', 'style') for k in attrs)
+                       for tag, attrs in page.tags)
+        for href in page.links:
+            u = urlsplit(href)
+            assert not u.scheme and not u.netloc and not u.query and not u.path.startswith('/')
+            assert '\\' not in href and '%' not in u.path
+            dest = (path.parent / u.path).resolve() if u.path else path
+            assert dest in allowed and dest.is_file(), (path.name, href)
+            if u.fragment:
+                assert dest in pages and u.fragment in pages[dest].ids, (path.name, href)
+    assert {V4 + '/' + name for name in names} <= set(pages[index].links)
+    backwards = defaultdict(set)
+    # Independent oracle: use actual emitted A group and reference sets,
+    # not the new renderer's reverse map or its counts.
+    for name in ('algorithms', 'libraries'):
+        page = pages[gen / (name + '.html')]; data = expected[name]
+        for key, count in data['counts'].items():
+            assert int(page.text['count-' + key]) == count
+        assert {ident for ident in page.ids if ident.startswith(('alg-', 'lib-'))} == {g['id'] for g in data['groups']}
+        for group in data['groups']:
+            href = group['backlink']
+            for field, registry in (('host_ids', 'hosts'), ('asset_ids', 'assets'),
+                                    ('evidence_ids', 'evidence'), ('claim_ids', 'claims')):
+                for ref in group[field]:
+                    assert expected[registry][ref]['href'] in page.references[group['id']]
+                    backwards[ref].add(href)
+            assert {x for x in page.references[group['id']] if x.startswith(('algorithms.html#', 'libraries.html#'))} == {
+                r['href'] for r in group['relations']}
+        for cid in data['unresolved_claim_ids']:
+            claim = expected['claims'][cid]
+            ref_ids = [cid, claim['subject']['host_id'], *claim['evidence_ids']]
+            if claim['subject'].get('asset_id') is not None:
+                ref_ids.append(claim['subject']['asset_id'])
+            for ref in ref_ids:
+                backwards[ref].add(name + '.html#unresolved-claims')
+    for hid in pub.manifest['expected_host_ids']:
+        page = pages[gen / (hid + '.html')]
+        assert {'algorithms.html', 'libraries.html', V4_JSON, '../index.html#' + hid,
+                'hosts.html#' + hid} <= set(page.links)
+        all_anchors = [hid] + [r[e.REGISTRIES[k]] for k in ('assets', 'evidence')
+                               for r in pub.document[k] if r['host_id'] == hid] + [
+            r['claim_id'] for r in (pub.assessed or {}).get('claims', []) if r['subject']['host_id'] == hid]
+        for ref in all_anchors:
+            assert ref in page.ids
+            actual = {x for x in page.references[ref] if x.startswith(('algorithms.html#', 'libraries.html#'))}
+            assert actual == backwards[ref], ref
+    with rs.RunStore(root) as store:
+        assert store.open(rid) == pub
+    return expected
+
+
+def assert_old_unchanged(run, before):
+    assert {k: v for k, v in history_tests.tree_bytes(run).items()
+            if k != 'index.html' and not k.startswith(V4 + '/')} == {
+        k: v for k, v in before.items() if k != 'index.html'}
+
+
+@pytest.mark.parametrize('version', [1, 2, 3])
+def test_v4_fixed_n_golden_and_explicit_upgrade(root, version):
+    pub = publish_crypto(root); run = root / RID
+    history_tests.v1(root, RID, pub)
+    if version >= 2:
+        portal.render_run(root, RID, refresh_portal=True)
+    if version == 3:
+        cat.build_catalog(root)
+        portal.render_run(root, RID, refresh_portal=True, with_history=True)
+    assert {name: hashlib.sha256((run / name).read_bytes()).hexdigest()
+            for name in N_PORTAL_GOLDEN[str(version)]} == N_PORTAL_GOLDEN[str(version)]
+    cat.build_catalog(root)
+    old_catalog = history_tests.catalog_state(root)
+    old_generation = cat.check_catalog(root)
+    before = history_tests.tree_bytes(run)
+    rc = history_tests.render_cli(root, RID, '--with-crypto-indexes')
+    assert (rc.returncode, rc.stdout, rc.stderr) == (1, b'', b'PORTAL_OUTPUT_COLLISION\n')
+    assert history_tests.tree_bytes(run) == before and not (run / V4).exists()
+    flags = ['--with-crypto-indexes', '--refresh-portal']
+    if version == 3:
+        flags += ['--with-history']
+    rc = history_tests.render_cli(root, RID, *flags)
+    assert (rc.returncode, rc.stdout, rc.stderr) == (0, b'PORTAL_RENDERED\n', b'')
+    assert (run / 'index.html').stat().st_ino != before['index.html'][1]
+    assert_old_unchanged(run, before)
+    assert history_tests.catalog_state(root) == old_catalog
+    assert cat.check_catalog(root) == old_generation
+    assert history_tests.data(root)['rows'][0]['portal_generation'] == f'portal-v{version}'
+    assert_v4_publication(root, pub)
+    cat.build_catalog(root)
+    result = history_tests.assert_html_snapshot(root)
+    assert result['rows'][0]['portal_generation'] == V4 and result['rows'][0]['href'] == RID + '/index.html'
+    assert history_tests.tree_bytes(root / cat.GENERATIONS / old_generation) == {
+        k.split('/', 1)[1]: v for k, v in old_catalog[2].items() if k.startswith(old_generation + '/')}
+
+
+def test_v4_fresh_single_projection_and_unresolved_backlinks(root, monkeypatch):
+    actual = populate
+    def with_ambiguous_claim(doc, host, second):
+        actual(doc, host, second)
+        alg = classified('ML-KEM-512', 'KEM_CAPABILITY')
+        # Same exact saved claim context, two conflicting stored taxonomies.
+        # A must leave the resulting saved claim unresolved.
+        add_scope(doc, host, 'openssl', 'fixture-ambiguous-claim', [
+            runtime('one', alg, True, capability='same-fact'),
+            runtime('two', dict(alg, primitive='SIGNATURE', family='CLASSICAL'), True, capability='same-fact')])
+    monkeypatch.setattr(sys.modules[__name__], 'populate', with_ambiguous_claim)
+    cat.build_catalog(root)  # a coherent empty snapshot, no current run row
+    before_cat = history_tests.catalog_state(root)
+    pub = publish_crypto(root); run = root / RID
+    before = history_tests.tree_bytes(run); calls = []
+    original = indexes.render_crypto_indexes
+    def render(published):
+        assert published == pub
+        out = original(published); calls.append(out)
+        return out
+    with monkeypatch.context() as m:
+        m.setattr(indexes, 'render_crypto_indexes', render)
+        portal.render_run(root, RID, with_crypto_indexes=True, with_history=True)
+    assert len(calls) == 1
+    assert not (run / 'portal-v2').exists() and not (run / 'portal-v3').exists()
+    assert json.loads((run / V4 / V4_JSON).read_bytes()) == calls[0][0]
+    assert all((run / V4 / n).read_bytes() == b for n, b in calls[0][1].items())
+    assert calls[0][0]['algorithms']['unresolved_claim_ids']
+    assert history_tests.catalog_state(root) == before_cat
+    assert all(history_tests.tree_bytes(run)[k] == v for k, v in before.items())
+    assert_v4_publication(root, pub)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'one-slot', 'corrupt'])
+def test_v4_catalog_precondition_eight_flag_noop(root, monkeypatch, fault):
+    pub = history_tests.publish(root, monkeypatch, 'first'); run = root / 'first'
+    original = history_tests.tree_bytes(run)
+    assert history_tests.render_cli(root, 'first', '--with-crypto-indexes').returncode == 1
+    assert not (root / cat.LOCK).exists() and history_tests.tree_bytes(run) == original
+    cat.build_catalog(root)
+    second = history_tests.publish(root, monkeypatch, 'new'); target = root / 'new'
+    rc = history_tests.render_cli(root, 'new', '--with-crypto-indexes')
+    assert (rc.returncode, rc.stdout, rc.stderr) == (0, b'PORTAL_RENDERED\n', b'')
+    assert_v4_publication(root, second)
+    if fault == 'missing':
+        for name in (cat.HTML, cat.JSON, cat.LOCK): (root / name).unlink()
+        shutil.rmtree(root / cat.GENERATIONS)
+    elif fault == 'one-slot': (root / cat.HTML).unlink()
+    else: history_tests.put(root / cat.JSON, b'foreign')
+    before = tree_state(root)
+    for refresh, history, crypto in product((False, True), repeat=3):
+        assert portal.render_run(root, 'new', refresh_portal=refresh, with_history=history,
+                                 with_crypto_indexes=crypto) == target / 'index.html'
+        assert tree_state(root) == before
+    assert history_tests.render_cli(root, 'first', '--with-crypto-indexes').returncode == 1
+    assert tree_state(root) == before
+    with pytest.raises(rs.StoreError, match='INVALID_CRYPTO_INDEXES_FLAG'):
+        portal.render_run(root, 'first', with_crypto_indexes=1)
+    assert history_tests.render_cli(root, 'first', '--with-crypto-index').returncode == 2
+    portal.render_run(root, 'first')
+    assert (run / 'portal-v2' / V4_RECEIPT).is_file() and not (run / V4).exists()
+
+
+def test_v4_legacy_recovered_error_relative_relocation(root, monkeypatch):
+    pubs = {'legacy': history_tests.legacy(root, 'legacy'),
+            'recovered': history_tests.recover(root, monkeypatch, 'recovered'),
+            'error': history_tests.publish(root, monkeypatch, 'error', ('ERROR',))}
+    cat.build_catalog(root)
+    before = {rid: history_tests.tree_bytes(root / rid) for rid in pubs}
+    for rid in pubs:
+        portal.render_run(root, rid, with_crypto_indexes=True)
+    cat.build_catalog(root)
+    for rid, pub in pubs.items():
+        assert all(history_tests.tree_bytes(root / rid)[k] == v for k, v in before[rid].items())
+        data = assert_v4_publication(root, pub)
+        assert data['relations'] == []
+    moved = root.parent / 'reports moved \u6e2c\u8a66'; root.rename(moved)
+    for rid, pub in pubs.items():
+        assert_v4_publication(moved, pub)
+    assert all(r['portal_generation'] == V4 for r in history_tests.assert_html_snapshot(moved)['rows'])
+
+
+@pytest.mark.parametrize('fault', ['json', 'receipt', 'missing', 'extra', 'symlink', 'hardlink', 'mode', 'marker'])
+def test_v4_invalid_reference_mixed_valid_run(root, monkeypatch, fault):
+    cat.build_catalog(root)
+    pub = history_tests.publish(root, monkeypatch, 'bad')
+    good = history_tests.publish(root, monkeypatch, 'good')
+    portal.render_run(root, 'good', with_crypto_indexes=True)
+    run = root / 'bad'; gen = run / V4
+    portal.render_run(root, 'bad', with_crypto_indexes=True)
+    path = gen / V4_JSON
+    if fault == 'json': history_tests.put(path, b'{}')
+    elif fault == 'receipt': history_tests.put(gen / V4_RECEIPT, b'{}')
+    elif fault == 'missing': path.unlink()
+    elif fault == 'extra': history_tests.put(gen / 'foreign.html', b'foreign')
+    elif fault == 'symlink':
+        path.unlink(); path.symlink_to(root / 'good' / V4 / V4_JSON)
+    elif fault == 'hardlink':
+        other = root.parent / 'external'; os.link(path, other)
+    elif fault == 'mode': path.chmod(0o644)
+    else: history_tests.put(run / 'index.html', portal._CRYPTO_MARKER)
+    old_index = (run / 'index.html').read_bytes()
+    for flags in ({}, {'with_crypto_indexes': True, 'refresh_portal': True}):
+        with pytest.raises(rs.StoreError): portal.render_run(root, 'bad', **flags)
+        assert (run / 'index.html').read_bytes() == old_index
+    rc = history_tests.cli(root)
+    assert rc.returncode == 0, rc.stderr
+    rows = {r['run_id']: r for r in history_tests.assert_html_snapshot(root)['rows']}
+    assert rows['good']['portal_status'] == 'AVAILABLE' and rows['good']['portal_generation'] == V4
+    assert rows['bad']['publication_status'] == 'PUBLISHED' and rows['bad']['portal_status'] == 'INVALID'
+    assert rows['bad']['href'] is None and rows['bad']['portal_generation'] is None
+    assert_v4_publication(root, good)
+
+
+def test_v4_unreferenced_generations_not_opened(root, monkeypatch):
+    cat.build_catalog(root)
+    for version in (1, 2, 3, 4):
+        rid = f'v{version}'; pub = history_tests.publish(root, monkeypatch, rid); run = root / rid
+        if version == 1: history_tests.v1(root, rid, pub)
+        else: portal.render_run(root, rid, with_history=version == 3, with_crypto_indexes=version == 4)
+        if version != 4:
+            (run / V4).mkdir(mode=0o700)
+            path = history_tests.put(run / V4 / V4_JSON, b'')
+            history_tests.sparse(path, portal._MAX_CRYPTO_JSON + 1)
+        else:
+            for name in ('portal-v2', 'portal-v3'): (run / name).symlink_to(root.parent / 'missing')
+    original = rs._open_dir
+    def safe_open(fd, name, device, **kwargs):
+        parent = Path(os.readlink(f'/proc/self/fd/{fd}')).name
+        assert (parent, name) not in {('v1', V4), ('v2', V4), ('v3', V4), ('v4', 'portal-v2'), ('v4', 'portal-v3')}
+        return original(fd, name, device, **kwargs)
+    monkeypatch.setattr(rs, '_open_dir', safe_open)
+    cat.build_catalog(root)
+    assert {r['run_id']: r['portal_generation'] for r in history_tests.data(root)['rows']} == {f'v{n}': f'portal-v{n}' for n in (1,2,3,4)}
+    for rid in ('v2', 'v3', 'v4'): portal.render_run(root, rid)
+
+
+def test_v4_json_separate_cap_and_exact_admission(root, monkeypatch):
+    pub = publish_crypto(root); run = root / RID
+    cat.build_catalog(root); portal.render_run(root, RID, with_crypto_indexes=True)
+    gen = run / V4
+    html = [run / 'index.html', *gen.glob('*.html')]
+    # Real fixture JSON exceeds every individual HTML page. Lower only the
+    # test HTML cap; this must not cap JSON or add JSON to total HTML.
+    max_page = max(p.stat().st_size for p in html)
+    json_size = (gen / V4_JSON).stat().st_size
+    assert json_size > max_page
+    monkeypatch.setattr(portal, '_MAX_HTML', max_page)
+    monkeypatch.setattr(portal, '_MAX_TOTAL_HTML', sum(p.stat().st_size for p in html))
+    admitted = (sum(a['size'] for a in pub.manifest['artifacts']) +
+                sum((run / n).stat().st_size for n in ('run_manifest.json', 'journal.json', 'portal.css', 'index.html')) +
+                sum(p.stat().st_size for p in gen.iterdir()))
+    monkeypatch.setattr(cat, 'MAX_ADMITTED', admitted)
+    cat.build_catalog(root)
+    assert history_tests.data(root)['rows'][0]['portal_generation'] == V4
+    portal.render_run(root, RID)
+    before = history_tests.catalog_state(root)
+    monkeypatch.setattr(cat, 'MAX_ADMITTED', admitted - 1)
+    with pytest.raises(cat.CapacityError, match='CATALOG_CAPACITY'): cat.build_catalog(root)
+    assert history_tests.catalog_state(root) == before
+
+
+@pytest.mark.parametrize('fault', ['json', 'html', 'total', 'generated-json', 'generated-page'])
+def test_v4_capacity_refuses_whole_catalog(root, monkeypatch, fault):
+    cat.build_catalog(root)
+    history_tests.publish(root, monkeypatch, 'run'); run = root / 'run'; gen = run / V4
+    portal.render_run(root, 'run', with_crypto_indexes=True); cat.build_catalog(root)
+    old = history_tests.catalog_state(root); old_gen = cat.check_catalog(root)
+    path = gen / (V4_JSON if fault == 'json' else 'algorithms.html')
+    if fault == 'json': history_tests.sparse(path, portal._MAX_CRYPTO_JSON + 1)
+    elif fault == 'html': history_tests.sparse(path, portal._MAX_HTML + 1)
+    elif fault == 'total':
+        monkeypatch.setattr(portal, '_MAX_TOTAL_HTML', (run / 'index.html').stat().st_size + sum(
+            p.stat().st_size for p in gen.glob('*.html')) - 1)
+    elif fault == 'generated-json': monkeypatch.setattr(indexes, '_MAX_JSON', 1)
+    else: monkeypatch.setattr(indexes, '_MAX_HTML', 1)
+    actual = rs._read
+    def read(fd, name, device, limit, *args, **kwargs):
+        if fault in ('json', 'html'):
+            assert not (Path(os.readlink(f'/proc/self/fd/{fd}')).name == V4 and name == path.name)
+        return actual(fd, name, device, limit, *args, **kwargs)
+    def unrelated(*args, **kwargs): raise AssertionError('unreferenced renderer')
+    monkeypatch.setattr(rs, '_read', read)
+    for name in ('_render', '_render_v2', '_render_v3'): monkeypatch.setattr(portal, name, unrelated)
+    for recover in (False, True):
+        with pytest.raises(cat.CapacityError, match='CATALOG_CAPACITY'): cat.build_catalog(root, recover=recover)
+        assert history_tests.catalog_state(root) == old
+    assert cat.check_catalog(root) == old_gen
+
+
+@pytest.mark.parametrize('kind', ['json', 'total', 'page', 'receipt'])
+def test_v4_generated_cap_before_write(root, monkeypatch, kind):
+    cat.build_catalog(root); history_tests.publish(root, monkeypatch, 'run')
+    before = tree_state(root)
+    owner, field = {'json': (portal, '_MAX_CRYPTO_JSON'), 'total': (portal, '_MAX_TOTAL_HTML'),
+                    'page': (portal, '_MAX_HTML'), 'receipt': (portal, '_MAX_RECEIPT')}[kind]
+    monkeypatch.setattr(owner, field, 1)
+    with pytest.raises(rs.StoreError, match='SIZE_LIMIT'):
+        portal.render_run(root, 'run', with_crypto_indexes=True)
+    assert tree_state(root) == before
+
+
+def test_v4_lock_order_shared_through_switch(root, monkeypatch):
+    history_tests.publish(root, monkeypatch, 'run'); run = root / 'run'
+    cat.build_catalog(root); portal.render_run(root, 'run', with_history=True)
+    before = history_tests.catalog_state(root); seen = []
+    real_context, real_render, real_replace = cat._history_root, portal._render_v4, os.replace
+    def probe(path, held):
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            if held:
+                with pytest.raises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally: os.close(fd)
+    @contextmanager
+    def context(report_root):
+        probe(run / '.writer.lock', False); seen.append('run-released')
+        with real_context(report_root) as value: yield value
+    def render(*args):
+        probe(root / cat.LOCK, True); seen.append('render-held')
+        return real_render(*args)
+    def replace(src, dst, **kwargs):
+        if dst == 'index.html':
+            probe(root / cat.LOCK, True); probe(run / '.writer.lock', True); seen.append('switch-held')
+        return real_replace(src, dst, **kwargs)
+    monkeypatch.setattr(cat, '_history_root', context); monkeypatch.setattr(portal, '_render_v4', render)
+    monkeypatch.setattr(os, 'replace', replace)
+    portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    assert seen == ['run-released', 'render-held', 'switch-held']
+    probe(root / cat.LOCK, False); probe(run / '.writer.lock', False)
+    assert history_tests.catalog_state(root) == before
+
+
+def test_v4_actual_lock_contention_and_independent_noop(root, monkeypatch):
+    cat.build_catalog(root)
+    for rid in ('old', 'new', 'default'): history_tests.publish(root, monkeypatch, rid)
+    portal.render_run(root, 'old', with_crypto_indexes=True)
+    before = history_tests.tree_bytes(root / 'new'); old = history_tests.tree_bytes(root / 'old')
+    fd = os.open(root / cat.LOCK, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); start = time.monotonic()
+        p = history_tests.render_cli(root, 'new', '--with-crypto-indexes')
+        assert (p.returncode, p.stdout, p.stderr) == (1, b'', b'RUN_BUSY\n')
+        assert 4.5 <= time.monotonic() - start < 20
+        portal.render_run(root, 'old', with_crypto_indexes=True, refresh_portal=True)
+        portal.render_run(root, 'default')
+        assert history_tests.tree_bytes(root / 'old') == old
+    finally: os.close(fd)
+    with rs.RunStore(root) as store, store._locked_run('new', shared=False):
+        with pytest.raises(rs.StoreError, match='RUN_BUSY'):
+            portal.render_run(root, 'new', with_crypto_indexes=True)
+    assert history_tests.tree_bytes(root / 'new') == before
+
+
+@pytest.mark.parametrize('fault', ['root', 'catalog-lock', 'stable-slot', 'run-lock', 'core'])
+def test_v4_identity_drift_refuses_before_output(root, monkeypatch, fault):
+    pub = history_tests.publish(root, monkeypatch, 'run'); run = root / 'run'
+    cat.build_catalog(root); portal.render_run(root, 'run', with_history=True)
+    before = history_tests.tree_bytes(run); actual = portal._render_v4
+    moved = root.parent / 'old-root'
+    def render(*args):
+        out = actual(*args)
+        if fault == 'root': root.rename(moved); root.mkdir(mode=0o700)
+        else:
+            path = {'catalog-lock': root / cat.LOCK, 'stable-slot': root / cat.JSON,
+                    'run-lock': run / '.writer.lock', 'core': run / 'evidence.json'}[fault]
+            raw_bytes = path.read_bytes(); path.rename(root.parent / 'old-inode'); history_tests.put(path, raw_bytes)
+        return out
+    monkeypatch.setattr(portal, '_render_v4', render)
+    with pytest.raises(rs.StoreError):
+        portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    target = moved / 'run' if fault == 'root' else run
+    assert not (target / V4).exists()
+    assert (target / 'index.html').read_bytes() == before['index.html'][0]
+
+
+@pytest.mark.parametrize('boundary', ['page', 'receipt', 'replace', 'durability', 'old-page', 'sealed-json', 'core'])
+def test_v4_upgrade_faults_and_exact_resume(root, monkeypatch, boundary):
+    pub = history_tests.publish(root, monkeypatch, 'run', ('COMPLETE', 'PARTIAL')); run = root / 'run'
+    cat.build_catalog(root); portal.render_run(root, 'run', with_history=True)
+    original = history_tests.tree_bytes(run); old_index = original['index.html'][0]
+    old_catalog = history_tests.catalog_state(root); gen = run / V4
+    real_write, real_replace, real_sync = rs._write, os.replace, rs._sync
+    switched = False
+    def write(fd, name, content, device, **kwargs):
+        if boundary == 'page' and name == V4_JSON: raise rs.StoreError('FIXTURE_INTERRUPTION')
+        if boundary == 'receipt' and name == V4_RECEIPT: raise rs.StoreError('FIXTURE_INTERRUPTION')
+        result = real_write(fd, name, content, device, **kwargs)
+        if name == V4_RECEIPT:
+            if boundary == 'old-page':
+                path = run / 'portal-v3' / 'hosts.html'; raw_bytes = path.read_bytes()
+                path.rename(root.parent / 'old-page'); history_tests.put(path, raw_bytes)
+            if boundary == 'sealed-json': history_tests.put(gen / V4_JSON, b'{}')
+            if boundary == 'core':
+                path = run / 'evidence.json'; raw_bytes = path.read_bytes()
+                path.rename(root.parent / 'old-core'); history_tests.put(path, raw_bytes)
+        assert (run / 'index.html').read_bytes() == old_index
+        return result
+    def replace(src, dst, **kwargs):
+        nonlocal switched
+        if dst == 'index.html':
+            assert (gen / V4_RECEIPT).is_file() and (gen / V4_JSON).is_file()
+            if boundary == 'replace': raise OSError(errno.EIO, 'fixture interruption')
+            real_replace(src, dst, **kwargs); switched = True
+        else: return real_replace(src, dst, **kwargs)
+    def sync(fd):
+        if boundary == 'durability' and switched: raise rs.StoreError('DURABILITY_UNCONFIRMED')
+        return real_sync(fd)
+    with monkeypatch.context() as m:
+        m.setattr(rs, '_write', write); m.setattr(os, 'replace', replace); m.setattr(rs, '_sync', sync)
+        with pytest.raises(rs.StoreError):
+            portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    assert switched == (boundary == 'durability')
+    assert ((run / 'index.html').read_bytes() != old_index) == switched
+    assert history_tests.catalog_state(root) == old_catalog and not list(run.glob('.portal-index-*'))
+    staged = history_tests.tree_bytes(gen)
+    if boundary == 'sealed-json':
+        with pytest.raises(rs.StoreError): portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+        assert history_tests.tree_bytes(gen) == staged
+    elif boundary in ('old-page', 'core'):
+        # The interrupted invocation refused even a same-byte inode change.
+        # The new invocation has its own independent exact preflight.
+        assert not switched
+    else:
+        portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+        assert_v4_publication(root, pub)
+        assert all(history_tests.tree_bytes(gen)[k] == v for k, v in staged.items())
+        assert_old_unchanged(run, original)
+
+
+def test_v4_incomplete_sealed_staging_refuses_upgrade(root, monkeypatch):
+    history_tests.publish(root, monkeypatch, 'run'); run = root / 'run'
+    cat.build_catalog(root); portal.render_run(root, 'run')
+    original = os.replace
+    def interrupt(src, dst, **kwargs):
+        if dst == 'index.html': raise OSError(errno.EIO, 'fixture interruption')
+        return original(src, dst, **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(os, 'replace', interrupt)
+        with pytest.raises(rs.StoreError): portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    gen = run / V4; assert (gen / V4_RECEIPT).exists()
+    (gen / V4_JSON).unlink(); before = tree_state(root)
+    with pytest.raises(rs.StoreError): portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    assert tree_state(root) == before
+
+
+def test_v4_fresh_index_last_interruption_resume(root, monkeypatch):
+    cat.build_catalog(root); pub = history_tests.publish(root, monkeypatch, 'run')
+    run = root / 'run'; gen = run / V4; original = history_tests.tree_bytes(run)
+    cat_before = history_tests.catalog_state(root); actual = rs._write
+    def write(fd, name, content, device, **kwargs):
+        if name == 'index.html':
+            assert (gen / V4_RECEIPT).is_file() and (gen / V4_JSON).is_file()
+            assert not (run / 'index.html').exists()
+            raise rs.StoreError('FIXTURE_INTERRUPTION')
+        return actual(fd, name, content, device, **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(rs, '_write', write)
+        with pytest.raises(rs.StoreError, match='FIXTURE_INTERRUPTION'):
+            portal.render_run(root, 'run', with_crypto_indexes=True)
+    staged = history_tests.tree_bytes(gen)
+    assert not (run / 'index.html').exists() and history_tests.catalog_state(root) == cat_before
+    portal.render_run(root, 'run', with_crypto_indexes=True)
+    assert_v4_publication(root, pub)
+    assert history_tests.tree_bytes(gen) == staged
+    assert all(history_tests.tree_bytes(run)[k] == v for k, v in original.items())
+
+
+@pytest.mark.parametrize('version', [2, 3])
+def test_v4_refuses_corrupt_referenced_old_generation(root, monkeypatch, version):
+    cat.build_catalog(root); history_tests.publish(root, monkeypatch, 'run'); run = root / 'run'
+    portal.render_run(root, 'run', with_history=version == 3)
+    history_tests.put(run / f'portal-v{version}' / V4_RECEIPT, b'{}')
+    before = tree_state(root)
+    with pytest.raises(rs.StoreError, match='PORTAL_OUTPUT_COLLISION'):
+        portal.render_run(root, 'run', refresh_portal=True, with_crypto_indexes=True)
+    assert tree_state(root) == before and not (run / V4).exists()
