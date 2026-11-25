@@ -68,7 +68,26 @@ particular the Ansible default multiplexing options and implicit OpenSSH
 config loading are not accepted in this candidate. The exact effective
 OpenSSH configuration is intended to be checked using bounded native
 `ssh -G` for the destination and jump hosts; without that native evidence
-preflight must remain closed. The code does not assert a 15-second complete
+preflight must remain closed.
+
+For the allowed explicit `-F` subset, the bounded validated raw bytes and
+fingerprint are bound to a fresh private snapshot for each effective-config
+proof. A worker-created 0700 directory and exclusive 0600 regular file under
+the fixed trusted `/tmp` root hold the exact bytes (no re-rendering). No
+Inventory, CLI or environment setting selects this snapshot path. Only the assessment's `-F` value is substituted, for the
+destination and every ProxyJump consumer; the original native argv/path and
+fingerprint remain in the connection binding. The existing absolute-path
+and restricted syntax checks exclude Include, Match exec and relative
+identity/known-hosts paths, so no new config-relative semantics are introduced.
+At the native boundary, a changed original argv or fingerprint is denied
+before re-evaluation. The source is checked before consumers and at completion.
+Persistent source drift denies the proof; even if a transient edit is restored, a child
+can read only the validated snapshot, never the edited original pathname.
+Snapshots are removed before proof return, including on rejection, exception
+and bounded-command timeout; creation or reported cleanup failure denies the
+proof. This assumes the original trusted controller worker/UID and system
+paths, not hostile code with its privileges or cleanup after SIGKILL.
+The code does not assert a 15-second complete
 handshake/chain deadline or 30-second remote command termination; those
 are required S2 work. It also cannot guarantee DNS aliases are never local,
 configuration files cannot be changed by the trusted controller administrator,
@@ -94,6 +113,13 @@ a proof of actual OpenSSH option consumption. A separate required test must
 exercise real `ssh -G` on the synthetic configuration and then the guarded
 native boundary. If OpenSSH is absent, the test confirms fail-closed and
 records NOT_TESTED; this is an S1-02 HOLD, not a successful S1 acceptance.
+The validated-snapshot cases use actual bounded synthetic child file reads
+at each destination/jump consumer, test permanent and transient edits and
+verify byte-for-byte input, mode, unchanged argv options/order, cleanup and
+fail-closed behavior. The native guard case retains the actual Ansible
+context/argv and terminal `_run` stop while substituting synthetic `-G`
+records and the fixed-binary availability check in the test only. These
+cases do not replace the required real OpenSSH effective-config proof.
 The existing plan-only CLI gets one directly relevant synthetic check; no
 historical full-suite rerun is required. Any release/production validation
 remains Issue #28. S2 cannot start until the S1 proof gap is closed and the

@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import stat
+import tempfile
 import time
 
 
@@ -330,7 +331,7 @@ def _args(tokens):
     return configs[0], tuple(options)
 
 
-def _config(path):
+def _config_bytes(path):
     # Explicit -F avoids implicit user/system Include/Match exec. A config
     # outside this initial audited subset is denied, never edited.
     p = Path(path)
@@ -352,9 +353,57 @@ def _config(path):
                 require(parts[1] == '*' or _scope.HOST.fullmatch(parts[1]), 4, 'SSH_CONFIG_UNVERIFIED')
             else:
                 _option(*parts)
-        return hashlib.sha256(raw).hexdigest()
+        return raw
     except (OSError, UnicodeError, ValueError):
         raise Denied(4, 'SSH_CONFIG_UNVERIFIED') from None
+
+
+def _config(path):
+    return hashlib.sha256(_config_bytes(path)).hexdigest()
+
+
+@contextlib.contextmanager
+def _validated_snapshot(path, fingerprint):
+    # Bind the bounded, validated read to what OpenSSH will actually open.
+    # Reopening the original pathname after a hash check is not safe: a
+    # transient edit can disappear before a subsequent hash check.
+    raw = _config_bytes(path)
+    require(hashlib.sha256(raw).hexdigest() == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix='pqc-ssh-', dir='/tmp')
+    except OSError:
+        raise Denied(4, 'SSH_CONFIG_SNAPSHOT_ERROR') from None
+    try:
+        try:
+            directory = Path(temporary.name)
+            ds = directory.lstat()
+            require(directory.resolve(strict=True) == directory and stat.S_ISDIR(ds.st_mode)
+                    and stat.S_IMODE(ds.st_mode) == 0o700 and ds.st_uid == os.geteuid(),
+                    4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+            snapshot = directory / 'config'
+            # No caller-selected destination, existing file or symlink. This
+            # private file is shared only by the bounded consumers in this
+            # trusted worker, not by inventory/provider or maintenance paths.
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            with os.fdopen(os.open(snapshot, flags, 0o600), 'w+b') as f:
+                fs = os.fstat(f.fileno())
+                require(stat.S_ISREG(fs.st_mode) and stat.S_IMODE(fs.st_mode) == 0o600
+                        and fs.st_uid == os.geteuid() and fs.st_nlink == 1,
+                        4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+                require(f.write(raw) == len(raw), 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+                f.flush()
+                f.seek(0)
+                require(f.read(65537) == raw, 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+        except (OSError, ValueError):
+            raise Denied(4, 'SSH_CONFIG_SNAPSHOT_ERROR') from None
+        yield str(snapshot)
+    finally:
+        # Cleanup must complete before any proof can be returned; errors are
+        # a closed failure, including after a successful final consumer.
+        try:
+            temporary.cleanup()
+        except OSError:
+            raise Denied(4, 'SSH_CONFIG_SNAPSHOT_CLEANUP_FAILED') from None
 
 
 def _native_argv(conn):
@@ -389,6 +438,7 @@ def _effective_ssh(argv, fingerprint):
     # -G evaluates configuration without connecting. The restricted explicit
     # config/argv disallow Match exec, Include, ProxyCommand and forwarding.
     def dump(args):
+        require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
         rc, out, _ = _scope.bounded_command([str(binary), '-G', *args], dict(os.environ),
                                              timeout=5, out_cap=65536, err_cap=65536)
         require(rc == 0, 3, 'OPENSSH_EFFECTIVE_CONFIG_UNAVAILABLE')
@@ -425,25 +475,30 @@ def _effective_ssh(argv, fingerprint):
                 and not entries.get('localforward') and not entries.get('dynamicforward'),
                 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
         return entries, hashlib.sha256(out).hexdigest()
-    args = [x.decode('utf-8') for x in argv[1:-1]]
-    effective, digest = dump(args)
-    jumps = effective.get('proxyjump', ['none'])
-    require(len(jumps) == 1, 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
-    _option('proxyjump', jumps[0])
-    proofs = [digest]
-    if jumps[0] != 'none':
-        for jump in jumps[0].split(','):
-            userhost, port = (jump.rsplit(':', 1) if ':' in jump else (jump, None))
-            user, host = (userhost.split('@', 1) if '@' in userhost else (None, userhost))
-            ja = ['-F', path]
-            if port:
-                ja += ['-o', 'Port=' + port]
-            if user:
-                ja += ['-o', 'User=' + user]
-            j, proof = dump(ja + [host])
-            require(j.get('proxyjump', ['none']) == ['none'], 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
-            proofs.append(proof)
-    require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
+    with _validated_snapshot(path, fingerprint) as snapshot:
+        args = [x.decode('utf-8') for x in argv[1:-1]]
+        # _args validated exactly one separate -F argument. Only the -G
+        # assessment uses the snapshot; retain original native argv/path for
+        # the binding and late-drift guard. Preserve all other options/order.
+        args[args.index('-F') + 1] = snapshot
+        effective, digest = dump(args)
+        jumps = effective.get('proxyjump', ['none'])
+        require(len(jumps) == 1, 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
+        _option('proxyjump', jumps[0])
+        proofs = [digest]
+        if jumps[0] != 'none':
+            for jump in jumps[0].split(','):
+                userhost, port = (jump.rsplit(':', 1) if ':' in jump else (jump, None))
+                user, host = (userhost.split('@', 1) if '@' in userhost else (None, userhost))
+                ja = ['-F', snapshot]
+                if port:
+                    ja += ['-o', 'Port=' + port]
+                if user:
+                    ja += ['-o', 'User=' + user]
+                j, proof = dump(ja + [host])
+                require(j.get('proxyjump', ['none']) == ['none'], 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
+                proofs.append(proof)
+        require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
     return tuple(proofs)
 
 
@@ -485,8 +540,9 @@ class _Context:
             # the native plugin's _run boundary. Never call its original _run.
             for target in self._targets:
                 argv, fingerprint = _native_argv(_native_binding(self, target))
-                require((argv, fingerprint, _effective_ssh(argv, fingerprint)) == self._proofs[target],
-                        4, 'CONNECTION_CONTEXT_DRIFT')
+                expected = self._proofs[target]
+                require((argv, fingerprint) == expected[:2], 4, 'CONNECTION_CONTEXT_DRIFT')
+                require(_effective_ssh(argv, fingerprint) == expected[2], 4, 'CONNECTION_CONTEXT_DRIFT')
             conn = self._bound[name]
             expected = self._proofs[name]
             original = conn._run

@@ -310,3 +310,288 @@ def test_native_cli_extra_vars_denied(native, monkeypatch):
     with pytest.raises(batch.Denied) as error:
         batch._Context(path, request())
     assert error.value.reason == 'NATIVE_CONTEXT_UNVERIFIED' and calls() == []
+
+
+@pytest.fixture
+def snapshot_source(tmp_path):
+    # The ordered Host blocks, whitespace and absolute identity paths are
+    # intentional: the snapshot must copy the validated bytes, not re-render
+    # or interpret the OpenSSH config. All values are synthetic.
+    source = tmp_path / 'source_config'
+    source.write_bytes(b'# ordered configuration\nHost destination.example.invalid\n'
+                       b' User dummy-destination\n IdentityFile /dummy/destination-id\n'
+                       b'Host jump-one.example.invalid\n User dummy-jump\n'
+                       b' IdentityFile /dummy/jump-one-id\nHost *\n'
+                       b' StrictHostKeyChecking yes\n ControlMaster no\n'
+                       b' ConnectTimeout 10\n BatchMode yes\n')
+    argv = (b'ssh', b'-C', b'-o', b'User="dummy-cli"', b'-F', os.fsencode(source),
+            b'-o', b'Port=2222', b'-o',
+            b'ProxyJump=jumpuser@jump-one.example.invalid:2201,jump-two.example.invalid:2202',
+            b'destination.example.invalid', b':')
+    return source, argv
+
+
+@pytest.fixture
+def snapshot_consumer(monkeypatch):
+    # Fixed-binary availability seam only. Never launch OpenSSH in these
+    # cases; the real bounded child reads the actual -F path and returns its
+    # bytes. The synthetic -G output is explicitly NOT an OpenSSH proof.
+    original_is_file = Path.is_file
+    original_access = os.access
+    original_which = batch.shutil.which
+    original_command = batch._scope.bounded_command
+    monkeypatch.setattr(Path, 'is_file', lambda p: str(p) == '/usr/bin/ssh' or original_is_file(p))
+    monkeypatch.setattr(os, 'access', lambda p, *a, **kw: str(p) == '/usr/bin/ssh'
+                        or original_access(p, *a, **kw))
+    monkeypatch.setattr(batch.shutil, 'which', lambda exe, *a, **kw: '/usr/bin/ssh'
+                        if exe in ('ssh', '/usr/bin/ssh') else original_which(exe, *a, **kw))
+    calls = []
+    controls = {'before': lambda i: None, 'after': lambda i: None, 'error': None}
+
+    def consume(argv, env, **limits):
+        if argv[:2] != ['/usr/bin/ssh', '-G']:
+            return original_command(argv, env, **limits)
+        assert limits == {'timeout': 5, 'out_cap': 65536, 'err_cap': 65536}
+        args = argv[2:]
+        p = Path(args[args.index('-F') + 1])
+        i = len(calls)
+        controls['before'](i)
+        try:
+            # Record the exact file a consumer reopened, not just a hash or
+            # the ultimate guard status. No unsafe config is interpreted.
+            code = ('import pathlib,sys; p=pathlib.Path(sys.argv[1]); '
+                    'sys.stdout.buffer.write(p.read_bytes())')
+            rc, raw, err = original_command([sys.executable, '-I', '-B', '-c', code, str(p)],
+                                            env, **limits)
+            assert rc == 0 and not err
+            calls.append((tuple(args), p, raw, p.parent.stat().st_mode & 0o777,
+                          p.stat().st_mode & 0o777, p.stat().st_uid, p.is_symlink()))
+            if controls['error'] is not None:
+                raise controls['error']
+            opts = dict(x.split('=', 1) for x in args if '=' in x)
+            # Fixed, synthetic records exercise the existing output parser;
+            # input option preservation is independently asserted below.
+            fields = {'hostname': args[-1], 'user': opts.get('User', 'dummy').strip('"'),
+                      'port': opts.get('Port', '22'), 'connecttimeout': '10',
+                      'stricthostkeychecking': 'yes', 'controlmaster': 'no',
+                      'controlpersist': 'no', 'canonicalizehostname': 'no',
+                      'batchmode': 'yes', 'forwardagent': 'no', 'forwardx11': 'no',
+                      'permitlocalcommand': 'no', 'identityfile': '/dummy/identity',
+                      'userknownhostsfile': '/dummy/known_hosts',
+                      'globalknownhostsfile': '/dummy/system_known_hosts',
+                      'proxyjump': opts.get('ProxyJump', 'none')}
+            out = ''.join(f'{k} {v}\n' for k, v in fields.items()).encode('ascii')
+            return 0, out, b''
+        finally:
+            controls['after'](i)
+
+    monkeypatch.setattr(batch._scope, 'bounded_command', consume)
+    return calls, controls
+
+
+def _assert_snapshot_calls(calls, source, validated):
+    assert calls
+    for args, p, raw, dm, fm, owner, symlink in calls:
+        assert args.count('-F') == 1 and args[args.index('-F') + 1] == str(p)
+        assert str(source) not in args and p != source
+        assert raw == validated and (dm, fm, owner, symlink) == (0o700, 0o600, os.geteuid(), False)
+        assert not p.exists() and not p.parent.exists()
+
+
+def test_validated_snapshot_preserves_consumer_argv_and_bytes(snapshot_source, snapshot_consumer):
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    validated = source.read_bytes()
+    fingerprint = batch._config(str(source))
+    first = batch._effective_ssh(argv, fingerprint)
+    assert len(first) == len(calls) == 3
+    _assert_snapshot_calls(calls, source, validated)
+    snapshot = calls[0][1]
+    assert all(c[1] == snapshot for c in calls)
+    original_args = [os.fsdecode(x) for x in argv[1:-1]]
+    expected = original_args[:]
+    expected[expected.index('-F') + 1] = str(snapshot)
+    assert calls[0][0] == tuple(expected)
+    assert calls[1][0] == ('-F', str(snapshot), '-o', 'Port=2201', '-o', 'User=jumpuser',
+                           'jump-one.example.invalid')
+    assert calls[2][0] == ('-F', str(snapshot), '-o', 'Port=2202', 'jump-two.example.invalid')
+    assert source.read_bytes() == validated and argv[5] == os.fsencode(source)
+    assert batch._effective_ssh(argv, fingerprint) == first
+    _assert_snapshot_calls(calls, source, validated)
+    assert len(calls) == 6 and calls[3][1] != snapshot
+    assert all(c[1] == calls[3][1] for c in calls[3:])
+
+
+@pytest.mark.parametrize('consumer_index', [0, 1, 2], ids=['destination', 'jump-one', 'jump-two'])
+@pytest.mark.parametrize('transient', [False, True], ids=['permanent', 'transient'])
+def test_snapshot_source_reopen_race(snapshot_source, snapshot_consumer, consumer_index, transient):
+    source, argv = snapshot_source
+    calls, controls = snapshot_consumer
+    validated = source.read_bytes()
+    fingerprint = batch._config(str(source))
+    unsafe = validated + b'Include /dummy/unvalidated.conf\n'
+
+    def before(i):
+        if i == consumer_index:
+            source.write_bytes(unsafe)
+
+    def after(i):
+        if i == consumer_index and transient:
+            source.write_bytes(validated)
+
+    controls.update(before=before, after=after)
+    if transient:
+        # Restoring the source can still satisfy the fingerprint, but no
+        # consumer may ever reopen the transiently unsafe original bytes.
+        assert len(batch._effective_ssh(argv, fingerprint)) == len(calls) == 3
+        assert source.read_bytes() == validated
+    else:
+        with pytest.raises(batch.Denied) as error:
+            batch._effective_ssh(argv, fingerprint)
+        assert error.value.code == 4 and error.value.reason == 'UNSUPPORTED_SSH_OPTION'
+        assert len(calls) == consumer_index + 1  # no further consumer after observed drift
+        assert source.read_bytes() == unsafe
+    _assert_snapshot_calls(calls, source, validated)
+    assert len({c[1] for c in calls}) == 1
+
+
+@pytest.mark.parametrize('unsafe', [False, True], ids=['valid-but-changed', 'unvalidated-include'])
+def test_snapshot_refuses_source_drift_before_first_consumer(snapshot_source, snapshot_consumer, unsafe):
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    fingerprint = batch._config(str(source))
+    source.write_bytes(source.read_bytes() + (b'Include /dummy/unvalidated.conf\n' if unsafe
+                                             else b'# changed source\n'))
+    with pytest.raises(batch.Denied) as error:
+        batch._effective_ssh(argv, fingerprint)
+    assert error.value.code == 4
+    assert error.value.reason == ('UNSUPPORTED_SSH_OPTION' if unsafe else 'CONNECTION_CONTEXT_DRIFT')
+    assert calls == []
+
+
+def test_snapshot_drift_after_validation_before_child(snapshot_source, snapshot_consumer, monkeypatch):
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    validated = source.read_bytes()
+    fingerprint = batch._config(str(source))
+    original = batch.tempfile.TemporaryDirectory
+    paths = []
+
+    def create(*a, **kw):
+        directory = original(*a, **kw)
+        paths.append(Path(directory.name))
+        source.write_bytes(validated + b'# changed after validated read\n')
+        return directory
+
+    monkeypatch.setattr(batch.tempfile, 'TemporaryDirectory', create)
+    with pytest.raises(batch.Denied) as error:
+        batch._effective_ssh(argv, fingerprint)
+    assert error.value.reason == 'CONNECTION_CONTEXT_DRIFT' and calls == []
+    assert len(paths) == 1 and not paths[0].exists()
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'exception', 'interrupt'])
+def test_snapshot_cleanup_on_consumer_failure(snapshot_source, snapshot_consumer, failure):
+    source, argv = snapshot_source
+    calls, controls = snapshot_consumer
+    exc = {'timeout': batch.Denied(3, 'INVENTORY_TIMEOUT'), 'exception': RuntimeError('synthetic'),
+           'interrupt': KeyboardInterrupt()}[failure]
+    controls['error'] = exc
+    validated = source.read_bytes()
+    with pytest.raises(type(exc)) as error:
+        batch._effective_ssh(argv, batch._config(str(source)))
+    assert error.value is exc and len(calls) == 1
+    _assert_snapshot_calls(calls, source, validated)
+    assert source.read_bytes() == validated
+
+
+def test_snapshot_creation_failure_is_closed(snapshot_source, snapshot_consumer, monkeypatch):
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    original = os.open
+    paths = []
+
+    def deny(path, flags, *args, **kwargs):
+        p = Path(path)
+        if p.name == 'config' and p.parent.name.startswith('pqc-ssh-'):
+            paths.append(p.parent)
+            raise PermissionError('synthetic creation failure')
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', deny)
+    with pytest.raises(batch.Denied) as error:
+        batch._effective_ssh(argv, batch._config(str(source)))
+    assert error.value.reason == 'SSH_CONFIG_SNAPSHOT_ERROR' and calls == []
+    assert len(paths) == 1 and not paths[0].exists()
+
+
+def test_snapshot_cleanup_failure_discards_completed_proof(snapshot_source, snapshot_consumer, monkeypatch):
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    original = batch.tempfile.TemporaryDirectory.cleanup
+
+    def fail_after_cleanup(directory):
+        original(directory)
+        if Path(directory.name).name.startswith('pqc-ssh-'):
+            # Reported cleanup failure must deny even after all valid output.
+            # Remove the test directory first so this oracle leaks no files.
+            raise OSError('synthetic cleanup failure')
+
+    monkeypatch.setattr(batch.tempfile.TemporaryDirectory, 'cleanup', fail_after_cleanup)
+    with pytest.raises(batch.Denied) as error:
+        batch._effective_ssh(argv, batch._config(str(source)))
+    assert error.value.reason == 'SSH_CONFIG_SNAPSHOT_CLEANUP_FAILED' and len(calls) == 3
+    _assert_snapshot_calls(calls, source, source.read_bytes())
+
+
+def test_native_guard_uses_snapshots_and_terminal_stop(native, snapshot_consumer, monkeypatch):
+    from ansible.plugins.connection import ssh
+    source, provider_calls, request, cfg, marker, _ = native
+    calls, controls = snapshot_consumer
+    validated = cfg.read_bytes()
+    ctx = batch._Context(source(), request())
+    original_runs = []
+
+    def deny_run(*args, **kwargs):
+        original_runs.append(True)
+        pytest.fail('original native _run must not be called')
+
+    monkeypatch.setattr(ssh.Connection, '_run', deny_run)
+    ctx._preflight()
+    assert len(calls) == 4 and set(ctx._proofs) == {A, B}
+    assert all(os.fsencode(cfg) in proof[0] for proof in ctx._proofs.values())
+    # Inject a short-lived change on the first jump consumer during the final
+    # retained native connection's _run guard. Its -F still reads the snapshot.
+    controls['before'] = lambda i: cfg.write_bytes(validated + b'Include /dummy/unvalidated.conf\n') if i == 9 else None
+    controls['after'] = lambda i: cfg.write_bytes(validated) if i == 9 else None
+    with pytest.raises(batch.Denied) as error:
+        ctx._boundary(A)
+    assert error.value.code == 2 and error.value.reason == 'LIVE_NOT_AVAILABLE'
+    assert len(calls) == 10 and original_runs == [] and not marker.exists()
+    assert provider_calls() == [['--list']] and cfg.read_bytes() == validated
+    _assert_snapshot_calls(calls, cfg, validated)
+    assert len({c[1] for c in calls}) == 5
+    # Persistent drift after a valid proof must stop before a new consumer.
+    cfg.write_bytes(validated + b'# persistent edit\n')
+    with pytest.raises(batch.Denied) as error:
+        ctx._boundary(A)
+    assert error.value.reason == 'CONNECTION_CONTEXT_DRIFT'
+    assert original_runs == [] and not marker.exists()
+    assert len(calls) == 10
+    _assert_snapshot_calls(calls, cfg, validated)
+
+
+@pytest.mark.parametrize('line, reason', [
+    (b'Include /dummy/unvalidated.conf\n', 'UNSUPPORTED_SSH_OPTION'),
+    (b'Match exec /dummy/never-execute\n', 'SSH_CONFIG_UNVERIFIED'),
+])
+def test_snapshot_stable_unsafe_zero_child(snapshot_source, snapshot_consumer, line, reason):
+    import hashlib
+    source, argv = snapshot_source
+    calls, _ = snapshot_consumer
+    raw = source.read_bytes() + line
+    source.write_bytes(raw)
+    # Even an exact hash of stable disallowed content is not validation.
+    with pytest.raises(batch.Denied) as error:
+        batch._effective_ssh(argv, hashlib.sha256(raw).hexdigest())
+    assert error.value.code == 4 and error.value.reason == reason and calls == []
