@@ -1320,3 +1320,456 @@ def test_p2_platform_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
         assert set(bundle['companions'])=={a,b} and m['hosts'][0]['platform']['reason_code']=='CONTROLLER_TIMEOUT'
     assert all(not _p2_rows(driver,n) for n in names[2:])
     print('P2_EARLIEST_LEASE',json.dumps(dict(in_flight=in_flight,**marks)))
+
+
+# O2 native fixture: only the stage selected by the actual worker is packaged.
+# Reuse the P2 bounded driver pattern, with independent O1 supervisor evidence.
+class _O2Driver(_P2Driver):
+    def __init__(self, tmp, ctx, *, real=False, modes=None, stage_seconds=30, fault=None):
+        super().__init__(tmp, ctx, modes=modes, stage_seconds=stage_seconds, fault=fault)
+        self.real = real
+        self.o1 = self.p1.with_name('pqc_openssl_acquire.py')
+        self.validator = bridge._bound_openssl_stage_validator()
+        self.parent_pid = os.getpid()
+
+    def prepare(self, binding):
+        import subprocess
+        import selectors
+        from ansible import constants as C
+        from ansible.plugins.loader import module_loader, module_utils_loader
+        from ansible.executor.module_common import modify_module
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        name, stage, ordinal = binding.target_id, binding.stage, binding.ordinal
+        assert type(binding) is bridge._OpenSSLStageBinding
+        assert binding.producer_id == bridge.OPENSSL and binding.task_uuid and binding.run_id
+        assert name in self.ctx._targets and os.getpid() != self.parent_pid
+        assert stage == bridge._OPENSSL_STAGES[ordinal]
+        stem = f'{name}-{ordinal}'
+        private = self.tmp / stem
+        private.mkdir(mode=0o700)
+        mode = self.modes.get((name, ordinal), 'ok')
+        source = self.o1
+        module_name = 'security.compliance_pqc_readiness.pqc_openssl_acquire'
+        group = self.tmp / (stem + '-group.json')
+        if not self.real:
+            commands = {
+                'rpm-openssl': ['-q', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n', 'openssl'],
+                'rpm-openssl-libs': ['-q', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n', 'openssl-libs'],
+                'version': ['version'], 'providers': ['list', '-providers'],
+                'kem': ['list', '-kem-algorithms'], 'signature': ['list', '-signature-algorithms'],
+                'tls-groups': ['list', '-tls-groups', '-tls1_3'],
+            }
+            replies = {
+                'rpm-openssl': (b'openssl\t3.5.5\t1.el9\tx86_64\n', b'', 0),
+                'rpm-openssl-libs': (b'', b'package openssl-libs is not installed\n', 1),
+                'version': (b'OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)\n', b'', 0),
+                'providers': (b'Providers:\n  default\n    version: 3.5.5\n    status: active\n', b'', 0),
+                'kem': (b'{ ML-KEM-768, bad alias } @ default\nML-KEM-512 @ default\n', b'', 0),
+                'signature': (b'', b'list: Unknown option: -signature-algorithms\n', 1),
+                'tls-groups': (b'x25519:X25519MLKEM768\n', b'', 0),
+            }
+            exe = private / 'fixed-fixture'
+            out, err, rc = replies[stage]
+            if mode == 'inner-failure':
+                out, err, rc = b'', b'fixture failure\n', 7
+            script = f'''#!{self.python} -I
+import json,os,sys,time,signal
+assert sys.argv[1:]=={commands[stage]!r}
+assert os.geteuid()=={os.geteuid()} and os.read(0,1)==b''
+mode={mode!r}
+pids=[os.getpid()]
+if mode in ('outer-timeout','consumer-loss'):
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    child=os.fork()
+    if child==0:
+        time.sleep(60);os._exit(0)
+    pids.append(child)
+with open({str(group)!r},'x') as f:json.dump(dict(pids=pids,pgid=os.getpgrp()),f)
+if mode in ('outer-timeout','inner-timeout','consumer-loss'):time.sleep(60)
+os.write(1,{out!r});os.write(2,{err!r});sys.exit({rc})
+'''
+            exe.write_text(script); exe.chmod(0o700)
+            raw = self.o1.read_text()
+            changes = {"RPM_EXECUTABLE = '/usr/bin/rpm'": 'RPM_EXECUTABLE = ' + repr(str(exe)),
+                       "OPENSSL_EXECUTABLE = '/usr/bin/openssl'": 'OPENSSL_EXECUTABLE = ' + repr(str(exe)),
+                       'STAGE_SECONDS = 30': 'STAGE_SECONDS = ' + str(self.stage_seconds)}
+            if mode == 'inner-timeout':
+                changes['INNER_SECONDS = 27'] = 'INNER_SECONDS = 2'
+            for before, after in changes.items():
+                assert raw.count(before) == 1
+                raw = raw.replace(before, after)
+            source = private / self.o1.name
+            source.write_text(raw)
+            module_name = 'pqc_openssl_acquire'
+            module_loader._extra_dirs = [str(private)]
+            module_loader._clear_caches()
+            module_utils_loader.add_directory(str(ROOT / 'plugins/module_utils'))
+        else:
+            assert stage not in ssl.PACKAGES and Path('/usr/bin/openssl').is_file()
+        resolved = module_loader.find_plugin_with_context(module_name, '.py')
+        assert resolved.resolved and Path(resolved.plugin_resolved_path).resolve() == source.resolve()
+        prior_tmp = C.DEFAULT_LOCAL_TMP
+        try:
+            C.DEFAULT_LOCAL_TMP = str(private)
+            bits = modify_module(module_name=module_name, module_path=str(source),
+                module_args={'stage': stage, '_ansible_no_log': True}, templar=Templar(loader=DataLoader()),
+                task_vars={'ansible_python_interpreter': self.python, 'ansible_playbook_python': sys.executable},
+                remote_is_local=False)
+        finally:
+            C.DEFAULT_LOCAL_TMP = prior_tmp
+        assert bits.module_style == 'new'
+        wrapper = private / 'wrapper.py'
+        wrapper.write_bytes(bits.b_module_data); wrapper.chmod(0o600)
+        if self.fault is not None:
+            self.fault('prepare', binding, None)
+
+        def launch(begin):
+            end = begin()
+            try:
+                proc = subprocess.Popen([self.python, '-I', '-B', str(wrapper)], cwd=private,
+                    env={'PATH': '/usr/bin:/bin', 'HOME': str(private), 'TMPDIR': str(private), 'LC_ALL': 'C.UTF-8'},
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
+            except OSError:
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            (self.tmp / (stem + '-launch.json')).write_text(json.dumps(dict(
+                stage=stage, ordinal=ordinal, task=binding.task_uuid, run=binding.run_id,
+                worker=os.getpid(), supervisor=proc.pid, began=time.monotonic(), end=end)))
+            buffers = [bytearray(), bytearray()]
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for i, stream in enumerate((proc.stdout, proc.stderr)):
+                        sel.register(stream, selectors.EVENT_READ, i)
+                    while sel.get_map() or proc.poll() is None:
+                        if mode == 'consumer-loss' and group.exists():
+                            os._exit(17)
+                        left = end - time.monotonic()
+                        assert left > 0
+                        if not sel.get_map():
+                            time.sleep(min(.01, left)); continue
+                        for key, _ in sel.select(min(.02, left)):
+                            room = bridge._STAGE_FRAME_BYTES - sum(map(len, buffers))
+                            data = os.read(key.fd, min(4096, room + 1))
+                            assert len(data) <= room
+                            if data: buffers[key.data].extend(data)
+                            else: sel.unregister(key.fileobj)
+                proc.wait(timeout=max(.01, end-time.monotonic()))
+            finally:
+                proc.stdout.close(); proc.stderr.close()
+                # Never terminate the sole O1 cleanup supervisor. An abandoned
+                # worker's separate session remains bounded by O1 itself; the
+                # parent test reaps it independently, not as worker proof.
+                if proc.poll() is None:
+                    proc.wait(timeout=self.stage_seconds + 1)
+            assert proc.returncode == 0 and not buffers[1]
+            assert not batch._scope.group_exists(proc.pid)
+            if group.exists():
+                witness = json.loads(group.read_bytes())
+                assert witness['pgid'] != proc.pid
+                assert not batch._scope.group_exists(witness['pgid'])
+                assert all(not Path('/proc',str(pid)).exists() for pid in witness['pids'])
+            # Independently witness actual O1 success/cleanup before any test
+            # mutation. The product must still parse, bind and validate the
+            # returned frame itself with the original canonical validator.
+            raw = bytes(buffers[0]); receipt = json.loads(raw)['receipt']
+            self.validator(receipt, stage)
+            assert receipt['cleanup_confirmed'] is True
+            (self.tmp / (stem + '-done.json')).write_text(json.dumps(dict(
+                reason=receipt['reason_code'], wrapper_rc=proc.returncode, outer_rc=receipt['rc'],
+                payload=receipt['payload'],
+                cleanup=True, ended=time.monotonic())))
+            completion = bridge._StageCompletion(binding, raw, bytes(buffers[1]), proc.returncode, True, True)
+            return self.fault('completion', binding, completion) if self.fault is not None else completion
+        return launch
+
+
+def _o2_register(monkeypatch, ctx, trace, *, platform_kwargs=None, **kwargs):
+    p2 = _p2_register(monkeypatch, ctx, trace, **(platform_kwargs or {}))
+    directory = trace.parent / 'o2'
+    directory.mkdir(mode=0o700)
+    o2 = _O2Driver(directory, ctx, **kwargs)
+    registry = bridge._producer_adapters()
+    registry[bridge.OPENSSL] = bridge._OpenSSLStageAdapter(o2.prepare)
+    monkeypatch.setattr(bridge, '_producer_adapters', lambda: registry)
+    return p2, o2
+
+
+def test_o2_fixed_budgets_and_flag_ordinals():
+    session = batch._ProducerSession(RULES)
+    assert session.budget(bridge.PRODUCERS) == 155
+    session.staged = True
+    assert session.budget(bridge.PRODUCERS) == 382
+    session.openssl_staged = True
+    assert batch._platform_budget() == 258 and batch._openssl_budget() == 562
+    assert session.budget((bridge.PLATFORM, bridge.OPENSSL)) == 820
+    host = batch._GUARD_SECONDS + batch._SSH_SECONDS + session.budget(bridge.PRODUCERS) + batch._WORKER_GRACE + 5
+    assert host == 965 and 2*batch._GUARD_SECONDS + 10*(2*batch._GUARD_SECONDS+host)+5 == 10315
+    for flags, indices in [(selected_flags(), []), (selected_flags(bridge.PACKAGES), [0,1]),
+                           (selected_flags(bridge.SSL), [2,3,4,5,6]),
+                           (ALL, list(range(7)))]:
+        assert bridge._openssl_plan(flags) == tuple((i, ssl.SLOTS[i]) for i in indices)
+    assert bridge._producer_adapters() == batch._passive_adapters() == {}
+
+
+@pytest.mark.parametrize('families,indices', [
+    ((bridge.PACKAGES,bridge.SSL),list(range(7))),
+    ((bridge.PACKAGES,),[0,1]), ((bridge.SSL,),[2,3,4,5,6]),
+    ((),[]),
+])
+def test_o2_actual_native_flags(fixture, monkeypatch, families, indices):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=1,flags=selected_flags(*families))
+    p2,o2 = _o2_register(monkeypatch,ctx,trace)
+    rc,m,bundle = checked(ctx)
+    n = names[0]; stages = _p2_rows(o2,n); done = _p2_rows(o2,n,'done')
+    assert [x['ordinal'] for x in stages] == indices
+    assert [x['stage'] for x in stages] == [ssl.SLOTS[i] for i in indices]
+    assert len(stages) == len(done)
+    if indices:
+        platform_stages = _p2_rows(p2,n)
+        assert len(platform_stages)==3 and len({x['task'] for x in platform_stages+stages})==1
+        assert len({x['worker'] for x in platform_stages+stages})==1
+        assert _p2_rows(p2,n,'done')[-1]['ended']<=stages[0]['began']
+        assert all(x['cleanup'] and x['wrapper_rc']==x['outer_rc']==0 for x in done)
+        assert all(a['ended']<=b['began'] for a,b in zip(done,stages[1:]))
+        by = dict(zip(indices,[x['payload'] for x in done]))
+        if 1 in by:
+            assert (by[1]['reason'],by[1]['rc'])==('PACKAGE_ABSENT',1)
+        if 4 in by:
+            assert by[4]['reason']=='FORMAT_GAP' and by[4]['rows']==[['default',['ML-KEM-512']]]
+            assert (by[5]['reason'],by[5]['rc'])==('UNSUPPORTED_FLAG',1)
+        assert len(bundle['document']['collections'])==17+(3 in indices)
+        detail=bundle['companions'][n][bridge.OPENSSL]
+        assert len(detail)==7+(3 in indices)
+        assert not any(c['level'] in ('L3','L4','L5') and c['assessment_state']=='PASS'
+                       for c in bundle['assessed']['claims'])
+    else:
+        assert not _p2_rows(p2,n)
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('versions', [
+    {'distribution':'Debian','os_family':'Debian'},
+    {'distribution_version':'unknown','distribution_major_version':None},
+])
+def test_o2_actual_platform_gap(fixture, monkeypatch, versions):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=1,flags=selected_flags(bridge.PACKAGES,bridge.SSL))
+    p2,o2 = _o2_register(monkeypatch,ctx,trace,platform_kwargs={'versions':{names[0]:versions}})
+    rc,m,bundle=checked(ctx)
+    assert len(_p2_rows(p2,names[0]))==1 and not _p2_rows(o2,names[0])
+    detail=bundle['companions'][names[0]][bridge.OPENSSL]
+    assert len(detail)==7
+    assert all(x['reason'] in ('PLATFORM_OUT_OF_SCOPE','PLATFORM_UNRESOLVED') and x['rc'] is None for x in detail)
+    assert not trap.exists()
+
+
+def test_o2_mixed_platform_refused_before_connect(fixture, monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.SSL))
+    register(monkeypatch,trace)
+    registry=bridge._producer_adapters()
+    def forbidden(*args):
+        raise AssertionError('stage prepare must not be reached')
+    registry[bridge.OPENSSL]=bridge._OpenSSLStageAdapter(forbidden)
+    monkeypatch.setattr(bridge,'_producer_adapters',lambda:registry)
+    launches=_observe_native_queue(monkeypatch)
+    with pytest.raises(batch.Denied,match='INVALID_ADAPTER_REGISTRY'):
+        checked(ctx)
+    assert not launches and not trap.exists()
+
+
+@pytest.mark.parametrize('mode,reason,inner', [
+    ('outer-timeout','TIMEOUT',None),('inner-timeout','TIMEOUT',-9),
+    ('inner-failure','COMMAND_FAILED',7),
+])
+def test_o2_actual_failure_rc_layers(fixture, monkeypatch, mode, reason, inner):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.PACKAGES))
+    n=names[0]
+    _,o2=_o2_register(monkeypatch,ctx,trace,modes={(n,0):mode},stage_seconds=6)
+    rc,m,bundle=checked(ctx)
+    done=_p2_rows(o2,n,'done'); assert len(done)==2 and all(x['cleanup'] for x in done)
+    assert done[0]['wrapper_rc']==0
+    if inner is None:
+        assert done[0]['reason']=='COMMAND_TIMEOUT' and done[0]['outer_rc']!=0 and done[0]['payload'] is None
+    else:
+        assert done[0]['outer_rc']==0 and done[0]['payload']['rc']==inner
+    detail={x['slot']:x for x in bundle['companions'][n][bridge.OPENSSL]}
+    assert (detail['rpm-openssl']['reason'],detail['rpm-openssl']['rc'])==(reason,inner)
+    assert (detail['rpm-openssl-libs']['reason'],detail['rpm-openssl-libs']['rc'])==('PACKAGE_ABSENT',1)
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('fault',['guard','foreign','producer','ordinal','replay','frame','cleanup','interrupted'])
+def test_o2_native_fatal_retains_platform(fixture,monkeypatch,fault):
+    make,_,trace,trap,cfg=fixture
+    ctx,names=make(count=2,forks=1,flags=ALL)
+    n=names[0]
+    def corrupt(when,binding,completion):
+        if binding.ordinal!=1:return completion
+        if fault=='guard' and when=='prepare':
+            with cfg.open('a') as f:f.write('\n# anonymous O2 guard drift\n')
+        if when!='completion':return completion
+        if fault=='foreign':return completion._replace(binding=binding._replace(target_id=names[1]))
+        if fault=='producer':return completion._replace(binding=binding._replace(producer_id=bridge.PLATFORM))
+        if fault=='ordinal':return completion._replace(binding=binding._replace(ordinal=0))
+        if fault=='replay':return completion._replace(binding=binding._replace(ordinal=binding.ordinal))
+        if fault=='frame':return completion._replace(stdout=b'{"duplicate":1,"duplicate":2}')
+        if fault=='cleanup':return completion._replace(clean=False)
+        if fault=='interrupted':
+            frame=json.loads(completion.stdout)
+            frame['receipt'].update(reason_code='INTERRUPTED',rc=-15,payload=None)
+            return completion._replace(stdout=json.dumps(frame).encode('ascii'))
+        return completion
+    p2,o2=_o2_register(monkeypatch,ctx,trace,fault=corrupt)
+    rc,m,bundle=checked(ctx)
+    rows=m['hosts']; by={c['collector_id']:c for c in rows[0]['collectors']}
+    expected = {'guard':'GUARD_REJECTED','foreign':'REMOTE_CLEANUP_UNCONFIRMED',
+                'producer':'REMOTE_CLEANUP_UNCONFIRMED','ordinal':'REMOTE_CLEANUP_UNCONFIRMED',
+                'replay':'REMOTE_CLEANUP_UNCONFIRMED','frame':'INVALID_ADAPTER_RESULT',
+                'cleanup':'REMOTE_CLEANUP_UNCONFIRMED','interrupted':'INTERRUPTED'}[fault]
+    assert rc==(7 if fault=='interrupted' else 6) and m['reason_code']==expected
+    assert all(by[f]['reason_code']==expected for f in (bridge.PACKAGES,bridge.SSL))
+    assert rows[0]['host_state']=='ERROR' and rows[1]['host_state']=='NOT_ATTEMPTED'
+    assert len(_p2_rows(p2,n))==3 and len(_p2_rows(o2,n))==(1 if fault=='guard' else 2)
+    assert set(bundle['companions'][n])=={bridge.PLATFORM}
+    assert len(bundle['document']['collections'])==10
+    assert all(by[f]['state']=='ERROR' and not by[f]['collection_ids'] for f in (bridge.PACKAGES,bridge.SSL))
+    assert all(by[f]['state']=='NOT_SCANNED' for f in (bridge.POLICY_FLAG,bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG))
+    assert not trap.exists()
+
+
+def test_o2_actual_consumer_loss(fixture, monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.PACKAGES))
+    n=names[0]
+    p2,o2=_o2_register(monkeypatch,ctx,trace,modes={(n,0):'consumer-loss'},stage_seconds=4)
+    with _p2_owned_supervisors(o2) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert rc==6 and m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED'
+    assert len(_p2_rows(p2,n))==3 and len(_p2_rows(o2,n))==1
+    assert _p2_rows(o2,n)[0]['supervisor'] in reaped
+    assert m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    assert not bundle['document']['collections'] and not trap.exists()
+
+
+@pytest.mark.skipif(not Path('/usr/bin/openssl').is_file(),reason='fixed local OpenSSL unavailable')
+def test_o2_actual_fqcn_runtime(fixture, monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.SSL))
+    _,o2=_o2_register(monkeypatch,ctx,trace,real=True)
+    rc,m,bundle=checked(ctx)
+    done=_p2_rows(o2,names[0],'done')
+    assert len(done)==5 and all(x['cleanup'] and x['wrapper_rc']==0 for x in done)
+    assert done[0]['payload']['state']=='COLLECTED'
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('fault',['wrong-stage','wrong-producer','wrong-run','wrong-task','wrong-host',
+                                  'duplicate','nan','oversize','extra','wrapper','cleanup'])
+def test_o2_closed_receipt(fixture,fault):
+    make,_,_,_,_=fixture;make(count=1)
+    binding=bridge._OpenSSLStageBinding(RUN,HOST,'task-001',bridge.OPENSSL,'rpm-openssl',0)
+    payload=dict(state='COLLECTED',reason='PACKAGE_ABSENT',rc=1,rows=[['openssl',None,None,None]])
+    receipt=dict(format=1,stage=binding.stage,reason_code='COMMAND_OK',rc=0,
+                 cleanup_confirmed=True,payload=payload)
+    frame=dict(changed=False,invocation={'module_args':{'stage':binding.stage}},receipt=receipt)
+    raw=json.dumps(frame).encode('ascii')
+    complete=bridge._StageCompletion(binding,raw,b'',0,True,True)
+    assert bridge._stage_receipt(complete,binding)==receipt
+    if fault in ('wrong-producer','wrong-run','wrong-task','wrong-host'):
+        field,value={'wrong-producer':('producer_id',bridge.PLATFORM),'wrong-run':('run_id','foreign'),
+                     'wrong-task':('task_uuid','foreign'),'wrong-host':('target_id','foreign.example.invalid')}[fault]
+        complete=complete._replace(binding=binding._replace(**{field:value}))
+    elif fault=='wrong-stage':
+        frame['receipt']['stage']='rpm-openssl-libs';complete=complete._replace(stdout=json.dumps(frame).encode())
+    elif fault=='duplicate':
+        complete=complete._replace(stdout=raw.replace(b'"changed": false',b'"changed": false, "changed": false'))
+    elif fault=='nan':
+        complete=complete._replace(stdout=raw.replace(b'"rc": 0',b'"rc": NaN'))
+    elif fault=='oversize':
+        complete=complete._replace(stdout=b'x'*(bridge._STAGE_FRAME_BYTES+1))
+    elif fault=='extra':
+        frame['extra']='DUMMY_PRIVATE_SENTINEL';complete=complete._replace(stdout=json.dumps(frame).encode())
+    elif fault=='wrapper':
+        complete=complete._replace(wrapper_rc=1)
+    else:
+        complete=complete._replace(clean=False)
+    with pytest.raises(bridge._StageFailure):
+        bridge._stage_receipt(complete,binding)
+
+
+
+@pytest.mark.parametrize('in_flight',[False,True],ids=['no-new-stage','active-stage'])
+def test_o2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.PACKAGES))
+    a,b,_=names; ready=trace.parent/'o2-a-ready'; verified=trace.parent/'o2-b-verified'
+    marks={}
+    def synchronize(when,binding,completion):
+        if not in_flight and when=='prepare' and binding.target_id==a and binding.ordinal==0:
+            ready.write_text('ready'); _p2_wait(verified)
+            worker=batch._PLATFORM_WORKER.get()
+            end=worker.lease.limit(a)
+            (trace.parent/'o2-child-lease.json').write_text(json.dumps(dict(end=end,now=time.monotonic())))
+        return completion
+    p2,o2=_o2_register(monkeypatch,ctx,trace,
+        platform_kwargs={'versions':{b:{'distribution':'Debian','os_family':'Debian'}}},
+        modes={(a,0):'outer-timeout'} if in_flight else {},
+        stage_seconds=6 if in_flight else 30,fault=synchronize)
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator); send=q.send_task_result
+        def hold(result):
+            if result.as_wire_task_result().host_name==b:
+                _p2_wait(o2.tmp/f'{a}-0-group.json' if in_flight else ready)
+                send(result);time.sleep(15)
+            else:send(result)
+        q.send_task_result=hold;return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+    accepted=batch._ProducerWorkerWave._receipt_accepted
+    def observe(self):
+        result=accepted(self)
+        if b in self.ledger.projections and not verified.exists():
+            assert b not in self.confirmed and self.workers[b].is_alive()
+            end=self.limit()
+            assert end==min(self.ends[b],self.grace[b])<self.ends[a]
+            assert self.lease.limit(a)==end
+            marks.update(earliest=end,verified=time.monotonic())
+            verified.write_text('verified')
+        return result
+    monkeypatch.setattr(batch._ProducerWorkerWave,'_receipt_accepted',observe)
+    before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(o2) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert marks['verified']<marks['earliest'] and [n for n,_ in launches]==names[:2]
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert rc==6 and b in bundle['companions'] and not _p2_rows(o2,b)
+    assert not any(_p2_rows(o2,n) or _p2_rows(p2,n) for n in names[2:])
+    if in_flight:
+        assert len(_p2_rows(o2,a))==1 and not _p2_rows(o2,a,'done')
+        assert _p2_rows(o2,a)[0]['supervisor'] in reaped
+        assert m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED'
+        assert a not in bundle['companions']
+    else:
+        child=json.loads((trace.parent/'o2-child-lease.json').read_bytes())
+        assert child['end']==marks['earliest'] and 0<child['end']-child['now']<=batch._WORKER_GRACE
+        assert not _p2_rows(o2,a) and m['reason_code']=='CONTROLLER_TIMEOUT'
+        assert set(bundle['companions'][a])=={bridge.PLATFORM}
+        row=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.PACKAGES)
+        assert row['reason_code']=='CONTROLLER_TIMEOUT' and not row['collection_ids']
+    assert not trap.exists() and _signal_state()==before
+
+
+def test_o2_fatal_context_is_not_legacy_authority():
+    flags=selected_flags(bridge.PACKAGES)
+    data=envelope(flags=flags)
+    data['records'][1].update(reason_code='GUARD_REJECTED',rc=None,cleanup_confirmed=True,snapshot=None)
+    with pytest.raises(bridge.BridgeError):
+        bridge.normalize_handoff(data,RUN,HOST,flags,TIME,RULES)
+    result=bridge.normalize_handoff(data,RUN,HOST,flags,TIME,RULES,staged_openssl=True)
+    assert set(result.companions)=={bridge.PLATFORM}
+    assert result.outcomes[bridge.PACKAGES]['reason_code']=='GUARD_REJECTED'
+    assert not result.outcomes[bridge.PACKAGES]['collection_ids']

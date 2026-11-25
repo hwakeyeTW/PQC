@@ -1220,6 +1220,10 @@ _PLATFORM_WORKER = contextvars.ContextVar('_pqc_platform_worker', default=None)
 
 def _platform_budget():
     return 3 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
+
+
+def _openssl_budget():
+    return 7 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
 _COLLECTORS = tuple(sorted(_scope.FLAGS))
 _PASSIVE = frozenset(_COLLECTORS) - {'pqc_collect_tls_services'}
 _VALID = frozenset(('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL'))
@@ -1615,13 +1619,18 @@ class _PlatformLease:
 
 class _PlatformWorker:
     """Only constructed inside the actual native fixed raw witness."""
-    def __init__(self, name, task_uuid, host_end, lease, verify):
+    def __init__(self, name, task_uuid, host_end, lease, verify, flags):
         self.name, self.task_uuid = name, task_uuid
         self.host_end, self.lease, self.verify = host_end, lease, verify
         self.producer_end = None
         self.validation_left = _GUARD_SECONDS
         self.ordinal = 0
         self.run_id = None
+        from tools import scan_collectors as b
+        self.producer = None
+        self.plan = ()
+        self.platform_proof = None
+        self.openssl_plan = b._openssl_plan(flags)
 
     def limit(self, end):
         end = min(end, self.host_end, self.lease.limit(self.name))
@@ -1630,12 +1639,43 @@ class _PlatformWorker:
         return end
 
     def start(self, run_id):
-        require(self.producer_end is None, 3, 'INVALID_NATIVE_RESULT')
+        from tools import scan_collectors as b
+        require(self.producer_end is None and self.producer is None, 3, 'INVALID_NATIVE_RESULT')
         self.run_id = run_id
+        self.producer = b.PLATFORM
+        self.plan = tuple(enumerate(b._PLATFORM_STAGES))
         self.producer_end = min(self.host_end, time.monotonic() + _platform_budget())
 
+    def note_platform(self, row):
+        from tools import scan_collectors as b
+        require(self.producer == b.PLATFORM and self.platform_proof is None
+                and row['producer_id'] == b.PLATFORM and row['reason_code'] == 'COMMAND_OK'
+                and row['cleanup_confirmed'] is True and row['snapshot'] is not None
+                and not b.record_stop(row) and not self.lease.pending(self.name),
+                3, 'INVALID_NATIVE_RESULT')
+        expected = len(self.plan) if self.validate(b._rpm_eligible, row['snapshot']) else 1
+        require(self.ordinal == expected, 3, 'INVALID_NATIVE_RESULT')
+        self.limit(self.producer_end)
+        self.platform_proof = row['snapshot']
+
+    def start_openssl(self, run_id, flags, platform_snapshot):
+        from tools import scan_collectors as b
+        require(self.producer == b.PLATFORM and self.run_id == run_id
+                and self.platform_proof is not None and self.platform_proof is platform_snapshot
+                and self.openssl_plan and b._openssl_plan(flags) == self.openssl_plan
+                and not self.lease.pending(self.name), 3, 'INVALID_NATIVE_RESULT')
+        require(self.validate(b._platform_status, platform_snapshot) == 'UNVERIFIED',
+                3, 'INVALID_NATIVE_RESULT')
+        # Only the next fixed producer gets a new local budget. The same host,
+        # task UUID and shared earliest lease still cap every operation.
+        self.producer_end = min(self.limit(self.host_end), time.monotonic() + _openssl_budget())
+        self.producer = b.OPENSSL
+        self.plan = self.openssl_plan
+        self.ordinal = 0
+        self.validation_left = _GUARD_SECONDS
+
     def validate(self, fn, *args, **kwargs):
-        # Cumulative platform-only 30s validation, not 30s for each stage.
+        # Cumulative per-producer 30s validation, not 30s for each stage.
         start = time.monotonic()
         end = self.limit(min(self.producer_end, start + self.validation_left))
         try:
@@ -1648,10 +1688,14 @@ class _PlatformWorker:
 
     def invoke(self, prepare, binding):
         from tools import scan_collectors as b
-        require(type(binding) is b._StageBinding and binding.run_id == self.run_id
-                and binding.target_id == self.name and binding.task_uuid == self.task_uuid
-                and binding.ordinal == self.ordinal and self.ordinal < len(b._PLATFORM_STAGES)
-                and binding.stage == b._PLATFORM_STAGES[self.ordinal], 3, 'INVALID_NATIVE_RESULT')
+        require(((self.producer == b.PLATFORM and type(binding) is b._StageBinding)
+                 or (self.producer == b.OPENSSL and type(binding) is b._OpenSSLStageBinding
+                     and binding.producer_id == b.OPENSSL))
+                and binding.run_id == self.run_id and binding.target_id == self.name
+                and binding.task_uuid == self.task_uuid and type(binding.ordinal) is int
+                and self.ordinal < len(self.plan)
+                and (binding.ordinal, binding.stage) == self.plan[self.ordinal],
+                3, 'INVALID_NATIVE_RESULT')
         self.ordinal += 1
         used = False
         trusted_clean = False
@@ -1711,6 +1755,11 @@ class _PlatformWorker:
             self.limit(command_end)
             return receipt
         except b._StageFailure:
+            if self.producer == b.OPENSSL and used and trusted_clean:
+                try:
+                    self.limit(command_end)
+                except _Deadline:
+                    raise b._StageFailure('CONTROLLER_TIMEOUT', clean=True) from None
             raise
         except _Cancelled:
             # The controller has already observed a stop; do not produce a
@@ -1886,7 +1935,7 @@ def _worker_boundary(ctx, name, registry, collect=None, staged=None):
                 finally:
                     conn._build_command = builder
 
-            token = _PLATFORM_WORKER.set(_PlatformWorker(name, task_uuid, host_end, lease, verify))
+            token = _PLATFORM_WORKER.set(_PlatformWorker(name, task_uuid, host_end, lease, verify, flags))
             try:
                 result = collect(name, flags, registry)
             finally:
@@ -2540,7 +2589,11 @@ def _execute_batch(ctx, producer_session=None):
 def _v2_base_row(row):
     result = {k: v for k, v in row.items() if k != 'platform'}
     result['collectors'] = [{**c, 'collection_ids': [],
-        'reason_code': 'COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else c['reason_code']}
+        'reason_code': ('COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else
+                        'INVALID_ADAPTER_RESULT' if c['state'] == 'ERROR'
+                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl')
+                        and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')
+                        else c['reason_code'])}
         for c in row['collectors']]
     return result
 
@@ -2561,7 +2614,8 @@ def _valid_v2_outcome(row, flag, requested, cap):
         reduced['reason_code'] = 'COMMAND_IO_FAILED'
     if (reduced.get('state') == 'ERROR'
             and reduced.get('reason_code') in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')):
-        if flag != 'pqc-platform' or reduced.get('state') != 'ERROR' or reduced.get('rc') is not None or ids:
+        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl')
+                or reduced.get('rc') is not None or ids):
             return False
         reduced['reason_code'] = 'INVALID_ADAPTER_RESULT'
     return _valid_outcome(reduced, flag, requested) and (row['state'] != 'UNREACHABLE' or not ids)
@@ -2587,6 +2641,18 @@ def validate_producer_manifest(manifest, rc):
                 and _valid_v2_outcome(row['platform'], bridge.PLATFORM, any(flags.values()), 10)
                 and all(_valid_v2_outcome(c, f, flags[f], caps[f]) for c, f in zip(row['collectors'], _COLLECTORS)),
                 3, 'INVALID_TERMINAL_MANIFEST')
+        # V2 shape only: O2 fatal outcomes must follow retained Platform
+        # evidence, not fabricate a standalone fatal SSL projection.
+        ssl_rows = [c for c in row['collectors'] if c['collector_id'] in (bridge.PACKAGES, bridge.SSL)
+                    and c['requested']]
+        ssl_fatal = [c for c in ssl_rows if c['state'] == 'ERROR'
+                     and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')]
+        if ssl_fatal:
+            require(row['attempted'] and row['reason_code'] in _FATAL
+                    and row['platform']['collection_ids']
+                    and len(ssl_fatal) == len(ssl_rows)
+                    and len({c['reason_code'] for c in ssl_fatal}) == 1,
+                    3, 'INVALID_TERMINAL_MANIFEST')
         ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
         require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)
                 and (row['attempted'] or (not ids and row['platform']['state'] == 'NOT_SCANNED')),
@@ -2630,8 +2696,9 @@ class _ProducerLedger(_Ledger):
             raise _Deadline()
         try:
             envelope = self.session.handoff.read(n, receipt)
+            context = {'staged_openssl': True} if self.session.openssl_staged else {}
             projection = self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
-                                                                self.session.started_at, self.session.rules)
+                                                                self.session.started_at, self.session.rules, **context)
         except Exception:
             # Never send a raw parsing/normalizer exception or retained snapshot
             # through the queue. Known earlier valid hosts remain available.
@@ -2691,6 +2758,7 @@ class _ProducerSession:
         self.started_at = None
         self.handlers = {}
         self.staged = False
+        self.openssl_staged = False
 
     def _identity(self, ctx):
         import uuid
@@ -2701,10 +2769,15 @@ class _ProducerSession:
         self._identity(ctx)
         registry = self.bridge._producer_adapters()
         require(type(registry) is dict and registry.keys() <= set(self.bridge.PRODUCERS)
-                and all(callable(v) if type(v) is not self.bridge._PlatformStageAdapter else
-                        k == self.bridge.PLATFORM and callable(v.prepare) for k, v in registry.items()),
+                and all((k == self.bridge.PLATFORM and callable(v.prepare))
+                        if type(v) is self.bridge._PlatformStageAdapter else
+                        (k == self.bridge.OPENSSL and callable(v.prepare))
+                        if type(v) is self.bridge._OpenSSLStageAdapter else callable(v)
+                        for k, v in registry.items()),
                 3, 'INVALID_ADAPTER_REGISTRY')
         self.staged = type(registry.get(self.bridge.PLATFORM)) is self.bridge._PlatformStageAdapter
+        self.openssl_staged = type(registry.get(self.bridge.OPENSSL)) is self.bridge._OpenSSLStageAdapter
+        require(not self.openssl_staged or self.staged, 3, 'INVALID_ADAPTER_REGISTRY')
         try:
             eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
         except self.bridge.BridgeError:
@@ -2723,11 +2796,13 @@ class _ProducerSession:
 
     def budget(self, producers):
         return sum(_platform_budget() if self.staged and p == self.bridge.PLATFORM else
+                   _openssl_budget() if self.openssl_staged and p == self.bridge.OPENSSL else
                    _COMMAND_SECONDS + 1 for p in producers)
 
     def collect(self, name, flags, registry):
         """Called only after the unchanged native per-dispatch/argv guard."""
         b = self.bridge
+        flags = copy.deepcopy(flags)
         records = []
         worker = _PLATFORM_WORKER.get()
         if self.staged:
@@ -2744,12 +2819,26 @@ class _ProducerSession:
             platform_snapshot = None
             for producer in b.requested(flags):
                 value = None
+                staged_producer = ((self.staged and producer == b.PLATFORM) or
+                                   (self.openssl_staged and producer == b.OPENSSL))
                 try:
                     if self.staged and producer == b.PLATFORM:
                         worker.start(self.run_id)
                         value = registry[producer].collect(self.run_id, name, worker.task_uuid,
                                                            worker.invoke, worker.validate)
                         row = worker.validate(b.record, producer, value, flags, platform_snapshot, self.run_id, name)
+                        if (self.openssl_staged and b.OPENSSL in b.requested(flags)
+                                and row['snapshot'] is not None and not b.record_stop(row)):
+                            worker.note_platform(row)
+                    elif (self.openssl_staged and producer == b.OPENSSL
+                          and b._platform_status(platform_snapshot) == 'UNVERIFIED'):
+                        worker.start_openssl(self.run_id, flags, platform_snapshot)
+                        value = registry[producer].collect(self.run_id, name, worker.task_uuid, flags,
+                                                           platform_snapshot, worker.invoke, worker.validate)
+                        row = worker.validate(b.record, producer, value, flags, platform_snapshot,
+                                              self.run_id, name, staged_openssl=True)
+                        require(row['snapshot'] is None or worker.ordinal == len(worker.plan),
+                                3, 'INVALID_NATIVE_RESULT')
                     else:
                         # Legacy single-call surrogate budget unchanged. A
                         # staged host's later producers also observe the lease.
@@ -2767,13 +2856,13 @@ class _ProducerSession:
                         if worker is not None:
                             worker.limit(worker.host_end)
                 except _Deadline:
-                    clean = (self.staged and producer == b.PLATFORM and not worker.lease.pending(name))
+                    clean = (staged_producer and not worker.lease.pending(name))
                     row = b.failed_record(producer, 'CONTROLLER_TIMEOUT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
                 except Exception:
                     # A malformed projection is not a successful acquisition.
                     # Only a genuine adapter cleanup receipt permits the less
                     # severe invalid-result classification.
-                    clean = (not worker.lease.pending(name) if self.staged and producer == b.PLATFORM else
+                    clean = (not worker.lease.pending(name) if staged_producer else
                              type(value) is dict and value.get('cleanup_confirmed') is True)
                     row = b.failed_record(producer, 'INVALID_ADAPTER_RESULT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
                 records.append(row)

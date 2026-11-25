@@ -587,3 +587,40 @@ and peer fatal stop. Local surrogate cleanup is not proof of real remote
 SSH transport or crash/power-loss cleanup. Real transport and formal
 Controller/OL9.x safety, performance and offline qualification remain
 closed/NOT_TESTED (#8/#17/#28).
+
+
+### I1b O2 — private native worker lifecycle and bounds
+
+A worker's original Platform lifecycle may transition only once to the
+OpenSSL staged lifecycle after validated Platform completion with the
+same snapshot object, confirmed lease cleanup, frozen flag plan and
+numeric UNVERIFIED platform status. The task UUID, target, run, host
+deadline and shared wave lease are never renewed. Only the fixed next
+producer deadline, canonical ordinal cursor and cumulative validation
+reserve are initialized anew. A disabled or noneligible OpenSSL family
+never causes an O1 stage. The existing raw native witness, actual consumed
+connection proof, pre/post packaging guard, independent synthetic
+connection witness, one-use launch gate and no-log/no-become boundaries
+are retained; original SSH execution is not enabled.
+
+Per stage: G=30 s shared packaging/guard budget, S=15 s independent
+connection witness, C=30 s command including cleanup, and 1 s return
+reserve, total 76 s. Launch still requires at least C+1 s under the
+remaining stage, producer, host, wave-earliest and absolute deadlines.
+A clean completion does not authorize a late result or extend a phase
+already begun. Platform-only budget remains 3*76+30=258 s. Requested
+staged OpenSSL uses the fixed conservative 7*76+30=562 s even for
+package-only or runtime-only selection. Other producers remain 31 s.
+Legacy callable and V1 budgets are unchanged.
+
+The maximum five-producer host budget is
+30+15+258+562+3*31+2+5=965 s; for ten eligible hosts the absolute
+invocation bound is 60+10*(60+965)+5=10,315 s. These are upper accounting
+bounds, not an SLA, expanded command timeout or production qualification.
+Fork/serial remains at most two. Fatal stops and cleanup uncertainty
+prevent further stage/host dispatch under the existing shared lease and
+worker ownership rules. Wrapper, outer and inner return codes are not
+interchangeable. V2 accepts the new guarded staged OpenSSL fatal outcome
+only with no OpenSSL collection references; legacy producer records and
+V1 shape stay closed. Real transport and OL9 release verification remain
+outside this slice.
