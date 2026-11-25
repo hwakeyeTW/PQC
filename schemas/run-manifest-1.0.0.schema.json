@@ -1,0 +1,1094 @@
+{
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "asset_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:a-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "evidence_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:e-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "format_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "host_id": {
+          "anyOf": [
+            {
+              "maxLength": 66,
+              "minLength": 1,
+              "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "evidence",
+            "assessed",
+            "rules",
+            "batch",
+            "cff",
+            "legacy",
+            "detail"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 150,
+          "minLength": 1,
+          "pattern": "^(?:(?:evidence\\.json|assessed_evidence\\.json|assessment_rules\\.json|batch_manifest\\.json|cff_projection\\.json|legacy_provenance\\.json|details/h-[0-9a-f]{64}/(?:platform|openssl-runtime|crypto-policy|ssh-posture|certificate-inventory|service-inventory)\\.json))$(?![\\s\\S])",
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "sha256": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 134217728,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "slot": {
+          "anyOf": [
+            {
+              "enum": [
+                "platform",
+                "openssl-runtime",
+                "crypto-policy",
+                "ssh-posture",
+                "certificate-inventory",
+                "service-inventory"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "format_version",
+        "host_id",
+        "slot",
+        "path",
+        "size",
+        "sha256",
+        "required",
+        "collection_ids",
+        "asset_ids",
+        "evidence_ids"
+      ],
+      "type": "object"
+    },
+    "collector_flags": {
+      "additionalProperties": false,
+      "properties": {
+        "crypto_policy": {
+          "type": "boolean"
+        },
+        "nginx_certs": {
+          "type": "boolean"
+        },
+        "openssl": {
+          "type": "boolean"
+        },
+        "packages": {
+          "type": "boolean"
+        },
+        "ssh_host_keys": {
+          "type": "boolean"
+        },
+        "sshd": {
+          "type": "boolean"
+        },
+        "system_certs": {
+          "type": "boolean"
+        },
+        "tls_services": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "packages",
+        "openssl",
+        "sshd",
+        "ssh_host_keys",
+        "system_certs",
+        "crypto_policy",
+        "nginx_certs",
+        "tls_services"
+      ],
+      "type": "object"
+    },
+    "collector_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "packages",
+            "openssl",
+            "sshd",
+            "ssh_host_keys",
+            "system_certs",
+            "crypto_policy",
+            "nginx_certs",
+            "tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "detail_requirement": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "maxLength": 66,
+          "minLength": 1,
+          "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "slot": {
+          "enum": [
+            "platform",
+            "openssl-runtime",
+            "crypto-policy",
+            "ssh-posture",
+            "certificate-inventory",
+            "service-inventory"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "slot"
+      ],
+      "type": "object"
+    },
+    "host": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_status": {
+          "enum": [
+            "ATTEMPTED",
+            "NOT_ATTEMPTED",
+            "UNKNOWN",
+            "NOT_APPLICABLE"
+          ],
+          "type": "string"
+        },
+        "attempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dispatch_intent": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "maxLength": 66,
+          "minLength": 1,
+          "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "identity_key": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity_scope": {
+          "enum": [
+            "STABLE",
+            "RUN_SCOPED"
+          ],
+          "type": "string"
+        },
+        "inventory_authority_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/terminal"
+                },
+                {
+                  "$ref": "#/$defs/native_terminal"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "host_id",
+        "target_id",
+        "identity_scope",
+        "inventory_authority_id",
+        "identity_key",
+        "host_state",
+        "reason_code",
+        "attempted",
+        "dispatch_intent",
+        "attempt_status",
+        "terminal"
+      ],
+      "type": "object"
+    },
+    "limits": {
+      "additionalProperties": false,
+      "properties": {
+        "command_timeout_s": {
+          "const": 30
+        },
+        "forks": {
+          "maximum": 2,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_hosts": {
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "serial": {
+          "const": 2
+        },
+        "ssh_timeout_s": {
+          "const": 15
+        }
+      },
+      "required": [
+        "max_hosts",
+        "forks",
+        "serial",
+        "ssh_timeout_s",
+        "command_timeout_s"
+      ],
+      "type": "object"
+    },
+    "missing": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 150,
+          "minLength": 1,
+          "pattern": "^(?:(?:evidence\\.json|assessed_evidence\\.json|assessment_rules\\.json|batch_manifest\\.json|cff_projection\\.json|legacy_provenance\\.json|details/h-[0-9a-f]{64}/(?:platform|openssl-runtime|crypto-policy|ssh-posture|certificate-inventory|service-inventory)\\.json))$(?![\\s\\S])",
+          "type": "string"
+        },
+        "reason_code": {
+          "enum": [
+            "BATCH_MANIFEST_UNAVAILABLE",
+            "REQUIRED_ARTIFACT_MISSING",
+            "REQUIRED_DETAIL_MISSING"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "reason_code"
+      ],
+      "type": "object"
+    },
+    "native_collector_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "pqc_collect_packages",
+            "pqc_collect_openssl",
+            "pqc_collect_sshd",
+            "pqc_collect_ssh_host_keys",
+            "pqc_collect_system_certs",
+            "pqc_collect_crypto_policy",
+            "pqc_collect_nginx_certs",
+            "pqc_collect_tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "native_terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/native_collector_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors"
+      ],
+      "type": "object"
+    },
+    "requirements": {
+      "additionalProperties": false,
+      "properties": {
+        "assessment": {
+          "type": "boolean"
+        },
+        "cff": {
+          "type": "boolean"
+        },
+        "details": {
+          "items": {
+            "$ref": "#/$defs/detail_requirement"
+          },
+          "maxItems": 8186,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "assessment",
+        "cff",
+        "details"
+      ],
+      "type": "object"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "input_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "producer_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "producer_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_kind": {
+          "enum": [
+            "NATIVE_COLLECTOR",
+            "LEGACY_IMPORT",
+            "SYNTHETIC"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_kind",
+        "producer_id",
+        "producer_version",
+        "origin_ref",
+        "input_sha256"
+      ],
+      "type": "object"
+    },
+    "terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/collector_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:pqc:run-manifest:1.0.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "hosts": {
+            "items": {
+              "properties": {
+                "terminal": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/terminal"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "batch_contract": {
+            "const": "B04_NATIVE_V1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence_schema_version": {
+            "const": "1.1.0"
+          },
+          "hosts": {
+            "items": {
+              "properties": {
+                "terminal": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/native_terminal"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "run_kind": {
+            "const": "SYNTHETIC"
+          }
+        }
+      }
+    }
+  ],
+  "description": "Local closed shape; Run Store also validates hashes, references, ownership, exact counts and publication state.",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "maxItems": 8192,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "batch_canonical_sha256": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_contract": {
+      "anyOf": [
+        {
+          "enum": [
+            "B04_S1_CONTRACT_ONLY",
+            "B04_NATIVE_V1"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_missing_reason": {
+      "anyOf": [
+        {
+          "const": "BATCH_MANIFEST_UNAVAILABLE"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_rc": {
+      "anyOf": [
+        {
+          "enum": [
+            0,
+            5,
+            6,
+            7
+          ],
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "counts": {
+      "additionalProperties": false,
+      "properties": {
+        "COMPLETE": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ERROR": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "NOT_ATTEMPTED": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "PARTIAL": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "UNREACHABLE": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "COMPLETE",
+        "PARTIAL",
+        "ERROR",
+        "UNREACHABLE",
+        "NOT_ATTEMPTED"
+      ],
+      "type": "object"
+    },
+    "evidence_schema_version": {
+      "enum": [
+        "1.0.0",
+        "1.1.0"
+      ],
+      "type": "string"
+    },
+    "expected_host_ids": {
+      "items": {
+        "maxLength": 66,
+        "minLength": 1,
+        "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+        "type": "string"
+      },
+      "maxItems": 1000,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "finished_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "flags": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "maxProperties": 10,
+          "patternProperties": {
+            "^(?:h-[0-9a-f]{64})$(?![\\s\\S])": {
+              "$ref": "#/$defs/collector_flags"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hosts": {
+      "items": {
+        "$ref": "#/$defs/host"
+      },
+      "maxItems": 1000,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "limits": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/limits"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "manifest_version": {
+      "const": "1.0.0"
+    },
+    "missing_artifacts": {
+      "items": {
+        "$ref": "#/$defs/missing"
+      },
+      "maxItems": 8192,
+      "minItems": 0,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "profile": {
+      "anyOf": [
+        {
+          "enum": [
+            "baseline",
+            "extended"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "publication_state": {
+      "const": "PUBLISHED"
+    },
+    "reason_code": {
+      "maxLength": 96,
+      "minLength": 1,
+      "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "recorded_at": {
+      "format": "date-time",
+      "maxLength": 40,
+      "minLength": 1,
+      "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+      "type": "string"
+    },
+    "recovery": {
+      "type": "boolean"
+    },
+    "requirements": {
+      "$ref": "#/$defs/requirements"
+    },
+    "rule_version": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rules_sha256": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "run_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "not": {
+        "pattern": "^(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])$(?![\\s\\S])"
+      },
+      "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,63})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "run_kind": {
+      "enum": [
+        "NATIVE_SCAN",
+        "LEGACY_IMPORT",
+        "SYNTHETIC"
+      ],
+      "type": "string"
+    },
+    "run_state": {
+      "enum": [
+        "COMPLETE",
+        "PARTIAL",
+        "ERROR"
+      ],
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "manifest_version",
+    "publication_state",
+    "run_id",
+    "run_kind",
+    "run_state",
+    "reason_code",
+    "recovery",
+    "source",
+    "started_at",
+    "finished_at",
+    "recorded_at",
+    "expected_host_ids",
+    "hosts",
+    "counts",
+    "limits",
+    "profile",
+    "flags",
+    "requirements",
+    "evidence_schema_version",
+    "rule_version",
+    "rules_sha256",
+    "batch_rc",
+    "batch_contract",
+    "batch_canonical_sha256",
+    "batch_missing_reason",
+    "artifacts",
+    "missing_artifacts"
+  ],
+  "title": "PQC Run Store manifest",
+  "type": "object"
+}
