@@ -1,12 +1,12 @@
-# Private Controller run store (M0-08 S1)
+# Private Controller run store (M0-08 S2)
 
-This is the S1 internal Python API and local run-manifest 1.0.0 contract
+This is the internal Python API and local run-manifest 1.0.0 contract
 for issue #9. It is not a scan entry point, an Inventory adapter, a remote
 writer, a catalog, or a report-rendering API. No call authorizes dispatch.
 Plan-only and the existing live-rejection stubs remain unchanged. Issue #8
-must reach DEV_COMPLETE and the Planner must dispatch S2 before binding its
-actual batch result. The B04 adapter below describes the approved synthetic
-terminal contract, not a test of the unfinished native implementation.
+is integrated for restricted development at 1216f76df9913bc0e557523c88de99e1485d24c0.
+S2 binds its actual B04 terminal API for trusted synthetic batches only.
+This is not a production transport qualification or live dispatch grant.
 
 ## Owner-approved storage root
 
@@ -112,7 +112,7 @@ claims/findings, and at most one immutable checkpoint per host. Use
 `host_fragment` to split a validated unassessed document. The caller records
 actual terminal data, not an inference from files or logs.
 
-The S1 synthetic B04 contract uses terminal rows with exactly `target_id`,
+The explicitly identified S1 fixture and native B04 v1 contracts use terminal rows with exactly `target_id`,
 `host_state`, `attempted`, `reason_code`, `collectors`. The eight collector
 rows have `collector_id`, `requested`, `state`, `reason_code`, `rc`,
 `collection_ids`. They match frozen flags and partition the same host's
@@ -131,11 +131,15 @@ observation, identity and source with the checkpoints. The native-like
 `profile`, `run_state`, `reason_code`, sorted `hosts` (terminal rows).
 The manifest preserves both raw artifact SHA and canonical batch SHA,
 plus the actual rc supplied by the trusted caller. It labels this contract
-`B04_S1_CONTRACT_ONLY`; it is not an assertion that #8 was executed.
+`B04_S1_CONTRACT_ONLY` for the historical short-ID fixture; it is not an
+assertion that #8 was executed. The `B04_NATIVE_V1` path is selected explicitly
+at begin, not inferred from payload shape, and uses the actual #8 validator.
+It preserves original run reason/state/rc even when all hosts completed before
+an abnormal stop, or a fatal ERROR host retained earlier valid observations.
 Normal rc 0/5/6 requires COMPLETE/PARTIAL/ERROR respectively; rc 7 is a
 caught interruption with reason INTERRUPTED and non-COMPLETE state.
 INTERRUPTED is valid only with rc 7; contradictory rc/state/reason inputs
-are rejected, not rewritten, during publication, reading and recovery. A run
+are rejected, not rewritten, during publication, reading and recovery. A historical S1 fixture run
 is COMPLETE only for a nonempty all-COMPLETE host set without interruption,
 PARTIAL when any host provides valid coverage but the run is incomplete,
 otherwise ERROR. No report existence is used as a success oracle.
@@ -206,7 +210,7 @@ summary or arbitrary attachment names are not accepted.
 | evidence.json | Actual canonical Evidence 1.0.0 or 1.1.0 | 32 MiB |
 | assessed_evidence.json | Actual canonical evaluation | 32 MiB |
 | assessment_rules.json | Exact supplied rules bytes (existing JSON-form rules) | 64 KiB |
-| batch_manifest.json | Original B04 S1 terminal bytes | 16 MiB |
+| batch_manifest.json | Original selected B04 terminal bytes | 16 MiB |
 | cff_projection.json | S1 synthetic CFF + companion pair | 128 MiB |
 | legacy_provenance.json | Closed original-source provenance | 1 MiB |
 | details/<host_id>/<slot>.json | S1 synthetic typed detail | 1 MiB |
@@ -288,7 +292,35 @@ raw command output, secret attachments or arbitrary attachment paths are
 needed. Closed records and rejection of recognizable sensitive keys/PEM
 are not general DLP or source authentication.
 
-S2 remains blocked by #8; do not merge or declare #9 DEV_COMPLETE from S1.
+## Native v1 restricted integration
+
+Use `batch_contract="B04_NATIVE_V1"` with `run_kind="SYNTHETIC"`, Evidence
+1.1.0, and all eight actual `pqc_collect_*` boolean keys per target. Mapping
+is exactly the eight fixed suffixes listed above (including `tls_services`,
+which remains disabled). The journal freezes short-ID flags and the explicit
+contract marker. The raw terminal and each host checkpoint preserve the long
+IDs. Actual `batch_execution.validate_terminal_manifest` validates run/rc and
+its native host validator checks terminal rows against frozen flags. The store
+also checks every referenced collection, host, short fixture collector and
+scope key, actual Evidence coverage and immutable checkpoints. It does not
+infer COLLECTED from empty refs or convert a fatal ERROR into PARTIAL.
+Unknown contracts, versions, mismatched refs and unsupported producers are
+rejected; there is no native-to-fixture fallback. Historical fixture calls
+use short flags; new historical NATIVE_SCAN fixture calls must explicitly
+select `B04_S1_CONTRACT_ONLY`. This compatibility marker is not a real scan.
+Reader and recovery retain the selected contract. A recovered run without a
+terminal batch has null batch rc/hash and BATCH_MANIFEST_UNAVAILABLE, never a
+fabricated native terminal result. Existing legacy and S1 journals remain
+readable under their original contract.
+
+The trusted test orchestrator freezes the scope before execute_batch, persists
+intent before native queueing, validates separately acquired synthetic
+Evidence, and records the actual returned terminal rows. This does not implement
+production per-dispatch orchestration or register live collectors. Real #57
+producer IDs, scope-specific mapping and typed detail/CFF integration remain
+unqualified; the native path accepts only the fixed synthetic short-ID scope.
+Run store does not authorize any host connection. S2 review and Owner-approved
+merge are required before #9 DEV_COMPLETE.
 Production native/legacy/CFF/collector wiring, reader/catalog/Portal,
 actual Controller/OL, approved local filesystem durability and power loss,
 permissions/load and integrated release/offline QA remain for the authorized

@@ -76,6 +76,7 @@ def kwargs(rid=RID, targets=TARGETS[:1], version='1.1.0', kind='SYNTHETIC', *, s
              'limits': deepcopy(LIMITS), 'profile': 'baseline',
              'requested_flags': {h: {k: k in requested for k in m.COLLECTORS} for h in targets}}
     if requirements is not None: value['requirements'] = requirements
+    if kind == 'NATIVE_SCAN': value['batch_contract'] = m.S1_BATCH_CONTRACT
     if kind == 'LEGACY_IMPORT':
         original = raw({'fixture': 'legacy-original', 'selected': list(targets)})
         source.update(producer_id='legacy-ol-run-summary', producer_version=None, input_sha256=digest(original))

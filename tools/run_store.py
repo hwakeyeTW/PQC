@@ -1,4 +1,4 @@
-"""PQC M0-08 S1: private Controller run store. No dispatch or public CLI.
+"""PQC M0-08: private Controller run store. No dispatch or public CLI.
 
 The caller supplies authorized scope and typed data, not file names or loaders.
 Linux local POSIX only. The final manifest is the immutable commit marker.
@@ -39,6 +39,14 @@ KINDS = {'NATIVE_SCAN': 'NATIVE_COLLECTOR', 'LEGACY_IMPORT': 'LEGACY_IMPORT',
          'SYNTHETIC': 'SYNTHETIC'}
 COLLECTORS = ('packages', 'openssl', 'sshd', 'ssh_host_keys', 'system_certs',
               'crypto_policy', 'nginx_certs', 'tls_services')
+S1_BATCH_CONTRACT = 'B04_S1_CONTRACT_ONLY'
+NATIVE_BATCH_CONTRACT = 'B04_NATIVE_V1'
+NATIVE_COLLECTORS = {
+    'pqc_collect_packages': 'packages', 'pqc_collect_openssl': 'openssl',
+    'pqc_collect_sshd': 'sshd', 'pqc_collect_ssh_host_keys': 'ssh_host_keys',
+    'pqc_collect_system_certs': 'system_certs', 'pqc_collect_crypto_policy': 'crypto_policy',
+    'pqc_collect_nginx_certs': 'nginx_certs', 'pqc_collect_tls_services': 'tls_services',
+}
 DETAIL_SLOTS = ('platform', 'openssl-runtime', 'crypto-policy', 'ssh-posture',
                 'certificate-inventory', 'service-inventory')
 FORMATS = ('legacy-per-host', 'legacy-fleet', 'legacy-ol-run-summary')
@@ -577,10 +585,35 @@ def _requirements(value, hosts, kind):
     return slots
 
 
+def _native_api():
+    # No import of Ansible or dispatch on the historical fixture/legacy path.
+    # The actual integrated producer, not a second local B04 validator, owns
+    # native terminal state/reason/rc semantics. Missing API is not a fallback.
+    try:
+        from tools import batch_execution
+    except ImportError:
+        raise StoreError('NATIVE_BATCH_UNAVAILABLE') from None
+    require(tuple(sorted(NATIVE_COLLECTORS)) == batch_execution._COLLECTORS,
+            'NATIVE_BATCH_UNAVAILABLE')
+    return batch_execution
+
+
+def _is_native(s):
+    return s.get('batch_contract') == NATIVE_BATCH_CONTRACT
+
+
 def _scope(s):
-    _keys(s, 'run_id run_kind evidence_schema_version source started_at recorded_at hosts limits profile flags requirements')
+    fields = 'run_id run_kind evidence_schema_version source started_at recorded_at hosts limits profile flags requirements'
+    if type(s) is dict and 'batch_contract' in s:
+        fields += ' batch_contract'
+        require(_is_native(s), 'BATCH_CONTRACT')
+    _keys(s, fields)
     _rid(s['run_id']); _enum(s['run_kind'], KINDS)
     _enum(s['evidence_schema_version'], ('1.0.0', '1.1.0'))
+    if _is_native(s):
+        require(s['run_kind'] == 'SYNTHETIC' and s['evidence_schema_version'] == '1.1.0',
+                'UNVERIFIED_PRODUCER_FORMAT')
+        api = _native_api()
     hs = s['hosts']
     require(type(hs) is list and 0 < len(hs) <= (1000 if s['run_kind'] == 'LEGACY_IMPORT' else 10), 'HOST_LIMIT')
     for h in hs:
@@ -591,6 +624,10 @@ def _scope(s):
     ids = _ids([h['host_id'] for h in hs], limit=1000)
     targets = [h['target_id'] for h in hs if h['target_id'] is not None]
     require(len(set(targets)) == len(targets), 'DUPLICATE_TARGET')
+    if _is_native(s):
+        require(len(targets) == len(hs) and all(api._scope.HOST.fullmatch(n) and
+                n.lower() not in api._scope.RESERVED and not api._scope.loopback(n)
+                for n in targets), 'INVALID_TARGET')
     require([h['host_id'] for h in hs] == sorted(ids), 'HOST_ORDER')
     # Validate the frozen metadata and every ID via the actual Evidence model.
     _canonical(_doc(s, hs, 'PLANNED'))
@@ -649,8 +686,12 @@ def _match_doc(s, doc, *, fragment=False):
     gaps = {c['host_id'] for c in doc['collections'] if c['collection_state'] not in
             ('COLLECTED', 'NOT_APPLICABLE', 'NOT_SCANNED')}
     for h in doc['hosts']:
-        require((h['host_state'] in ('COMPLETE', 'PARTIAL')) == (h['host_id'] in good),
-                'HOST_COVERAGE')
+        # A native fatal host can retain earlier acquired observations without
+        # claiming safely completed coverage. The exact terminal is checked below.
+        fatal = (_is_native(s) and h['host_state'] == 'ERROR' and
+                 h['reason_code'] in _native_api()._FATAL)
+        require(fatal or (h['host_state'] in ('COMPLETE', 'PARTIAL')) ==
+                (h['host_id'] in good), 'HOST_COVERAGE')
         require(h['host_state'] != 'COMPLETE' or h['host_id'] not in gaps, 'HOST_COVERAGE')
         if s['run_kind'] == 'LEGACY_IMPORT':
             require(h['host_state'] != 'UNREACHABLE', 'LEGACY_OUTCOME')
@@ -734,14 +775,21 @@ def _detail(s, doc, value):
 
 
 def _terminal(s, doc, h, row, attempted):
-    """Validate one exact synthetic B04 terminal row with its Evidence."""
+    """Bind one terminal to its frozen flags, host and actual Evidence refs."""
+    native = _is_native(s)
+    if native:
+        api = _native_api()
+        require(api._valid_host(row, h['target_id'],
+                {flag: s['flags'][h['host_id']][short] for flag, short in NATIVE_COLLECTORS.items()}),
+                'INVALID_TERMINAL_MANIFEST')
     _keys(row, 'target_id host_state attempted reason_code collectors')
     require(row['target_id'] == h['target_id'], 'BATCH_HOST_STATE')
     hid = h['host_id']
     _bool(row['attempted']); _reason(row['reason_code'])
     require(row['host_state'] == h['host_state'] and row['reason_code'] == h['reason_code'] and
             row['attempted'] is attempted, 'BATCH_HOST_STATE')
-    require(row['reason_code'] not in ('OUTCOME_UNKNOWN', 'RECOVERY_INCOMPLETE'), 'BATCH_HOST_STATE')
+    if not native:
+        require(row['reason_code'] not in ('OUTCOME_UNKNOWN', 'RECOVERY_INCOMPLETE'), 'BATCH_HOST_STATE')
     if row['host_state'] == 'UNREACHABLE':
         require(row['reason_code'] == 'CONNECTION_FAILED', 'BATCH_HOST_STATE')
     flags = s['flags'][hid]
@@ -750,13 +798,16 @@ def _terminal(s, doc, h, row, attempted):
     seen, used, requested = set(), set(), []
     for c in row['collectors']:
         _keys(c, 'collector_id requested state reason_code rc collection_ids')
-        _enum(c['collector_id'], COLLECTORS); _bool(c['requested']); _enum(c['state'], STATES); _reason(c['reason_code'])
+        _enum(c['collector_id'], NATIVE_COLLECTORS if native else COLLECTORS)
+        short = NATIVE_COLLECTORS[c['collector_id']] if native else c['collector_id']
+        _bool(c['requested']); _enum(c['state'], STATES); _reason(c['reason_code'])
         if c['rc'] is not None: _int(c['rc'], -255, 255)
-        require(c['collector_id'] not in seen and c['requested'] is flags[c['collector_id']], 'BATCH_COLLECTORS')
-        seen.add(c['collector_id'])
-        refs = _ids(c['collection_ids'], 'collection', 20000)
+        require(short not in seen and c['requested'] is flags[short], 'BATCH_COLLECTORS')
+        seen.add(short)
+        refs = _ids(c['collection_ids'], 'collection', 8 if native else 20000)
         require(refs <= coll.keys() and not refs & used, 'FOREIGN_REF'); used |= refs
-        require(all(coll[x]['collector_id'] == c['collector_id'] for x in refs), 'FOREIGN_COLLECTOR')
+        require(all(coll[x]['collector_id'] == short and
+                    (not native or coll[x]['scope_key'] == short) for x in refs), 'FOREIGN_COLLECTOR')
         states = [coll[x]['collection_state'] for x in refs]
         if states:
             if all(x == 'NOT_APPLICABLE' for x in states): derived = 'NOT_APPLICABLE'
@@ -775,16 +826,24 @@ def _terminal(s, doc, h, row, attempted):
     require(used == coll.keys(), 'BATCH_COVERAGE')
     has_good = any(x in GOOD for x in requested)
     full = bool(requested) and all(x in ('COLLECTED', 'NOT_APPLICABLE') for x in requested)
-    require((row['host_state'] in ('COMPLETE', 'PARTIAL')) == has_good and
-            (row['host_state'] == 'COMPLETE') == full, 'BATCH_COVERAGE')
+    if not native:
+        require((row['host_state'] in ('COMPLETE', 'PARTIAL')) == has_good and
+                (row['host_state'] == 'COMPLETE') == full, 'BATCH_COVERAGE')
     require(row['attempted'] == (row['host_state'] != 'NOT_ATTEMPTED'), 'BATCH_HOST_STATE')
     if not requested: require(not row['attempted'], 'BATCH_COVERAGE')
     return row
 
 
 def _batch(s, doc, batch, rc, attempts):
-    """S1 closed B04 fixture contract. Actual #8 API binding belongs to S2."""
+    """Validate the explicitly selected contract, never infer it from shape."""
     require(s['run_kind'] != 'LEGACY_IMPORT', 'LEGACY_BATCH')
+    native = _is_native(s)
+    if native:
+        api = _native_api()
+        try:
+            api.validate_terminal_manifest(batch, rc)
+        except api.Denied:
+            raise StoreError('INVALID_TERMINAL_MANIFEST') from None
     _keys(batch, 'batch_manifest_version target_ids target_count limits profile run_state reason_code hosts')
     _int(batch['batch_manifest_version'], 1, 1); _int(rc, 0, 7)
     _reason(batch['reason_code'])
@@ -799,12 +858,15 @@ def _batch(s, doc, batch, rc, attempts):
         h = index[row['target_id']]; att = attempts[h['host_id']]
         require(_same(row, att['terminal']), 'TERMINAL_MISMATCH')
         _terminal(s, doc, h, row, att['attempted'])
-    state = _run_state(doc['hosts'], interrupted=rc == 7)
-    require(batch['run_state'] == doc['run']['run_state'] == state, 'BATCH_RUN_STATE')
-    require(rc == 7 or rc == {'COMPLETE': 0, 'PARTIAL': 5, 'ERROR': 6}[state], 'BATCH_RC')
+    if native:
+        require(batch['run_state'] == doc['run']['run_state'], 'BATCH_RUN_STATE')
+    else:
+        state = _run_state(doc['hosts'], interrupted=rc == 7)
+        require(batch['run_state'] == doc['run']['run_state'] == state, 'BATCH_RUN_STATE')
+        require(rc == 7 or rc == {'COMPLETE': 0, 'PARTIAL': 5, 'ERROR': 6}[state], 'BATCH_RC')
     require((rc == 7) == (batch['reason_code'] == 'INTERRUPTED'), 'BATCH_RC')
-    if doc['run'].get('coverage_reason') is not None:
-        require(doc['run']['coverage_reason'] == batch['reason_code'], 'BATCH_RUN_REASON')
+    if native or doc['run'].get('coverage_reason') is not None:
+        require(doc['run'].get('coverage_reason') == batch['reason_code'], 'BATCH_RUN_REASON')
     return batch
 
 
@@ -926,10 +988,13 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
         else:
             require(recovery and entry['attempted'] is not True and
                     h['host_state'] in ('ERROR', 'NOT_ATTEMPTED'), 'MISSING_TERMINAL_CHECKPOINT')
+            if _is_native(s):
+                require(not any(x['host_id'] == hid for k in ('collections', 'assets', 'evidence')
+                                for x in doc[k]), 'MISSING_TERMINAL_CHECKPOINT')
         require(recovery or entry['attempt_status'] != 'UNKNOWN', 'UNKNOWN_ATTEMPT')
         rows.append({**h, **entry})
     batch_raw, legacy_raw = get('batch'), get('legacy')
-    batch_hash, batch_contract, batch_missing_reason = None, None, None
+    batch_hash, batch_contract, batch_missing_reason = None, s.get('batch_contract'), None
     run_reason = run.get('coverage_reason', 'RUN_COMPLETE' if state == 'COMPLETE' else 'RUN_INCOMPLETE')
     if s['run_kind'] == 'LEGACY_IMPORT':
         require(batch_raw is None and batch_rc is None and legacy_raw is not None, 'LEGACY_BATCH')
@@ -945,7 +1010,7 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
             require(batch_raw is not None, 'MISSING_BATCH')
             batch = _batch(s, doc, _loads(batch_raw), batch_rc, attempts)
             batch_hash = _digest(_json_bytes(batch))
-            batch_contract = 'B04_S1_CONTRACT_ONLY'
+            batch_contract = NATIVE_BATCH_CONTRACT if _is_native(s) else S1_BATCH_CONTRACT
             run_reason = batch['reason_code']
     assessed_raw, rules_raw, cff_raw = get('assessed'), get('rules'), get('cff')
     require((assessed_raw is None) == (rules_raw is None), 'MISSING_ASSESSMENT_PAIR')
@@ -1030,6 +1095,8 @@ def _manifest_header(manifest, rid):
     s = {k: manifest[k] for k in ('run_id', 'run_kind', 'evidence_schema_version', 'source',
                                  'started_at', 'recorded_at', 'limits', 'profile', 'flags', 'requirements')}
     s['hosts'] = hs
+    if manifest['batch_contract'] == NATIVE_BATCH_CONTRACT:
+        s['batch_contract'] = NATIVE_BATCH_CONTRACT
     _scope(s)
     require(type(manifest['artifacts']) is list and 0 < len(manifest['artifacts']) <= MAX_SLOTS, 'SLOT_LIMIT')
     total = 0; entries = {}
@@ -1126,13 +1193,23 @@ class RunStore:
     @_public
     def begin(self, *, run_id=None, run_kind, evidence_schema_version, source,
               recorded_at, started_at, expected_hosts, limits=None, profile=None,
-              requested_flags=None, requirements=None, legacy_raw=None, legacy_provenance=None):
+              requested_flags=None, requirements=None, legacy_raw=None, legacy_provenance=None,
+              batch_contract=None):
         """Reserve exactly one directory; explicit IDs never change on collision.
 
         requested_flags is keyed by literal target_id; requirements.details is
-        keyed by derived host_id (explicit IDs) or can be empty. No dispatch.
+        keyed by derived host_id (explicit IDs) or can be empty. Native v1
+        takes the actual eight long flag names and freezes their short-ID
+        projection. The native contract is limited to SYNTHETIC Evidence 1.1.
+        No dispatch or production producer registration.
         """
         self._check(); _enum(run_kind, KINDS)
+        require(batch_contract in (None, S1_BATCH_CONTRACT, NATIVE_BATCH_CONTRACT), 'BATCH_CONTRACT')
+        require(run_kind != 'LEGACY_IMPORT' or batch_contract is None, 'LEGACY_BATCH')
+        # Historical NATIVE_SCAN fixture compatibility is explicitly selected;
+        # a real producer must not silently fall back to the old short-ID shape.
+        require(run_kind != 'NATIVE_SCAN' or batch_contract == S1_BATCH_CONTRACT,
+                'UNVERIFIED_PRODUCER_FORMAT')
         if run_id is not None: _rid(run_id)
         explicit = run_id is not None
         # Validate a fixed candidate scope before filesystem reservation. A
@@ -1145,10 +1222,17 @@ class RunStore:
             else:
                 require(type(requested_flags) is dict and set(requested_flags) == {h['target_id'] for h in hosts}, 'PROFILE_FLAGS')
                 flags = {h['host_id']: requested_flags[h['target_id']] for h in hosts}
+                if batch_contract == NATIVE_BATCH_CONTRACT:
+                    require(all(type(f) is dict and f.keys() == NATIVE_COLLECTORS.keys()
+                                for f in flags.values()), 'PROFILE_FLAGS')
+                    flags = {hid: {short: f[long] for long, short in NATIVE_COLLECTORS.items()}
+                             for hid, f in flags.items()}
             s = {'run_id': rid, 'run_kind': run_kind, 'evidence_schema_version': evidence_schema_version,
                  'source': source, 'started_at': started_at, 'recorded_at': recorded_at,
                  'hosts': hosts, 'limits': limits, 'profile': profile, 'flags': flags,
                  'requirements': {'assessment': False, 'cff': False, 'details': []} if requirements is None else requirements}
+            if batch_contract == NATIVE_BATCH_CONTRACT:
+                s['batch_contract'] = NATIVE_BATCH_CONTRACT
             s = _loads(_json_bytes(s)); _scope(s)
             if run_kind == 'LEGACY_IMPORT':
                 require(type(legacy_raw) is bytes and len(legacy_raw) <= MAX_EVIDENCE and
@@ -1385,8 +1469,8 @@ class RunWriter:
                  assessed=None, rules_raw=None, cff=None):
         """Publish validated final Evidence and mandatory paired artifacts.
 
-        batch_raw preserves original bytes of the S1 B04 synthetic contract.
-        Actual #8 producer integration is not performed in S1.
+        batch_raw preserves original bytes of the selected B04 contract.
+        Native v1 binds the actual #8 terminal to the frozen Evidence scope.
         """
         self._check(); s = self._j['scope']
         doc = _evidence_bytes(_canonical(_match_doc(s, document)))
@@ -1574,13 +1658,18 @@ def manifest_schema():
         'collector_outcome': obj({'collector_id': en(COLLECTORS), 'requested': boolean, 'state': en(STATES),
                                   'reason_code': reason, 'rc': nullable(integer(-255, 255)),
                                   'collection_ids': arr(cid, 20000)}),
+        'native_collector_outcome': obj({'collector_id': en(NATIVE_COLLECTORS),
+                                  'requested': boolean, 'state': en(STATES), 'reason_code': reason,
+                                  'rc': nullable(integer(-255, 255)), 'collection_ids': arr(cid, 8)}),
+        'native_terminal': obj({'target_id': target, 'host_state': en(HOST_STATES), 'attempted': boolean,
+                         'reason_code': reason, 'collectors': arr(ref('native_collector_outcome'), 8, 8)}),
         'terminal': obj({'target_id': target, 'host_state': en(HOST_STATES), 'attempted': boolean,
                          'reason_code': reason, 'collectors': arr(ref('collector_outcome'), 8, 8)}),
         'host': obj({'host_id': hid, 'target_id': nullable(target), 'identity_scope': en(('STABLE', 'RUN_SCOPED')),
                      'inventory_authority_id': nullable(string(SLUG, 128)), 'identity_key': nullable(target),
                      'host_state': en(HOST_STATES), 'reason_code': reason, 'attempted': nullable(boolean),
                      'dispatch_intent': nullable(boolean), 'attempt_status': en(('ATTEMPTED', 'NOT_ATTEMPTED', 'UNKNOWN', 'NOT_APPLICABLE')),
-                     'terminal': nullable(ref('terminal'))}),
+                     'terminal': nullable({'oneOf': [ref('terminal'), ref('native_terminal')]})}),
         'detail_requirement': obj({'host_id': hid, 'slot': en(DETAIL_SLOTS)}),
         'requirements': obj({'assessment': boolean, 'cff': boolean,
                              'details': arr(ref('detail_requirement'), MAX_SLOTS-6)}),
@@ -1605,12 +1694,20 @@ def manifest_schema():
               'requirements': ref('requirements'), 'evidence_schema_version': en(('1.0.0', '1.1.0')),
               'rule_version': nullable(version), 'rules_sha256': nullable(sha),
               'batch_rc': nullable({'type': 'integer', 'enum': [0, 5, 6, 7]}),
-              'batch_contract': nullable(const('B04_S1_CONTRACT_ONLY')),
+              'batch_contract': nullable(en((S1_BATCH_CONTRACT, NATIVE_BATCH_CONTRACT))),
               'batch_canonical_sha256': nullable(sha),
               'batch_missing_reason': nullable(const('BATCH_MANIFEST_UNAVAILABLE')),
               'artifacts': arr(ref('artifact'), MAX_SLOTS, 1), 'missing_artifacts': arr(ref('missing'), MAX_SLOTS)}
     return {'$schema': 'https://json-schema.org/draft/2020-12/schema',
             '$id': 'urn:pqc:run-manifest:1.0.0',
-            'title': 'PQC Run Store S1 manifest',
+            'title': 'PQC Run Store manifest',
             'description': 'Local closed shape; Run Store also validates hashes, references, ownership, exact counts and publication state.',
-            **obj(fields), '$defs': defs}
+            **obj(fields), '$defs': defs,
+            'allOf': [{
+                'if': {'properties': {'batch_contract': const(NATIVE_BATCH_CONTRACT)}},
+                'then': {'properties': {
+                    'run_kind': const('SYNTHETIC'), 'evidence_schema_version': const('1.1.0'),
+                    'hosts': {'items': {'properties': {'terminal': nullable(ref('native_terminal'))}}}}},
+                'else': {'properties': {
+                    'hosts': {'items': {'properties': {'terminal': nullable(ref('terminal'))}}}}},
+            }]}

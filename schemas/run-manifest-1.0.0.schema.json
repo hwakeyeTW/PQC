@@ -367,7 +367,14 @@
         "terminal": {
           "anyOf": [
             {
-              "$ref": "#/$defs/terminal"
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/terminal"
+                },
+                {
+                  "$ref": "#/$defs/native_terminal"
+                }
+              ]
             },
             {
               "type": "null"
@@ -443,6 +450,126 @@
       "required": [
         "path",
         "reason_code"
+      ],
+      "type": "object"
+    },
+    "native_collector_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "pqc_collect_packages",
+            "pqc_collect_openssl",
+            "pqc_collect_sshd",
+            "pqc_collect_ssh_host_keys",
+            "pqc_collect_system_certs",
+            "pqc_collect_crypto_policy",
+            "pqc_collect_nginx_certs",
+            "pqc_collect_tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "native_terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/native_collector_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors"
       ],
       "type": "object"
     },
@@ -582,6 +709,63 @@
   "$id": "urn:pqc:run-manifest:1.0.0",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "hosts": {
+            "items": {
+              "properties": {
+                "terminal": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/terminal"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "batch_contract": {
+            "const": "B04_NATIVE_V1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence_schema_version": {
+            "const": "1.1.0"
+          },
+          "hosts": {
+            "items": {
+              "properties": {
+                "terminal": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/native_terminal"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "run_kind": {
+            "const": "SYNTHETIC"
+          }
+        }
+      }
+    }
+  ],
   "description": "Local closed shape; Run Store also validates hashes, references, ownership, exact counts and publication state.",
   "properties": {
     "artifacts": {
@@ -609,7 +793,11 @@
     "batch_contract": {
       "anyOf": [
         {
-          "const": "B04_S1_CONTRACT_ONLY"
+          "enum": [
+            "B04_S1_CONTRACT_ONLY",
+            "B04_NATIVE_V1"
+          ],
+          "type": "string"
         },
         {
           "type": "null"
@@ -901,6 +1089,6 @@
     "artifacts",
     "missing_artifacts"
   ],
-  "title": "PQC Run Store S1 manifest",
+  "title": "PQC Run Store manifest",
   "type": "object"
 }
