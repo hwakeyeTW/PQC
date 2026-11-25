@@ -950,7 +950,7 @@ def _task(ctx, names):
 
 
 @contextlib.contextmanager
-def _worker_boundary(ctx, name, registry):
+def _worker_boundary(ctx, name, registry, collect=None):
     """Inherited only by the next native fork; never invoke original SSH _run."""
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.connection import ssh
@@ -998,7 +998,7 @@ def _worker_boundary(ctx, name, registry):
             actual = _native_argv(conn)
             require(actual == expected[:2] and _effective_ssh(tuple(argv), expected[1]) == expected[2],
                     4, 'BATCH_GUARD_DENIED')
-        result = _collect(name, flags, registry)
+        result = _collect(name, flags, registry) if collect is None else collect(name, flags, registry)
         raw = json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')
         require(len(raw) <= _QUEUE_BYTES - 350, 3, 'INVALID_NATIVE_RESULT')
         return 0, raw, b''
@@ -1017,7 +1017,7 @@ def _worker_boundary(ctx, name, registry):
         ssh.Connection._run = original_run
 
 
-def _make_queue():
+def _make_queue(receipt_validator=None):
     from ansible.executor.task_queue_manager import FinalQueue
     class ClosedQueue(FinalQueue):
         # The actual WorkerProcess calls this native result boundary. Do not
@@ -1043,7 +1043,10 @@ def _make_queue():
             if not isinstance(task_id, str) or not re.fullmatch(r'[0-9a-f-]{1,128}', task_id):
                 task_id = 'invalid-task'
                 row = None
-            if row is not None:
+            if row is not None and receipt_validator is not None:
+                if not receipt_validator(row, name):
+                    row = None
+            elif row is not None:
                 try:
                     rows = row['collectors']
                     flags = {f: c['requested'] for f, c in zip(_COLLECTORS, rows)}
@@ -1227,6 +1230,10 @@ def execute_batch(ctx):
     Denied(2/3/4) before dispatch is a preflight rejection, not a run.
     There is no public adapter/transport parameter or live execution grant.
     """
+    return _execute_batch(ctx)
+
+
+def _execute_batch(ctx, producer_session=None):
     import threading
     import ctypes
     from ansible import context
@@ -1244,6 +1251,8 @@ def execute_batch(ctx):
     interrupted = phase_active = fork_critical = False
     controller_pid = os.getpid()
     handlers = {}
+    if producer_session is not None:
+        producer_session.handlers = handlers
     tqm = queue = ledger = None
     wave = None
     subreaper = scheduling = False
@@ -1332,7 +1341,9 @@ def execute_batch(ctx):
                     if time.monotonic() >= launch_end:
                         raise _Deadline()
                 BaseProcess.start = start_worker
-                with _worker_boundary(ctx, name, registry):
+                boundary = (_worker_boundary(ctx, name, registry) if producer_session is None else
+                            _worker_boundary(ctx, name, registry, producer_session.collect))
+                with boundary:
                     strategy._queue_task(host, task, vals, pc)
         finally:
             BaseProcess.start = original_start
@@ -1354,10 +1365,13 @@ def execute_batch(ctx):
                 require(_request(ctx._request) == ctx._request and _source_identity(ctx._source) == ctx._source_id
                         and _project(ctx._inventory, ctx._variables, ctx._request)
                         == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
-                registry = _passive_adapters()
-                require(type(registry) is dict and registry.keys() <= _PASSIVE
-                        and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
-                ledger = _Ledger(ctx, registry)
+                if producer_session is None:
+                    registry = _passive_adapters()
+                    require(type(registry) is dict and registry.keys() <= _PASSIVE
+                            and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+                    ledger = _Ledger(ctx, registry)
+                else:
+                    registry, ledger = producer_session.prepare(ctx)
         except _Deadline:
             if not interrupted:
                 raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
@@ -1395,7 +1409,8 @@ def execute_batch(ctx):
                         signal.signal(sig, interrupt)
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 tqm._final_q.close()
-                queue = tqm._final_q = _make_queue()
+                queue = tqm._final_q = (_make_queue() if producer_session is None else
+                                        _make_queue(producer_session.bridge.valid_receipt))
             with _quiet():
                 for offset in range(0, len(names), width):
                     if not poll():
@@ -1446,7 +1461,8 @@ def execute_batch(ctx):
                         ledger.fail('INTERRUPTED')
     except _Cancelled:
         if ledger is None:
-            ledger = _Ledger(ctx, {})
+            ledger = (_Ledger(ctx, {}) if producer_session is None else
+                      producer_session.cancelled_before_prepare(ctx))
             ledger.rows.clear()
         ledger.fail('INTERRUPTED')
     except _Deadline:
@@ -1481,10 +1497,309 @@ def execute_batch(ctx):
                             ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
                 tqm.terminate()
         finally:
-            for sig, previous in handlers.items():
-                signal.signal(sig, previous)
+            if producer_session is None:
+                for sig, previous in handlers.items():
+                    signal.signal(sig, previous)
             if subreaper:
                 require(libc.prctl(36, old.value, 0, 0, 0) == 0, 3, 'NATIVE_CONTEXT_UNVERIFIED')
     if interrupted:
         ledger.fail('INTERRUPTED')
+    if producer_session is not None:
+        return producer_session.finish(ctx, ledger, lambda: interrupted)
     return _manifest(ctx, ledger.finish(), ledger.stop)
+
+
+# I1a: the same guarded queue, worker deadlines and lifecycle, with a distinct
+# private receipt path. V1 never consumes a V2 result or its reference limits.
+def _v2_base_row(row):
+    result = {k: v for k, v in row.items() if k != 'platform'}
+    result['collectors'] = [{**c, 'collection_ids': [],
+        'reason_code': 'COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else c['reason_code']}
+        for c in row['collectors']]
+    return result
+
+
+def _valid_v2_outcome(row, flag, requested, cap):
+    if type(row) is not dict or type(row.get('collection_ids')) is not list:
+        return False
+    ids = row['collection_ids']
+    if (len(ids) > cap or any(type(x) is not str or not re.fullmatch(r'c-[0-9a-f]{64}', x) for x in ids)
+            or ids != sorted(set(ids))):
+        return False
+    reduced = {**row, 'collection_ids': []}
+    # V2 can report an aggregate collection error without inventing a command
+    # rc. Reuse V1's state/rc shape, not its collection-reference capacity.
+    if reduced.get('reason_code') == 'COLLECTION_ERROR':
+        if reduced.get('state') != 'ERROR' or reduced.get('rc') is not None:
+            return False
+        reduced['reason_code'] = 'COMMAND_IO_FAILED'
+    return _valid_outcome(reduced, flag, requested) and (row['state'] != 'UNREACHABLE' or not ids)
+
+
+def validate_producer_manifest(manifest, rc):
+    """V2 terminal shape only; exact Evidence binding is a separate check."""
+    from tools import scan_collectors as bridge
+    require(type(manifest) is dict and type(manifest.get('batch_manifest_version')) is int
+            and manifest['batch_manifest_version'] == 2 and type(manifest.get('hosts')) is list
+            and 1 <= len(manifest['hosts']) <= 10, 3, 'INVALID_TERMINAL_MANIFEST')
+    caps = {bridge.PLATFORM: 10, bridge.PACKAGES: 2, bridge.SSL: 261, bridge.POLICY_FLAG: 9,
+            bridge.SSHD: 8, bridge.KEYS: 1, bridge.CERT_FLAG: 3, bridge.NGINX: 0, bridge.TLS: 0}
+    reduced = []
+    refs = set()
+    for row in manifest['hosts']:
+        require(type(row) is dict and row.keys() == {'target_id', 'host_state', 'attempted', 'reason_code', 'collectors', 'platform'}
+                and type(row['collectors']) is list and len(row['collectors']) == len(_COLLECTORS)
+                and all(type(c) is dict and type(c.get('requested')) is bool for c in row['collectors']),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        flags = {f: c['requested'] for f, c in zip(_COLLECTORS, row['collectors'])}
+        require(not flags[bridge.NGINX] and not flags[bridge.TLS]
+                and _valid_v2_outcome(row['platform'], bridge.PLATFORM, any(flags.values()), 10)
+                and all(_valid_v2_outcome(c, f, flags[f], caps[f]) for c, f in zip(row['collectors'], _COLLECTORS)),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
+        require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)
+                and (row['attempted'] or (not ids and row['platform']['state'] == 'NOT_SCANNED')),
+                3, 'INVALID_TERMINAL_MANIFEST')
+        refs.update(ids)
+        reduced.append(_v2_base_row(row))
+    require(len(refs) <= bridge.MAX_REFS * 10, 3, 'INVALID_TERMINAL_MANIFEST')
+    validate_terminal_manifest({**manifest, 'batch_manifest_version': 1, 'hosts': reduced}, rc)
+    return None
+
+
+class _ProducerLedger(_Ledger):
+    """Retain validated snapshots independently of the provisional terminal."""
+    def __init__(self, ctx, session, eligible):
+        self.session = session
+        self.targets = ctx._targets
+        self.flags = {n: dict(ctx._decisions[n]['requested_flags']) for n in self.targets}
+        self.eligible = eligible
+        self.started = {}
+        self.rows = {n: _blank(n, self.flags[n], 'NO_EXECUTABLE_COLLECTORS')
+                     for n in self.targets if not eligible[n]}
+        self.stop = None
+        self.ids = set()
+        self.projections = {}
+        self.metrics = {}
+
+    def accept(self, message):
+        require(type(message) is dict and message.keys() == {'target_id', 'task_uuid', 'row'}
+                and type(message['target_id']) is str, 3, 'INVALID_NATIVE_RESULT')
+        n, receipt = message['target_id'], message['row']
+        if n in self.started and n in self.rows:
+            # Duplicate receipt invalidates the host terminal, not its
+            # previously validated observations. Never continue dispatch.
+            self.worker_failed(n, 'INVALID_NATIVE_RESULT')
+            raise Denied(3, 'INVALID_NATIVE_RESULT')
+        require(n in self.started and n not in self.rows and self.started[n] == message['task_uuid']
+                and self.session.bridge.valid_receipt(receipt, n), 3, 'INVALID_NATIVE_RESULT')
+        # Receipt validation and actual normalization are bounded by the active
+        # scheduler phase, or a guard interval when polling outside a phase.
+        # Never replace an existing alarm. No callback alone proves worker exit.
+        def project():
+            envelope = self.session.handoff.read(n, receipt)
+            return self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
+                                                         self.session.started_at, self.session.rules)
+        try:
+            if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+                projection = project()
+            else:
+                with _deadline(_GUARD_SECONDS):
+                    projection = project()
+        except _Deadline:
+            self.fail('CONTROLLER_TIMEOUT')
+            raise Denied(3, 'CONTROLLER_TIMEOUT') from None
+        except Exception:
+            # Never send a raw parsing/normalizer exception or retained snapshot
+            # through the queue. Known earlier valid hosts remain available.
+            self.fail('INVALID_NATIVE_RESULT')
+            raise Denied(3, 'INVALID_NATIVE_RESULT') from None
+        row = _host(n, True, [projection.outcomes[f] for f in _COLLECTORS], projection.special)
+        row['platform'] = projection.outcomes[self.session.bridge.PLATFORM]
+        ids = {i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']}
+        require(not self.ids & ids, 3, 'INVALID_NATIVE_RESULT')
+        self.ids.update(ids)
+        self.projections[n] = projection
+        self.metrics[n] = {'typed_bytes': receipt['byte_count'],
+                           'ipc_bytes': len(json.dumps(message, separators=(',', ':'), ensure_ascii=True).encode('ascii'))}
+        self.rows[n] = row
+        if row['reason_code'] in _FATAL:
+            self.fail(row['reason_code'])
+
+    def worker_failed(self, name, reason):
+        old = self.rows.get(name, {}).get('platform')
+        super().worker_failed(name, reason)
+        if old is not None:
+            self.rows[name]['platform'] = (_outcome(self.session.bridge.PLATFORM, True, 'ERROR', 'OUTCOME_UNKNOWN')
+                                          if old['state'] == 'UNREACHABLE' else old)
+
+    def finish(self):
+        rows = super().finish()
+        for row in rows:
+            if 'platform' not in row:
+                enabled = any(self.flags[row['target_id']].values())
+                reason = row['reason_code']
+                row['platform'] = (_outcome(self.session.bridge.PLATFORM, enabled, 'ERROR', 'OUTCOME_UNKNOWN')
+                                   if row['attempted'] else
+                                   _outcome(self.session.bridge.PLATFORM, enabled, 'NOT_SCANNED',
+                                            'DISABLED' if not enabled else reason if reason in _OUTCOMES['NOT_SCANNED'] else 'STOPPED'))
+        return rows
+
+
+class _ProducerSession:
+    def __init__(self, rules):
+        from tools import scan_collectors as bridge
+        self.bridge = bridge
+        self.rules = copy.deepcopy(rules)
+        bridge.assessment.validate_rules(self.rules)
+        self.handoff = None
+        self.run_id = None
+        self.started_at = None
+        self.handlers = {}
+
+    def _identity(self, ctx):
+        import uuid
+        self.run_id = ctx._request['run_id'] or 'i1a-' + uuid.uuid4().hex
+        self.started_at = self.bridge.stamp()
+
+    def prepare(self, ctx):
+        self._identity(ctx)
+        registry = self.bridge._producer_adapters()
+        require(type(registry) is dict and registry.keys() <= set(self.bridge.PRODUCERS)
+                and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+        try:
+            eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
+        except self.bridge.BridgeError:
+            raise Denied(2, 'UNSUPPORTED_PRODUCER') from None
+        require(all(set(v) <= registry.keys() for v in eligible.values()), 2, 'PRODUCER_ADAPTER_NOT_AVAILABLE')
+        ledger = _ProducerLedger(ctx, self, eligible)
+        targets = [n for n in ctx._targets if eligible[n]]
+        if targets:
+            self.handoff = self.bridge.Handoff(self.run_id, targets)
+        return registry, ledger
+
+    def cancelled_before_prepare(self, ctx):
+        if self.run_id is None:
+            self._identity(ctx)
+        return _ProducerLedger(ctx, self, {n: () for n in ctx._targets})
+
+    def collect(self, name, flags, registry):
+        """Called only after the unchanged native per-dispatch/argv guard."""
+        b = self.bridge
+        records = []
+        try:
+            with _deadline(_SSH_SECONDS):
+                connected = _restricted_connection(name)
+        except (_Deadline, Exception):
+            connected = 'REMOTE_CLEANUP_UNCONFIRMED'
+        if connected not in b.CONNECTIONS:
+            connected = 'INVALID_ADAPTER_RESULT'
+        if connected == 'CONNECTED':
+            platform_snapshot = None
+            for producer in b.requested(flags):
+                value = None
+                try:
+                    # One bounded synthetic surrogate per producer. I1b must
+                    # separately prove each actual remote command and cleanup.
+                    with _deadline(_COMMAND_SECONDS + 1):
+                        gap = producer != b.PLATFORM and b._platform_status(platform_snapshot) != 'UNVERIFIED'
+                        if gap:
+                            value = dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                                         snapshot=b._gap_snapshot(producer, flags, b._platform_status(platform_snapshot)))
+                        else:
+                            value = registry[producer](name, copy.deepcopy(flags), copy.deepcopy(platform_snapshot))
+                        row = b.record(producer, value, flags, platform_snapshot, self.run_id, name, gap=gap)
+                except _Deadline:
+                    row = b.failed_record(producer, 'REMOTE_CLEANUP_UNCONFIRMED')
+                except Exception:
+                    # A malformed projection is not a successful acquisition.
+                    # Only a genuine adapter cleanup receipt permits the less
+                    # severe invalid-result classification.
+                    clean = type(value) is dict and value.get('cleanup_confirmed') is True
+                    row = b.failed_record(producer, 'INVALID_ADAPTER_RESULT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
+                records.append(row)
+                if producer == b.PLATFORM:
+                    platform_snapshot = row['snapshot']
+                    if platform_snapshot is None:
+                        break
+                if b.record_stop(row):
+                    break
+        envelope = dict(handoff_version=b.WIRE_VERSION, run_id=self.run_id, target_id=name,
+                        connection=connected, records=records)
+        return self.handoff.write(name, envelope)
+
+    def close(self):
+        if self.handoff is not None:
+            handoff, self.handoff = self.handoff, None
+            try:
+                with _deadline(_WORKER_GRACE):
+                    return handoff.close()
+            except (_Deadline, OSError, self.bridge.BridgeError):
+                return False
+        return True
+
+    def finish(self, ctx, ledger, interrupted):
+        if not self.close():
+            ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+            for name in ledger.started:
+                ledger.worker_failed(name, 'CONTROLLER_CLEANUP_UNCONFIRMED')
+        if interrupted():
+            ledger.fail('INTERRUPTED')
+        rows = ledger.finish()
+        # Use the original B05 classification with platform excluded. Only
+        # the actual V2 row contains expanded collection references.
+        rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
+        manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
+        validate_producer_manifest(manifest, rc)
+        b = self.bridge
+        hosts = [b.host_record(self.run_id, r['target_id'], r['host_state'], r['reason_code']) for r in rows]
+        doc = b.document(self.run_id, self.started_at, hosts, manifest['run_state'], b.stamp())
+        companions = {}
+        for name, projection in ledger.projections.items():
+            doc = b._append(doc, projection.document)
+            companions[name] = projection.companions
+        # Existing validator and evaluator keep their own document limits.
+        # No truncation, second evaluator or fake Evidence on overflow.
+        try:
+            with _deadline(_GUARD_SECONDS):
+                b.validate_bindings(manifest, doc, companions, ledger.projections)
+                raw = b.evidence.canonical_bytes(doc)
+                doc = b.evidence.parse_evidence_bytes(raw)
+                assessed = b.assessment.evaluate_document(doc, self.rules)
+                assessed = b.evidence.parse_evidence_bytes(b.evidence.canonical_bytes(assessed))
+                # Keep the original interrupt handler active throughout the
+                # bounded final evaluation. The evaluator's results depend on
+                # host/evidence rows, not run_state; only update the run state.
+                if interrupted() and rc != 7:
+                    ledger.fail('INTERRUPTED')
+                    rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
+                    manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
+                    validate_producer_manifest(manifest, rc)
+                    doc['run']['run_state'] = assessed['run']['run_state'] = manifest['run_state']
+                    b.validate_bindings(manifest, doc, companions, ledger.projections)
+                    b.evidence.validate_document(assessed)
+        except _Deadline:
+            raise Denied(3, 'PRODUCER_VALIDATION_TIMEOUT') from None
+        except b.evidence.EvidenceError as exc:
+            raise Denied(3, 'PRODUCER_EVIDENCE_SIZE_LIMIT' if exc.code == 'SIZE_LIMIT' else 'INVALID_PRODUCER_PROJECTION') from None
+        return rc, manifest, dict(document=doc, assessed=assessed, companions=companions,
+                                  handoff_metrics=ledger.metrics)
+
+
+def execute_producer_batch(ctx, rules):
+    """I1a private V2 API -> (rc, manifest, typed Controller bundle).
+
+    No adapter/transport/path argument. Product registry remains empty; the
+    only positive route is a trusted test-injected synthetic adapter.
+    """
+    session = _ProducerSession(rules)
+    try:
+        return _execute_batch(ctx, session)
+    finally:
+        # Covers before-dispatch denial and initialization/validation errors.
+        try:
+            if not session.close():
+                raise Denied(3, 'CONTROLLER_CLEANUP_UNCONFIRMED') from None
+        finally:
+            for sig, previous in session.handlers.items():
+                signal.signal(sig, previous)
