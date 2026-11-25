@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Algorithms | Run {{ p.run_id }}</title>
+<link rel="stylesheet" href="../portal.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="masthead"><div class="wrap"><p class="brand">PQC Report Portal</p>
+<nav aria-label="Breadcrumb"><a href="../../index.html">History</a> / <a href="../index.html">{{ p.run_id }}</a> / <span aria-current="page">Algorithms</span></nav></div></header>
+<main id="main" class="wrap">
+<section class="hero"><h1>Algorithms</h1><p>Recorded inventory and saved evidence, not a readiness score or proof of service library use.</p>
+<nav class="jump"><a href="hosts.html">Host list</a><a href="libraries.html">Libraries</a></nav>
+{% if not p.assessed %}<p id="not-assessed">Assessment not present. No verdict inferred.</p>{% endif %}
+<dl class="cards">{% for key, count in index.counts.items() %}<div class="metric"><dt>{{ key }}</dt><dd id="count-{{ key }}">{{ count }}</dd></div>{% endfor %}</dl>
+<p>Unique ID counts are set cardinalities; group totals can overlap. Unresolved claims are included in index totals, not assigned to an invented group.</p>
+<dl class="metadata">{% for category, count in index.categories.items() %}<div><dt>{{ category }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl>
+<h2>Recorded taxonomy</h2><ul>{% for t in index.taxonomy %}<li>{{ t.classification }} / {{ t.family }} / {{ t.primitive }}: {{ t.count }} group(s)</li>{% endfor %}</ul>
+</section>
+{% macro value(v) -%}{{ 'Unknown / not recorded' if v is none else v }}{%- endmacro %}
+{% macro refs(ids, table) -%}{% for ref in ids %}<a href="{{ table[ref].href }}">{{ ref }}</a>{% if not loop.last %}<br>{% endif %}{% else %}None recorded{% endfor %}{%- endmacro %}
+{% for g in index.groups %}<section id="{{ g.id }}">
+<h2>{{ value(g.algorithm_id) }} &mdash; {{ g.classification }}</h2>
+<p>Stored taxonomy: {{ value(g.taxonomy_version) }} / {{ g.primitive }} / {{ g.family }}. Observed names: {% for name in g.observed_names %}{{ name }}{% if not loop.last %}, {% endif %}{% else %}Unknown{% endfor %}.</p>
+<p>Group ID: {{ g.id }}</p>
+<dl class="metadata">{% for key, count in g.counts.items() %}<div><dt>{{ key }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl>
+<h3>Recorded hosts and assets</h3><ul>{% for hid in g.host_ids %}<li><a href="{{ p.hosts[hid].href }}">{{ value(p.hosts[hid].target_id) }} ({{ hid }})</a> / {{ p.hosts[hid].host_state }}</li>{% endfor %}</ul>
+<p>{{ refs(g.asset_ids, p.assets) }}</p>
+<h3>Independent levels</h3>
+<div class="scroll"><table><thead><tr><th>Level</th><th>Typed observations (not verdicts)</th><th>Saved claims</th></tr></thead><tbody>
+{% for level, data in g.levels.items() %}<tr><th>{{ level }} {{ data.label }}</th>
+<td>{% for state, ids in data.observations.items() %}{{ state }} ({{ data.observation_counts[state] }}): {{ refs(ids, p.evidence) }}<br>{% else %}Unknown / no typed observation{% endfor %}</td>
+<td>{% for state, ids in data.claims.items() %}{{ state }} ({{ data.claim_counts[state] }}): {{ refs(ids, p.claims) }}<br>{% else %}Unknown / no saved claim{% endfor %}</td></tr>{% endfor %}
+</tbody></table></div>
+<h3>Evidence and provenance</h3><div class="scroll"><table><thead><tr><th>Evidence</th><th>Recorded context and source</th><th>Typed facts</th></tr></thead><tbody>
+{% for eid in g.evidence_ids %}{% set r = p.evidence[eid] %}<tr><th><a href="{{ r.href }}">{{ eid }}</a><br>{{ r.evidence_kind }}</th><td>{{ r.collector_id }} / {{ r.scope_key }}<br>{{ r.collection_state }} / {{ r.reason_code }}<br>{{ r.source.source_kind }} / {{ r.source.producer_id }} / {{ value(r.source.producer_version) }}<br>Observed: {{ value(r.observed_at) }}<br>Collection: {{ r.collection_id }}</td><td>{% if r.algorithm %}{{ value(r.algorithm.observed_name) }} / {{ value(r.algorithm.algorithm_id) }}<br>{% endif %}{% for key, item in r.facts.items() %}{{ key }}: {{ value(item) }}<br>{% endfor %}{% if r.conditions %}{% for key, item in r.conditions.items() %}{{ key }}: {{ value(item) }}<br>{% endfor %}{% endif %}</td></tr>{% endfor %}
+</tbody></table></div>
+<h3>Explicit cross-index references (not service use)</h3>
+<ul>{% for relation in g.relations %}<li><a href="{{ relation.href }}">{{ relation.group_id }}</a> via {{ refs(relation.evidence_ids, p.evidence) }}</li>{% else %}<li>Unknown / no explicit relationship recorded.</li>{% endfor %}</ul>
+</section>{% else %}<p class="empty">No indexed records. This is not a negative verdict.</p>{% endfor %}
+{% if index.unresolved_claim_ids %}<section id="unresolved-claims"><h2>Unresolved claim association</h2><p>Saved claims whose group cannot be resolved without inference.</p><ul>{% for cid in index.unresolved_claim_ids %}{% set c = p.claims[cid] %}<li>{{ c.level }} / {{ c.assessment_state }} / {{ c.reason_code }}: <a href="{{ c.href }}">{{ cid }}</a><br>Subject: <a href="{{ p.hosts[c.subject.host_id].href }}">{{ c.subject.host_id }}</a>{% if c.subject.asset_id|default(none) %} / {{ refs([c.subject.asset_id], p.assets) }}{% endif %}{% if c.subject.algorithm_id|default(none) %} / {{ c.subject.algorithm_id }}{% endif %} &mdash; {{ refs(c.evidence_ids, p.evidence) }}</li>{% endfor %}</ul></section>{% endif %}
+</main>
+<footer class="wrap footer">Private offline report. Index preview contract; publication and host backlinks are integrated separately.</footer>
+</body>
+</html>
