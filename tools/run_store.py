@@ -580,7 +580,8 @@ def _requirements(value, hosts, kind):
         key = (item['host_id'], item['slot'])
         require(key[0] in hosts and key not in slots, 'INVALID_DETAIL_REQUIREMENT')
         slots.add(key)
-    require(kind == 'SYNTHETIC' or (not value['cff'] and not slots),
+    require(kind == 'SYNTHETIC' or
+            (not slots and (kind == 'LEGACY_IMPORT' or not value['cff'])),
             'UNVERIFIED_PRODUCER_FORMAT')
     return slots
 
@@ -653,6 +654,8 @@ def _scope(s):
             require(not flags['tls_services'] and (s['profile'] == 'extended' or
                     not flags['nginx_certs']), 'PROFILE_FLAGS')
     _requirements(s['requirements'], ids, s['run_kind'])
+    if s['run_kind'] == 'LEGACY_IMPORT' and s['requirements']['cff']:
+        require(s['evidence_schema_version'] == '1.0.0', 'UNVERIFIED_PRODUCER_FORMAT')
     return s
 
 
@@ -876,9 +879,20 @@ def _run_state(hosts, *, interrupted=False):
     return 'PARTIAL' if any(h['host_state'] in ('COMPLETE', 'PARTIAL') for h in hosts) else 'ERROR'
 
 
-def _cff(s, assessed, digest, value):
-    # The actual #13 implementation is not an S1 dependency. This is a closed
-    # synthetic common pair, not a third-party CFF wire/schema certification.
+def _cff(s, assessed, digest, value, *, rules=None):
+    if s['run_kind'] == 'LEGACY_IMPORT':
+        # Only the explicit legacy 1.0 contract may use the real projection.
+        # The saved rules, not a current installation policy, own replay.
+        require(s['evidence_schema_version'] == '1.0.0' and
+                s['requirements']['cff'] and s['requirements']['assessment'] and
+                not s['requirements']['details'], 'UNVERIFIED_PRODUCER_FORMAT')
+        from tools import cff as projection
+        try:
+            projection.validate_projection(value, assessed, rules)
+        except projection.ProjectionError as exc:
+            raise StoreError('CFF_' + exc.code) from None
+        return value
+    # Retain the closed synthetic S1 pair; no shape-based fallback.
     _keys(value, 'format projection_version evidence_document_sha256 per_host')
     require(s['run_kind'] == 'SYNTHETIC' and value['format'] == 'S1_CFF_PAIR' and
             value['projection_version'] == VERSION, 'UNVERIFIED_PRODUCER_FORMAT')
@@ -1025,7 +1039,12 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
         rule_version, rules_sha = rules['rule_version'], _digest(rules_raw)
     if cff_raw is not None:
         require(assessed is not None, 'MISSING_ASSESSMENT_PAIR')
-        _cff(s, assessed, _digest(assessed_raw), _loads(cff_raw, MAX_CFF))
+        cap = MAX_CFF
+        if s['run_kind'] == 'LEGACY_IMPORT':
+            from tools import cff as projection
+            cap = min(cap, projection.MAX_BYTES)
+            require(len(cff_raw) <= cap, 'CFF_PROJECTION_LIMIT')
+        _cff(s, assessed, _digest(assessed_raw), _loads(cff_raw, cap), rules=rules)
     required_details = _requirements(s['requirements'], set(hs), s['run_kind'])
     have_details = set(); entries = []
     for (kind, host, slot), data in payloads.items():
@@ -1050,7 +1069,12 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
     for hid, slot in sorted(required_details - have_details):
         require(hs[hid]['host_state'] != 'COMPLETE', 'REQUIRED_DETAIL_MISSING')
         missing.append({'path': '/'.join(_slot('detail', hid, slot)[0]), 'reason_code': 'REQUIRED_DETAIL_MISSING'})
-    require(state != 'COMPLETE' or not missing, 'REQUIRED_ARTIFACT_MISSING')
+    # A normally finalized I3 import needs its complete derived pair even
+    # when the historical scan itself was partial or failed. Recovery may
+    # retain only what was durably acquired and reports missing artifacts.
+    legacy_pair = s['run_kind'] == 'LEGACY_IMPORT' and s['requirements']['cff']
+    require(not missing or (state != 'COMPLETE' and (recovery or not legacy_pair)),
+            'REQUIRED_ARTIFACT_MISSING')
     counts = Counter(h['host_state'] for h in rows)
     manifest = {'manifest_version': VERSION, 'publication_state': 'PUBLISHED',
                 'run_id': s['run_id'], 'run_kind': s['run_kind'], 'run_state': state,
