@@ -117,7 +117,8 @@ def _portal_status(fd, device, published, marker, budget):
     has_index = rs._exists(fd, HTML)
     has_css = rs._exists(fd, 'portal.css')
     has_v2 = rs._exists(fd, portal._GENERATION)
-    if not (has_index or has_css or has_v2):
+    has_v3 = rs._exists(fd, portal._HISTORY_GENERATION)
+    if not (has_index or has_css or has_v2 or has_v3):
         return 'NOT_GENERATED', None
     try:
         index_size = budget.file(fd, HTML, device, portal._MAX_HTML) if has_index else None
@@ -125,8 +126,12 @@ def _portal_status(fd, device, published, marker, budget):
         rs.require(has_index and has_css, 'PORTAL_GENERATION_INCOMPLETE')
         current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
         css = rs._read(fd, 'portal.css', device, portal._MAX_CSS, css_size)
+        history = current.startswith(portal._HISTORY_MARKER)
         try:
-            old, expected_css = portal._render(published)
+            if history:
+                old, expected_css = None, portal._render_css()
+            else:
+                old, expected_css = portal._render(published)
         except rs.StoreError as exc:
             # V1 uses this code for an empty trusted CSS as well as overflow.
             # The installed renderer/templates are trusted, fixed inputs.
@@ -136,10 +141,11 @@ def _portal_status(fd, device, published, marker, budget):
             raise
         rs.require(css == expected_css, 'PORTAL_OUTPUT_COLLISION')
         if current == old:
-            # Unreferenced v2 staging is deliberately not opened.
+            # Neither unreferenced v2 nor v3 staging is opened.
             return 'AVAILABLE', 'portal-v1'
-        rs.require(has_v2, 'PORTAL_GENERATION_INCOMPLETE')
-        with rs._directory(fd, (portal._GENERATION,), device) as gen:
+        generation = portal._HISTORY_GENERATION if history else portal._GENERATION
+        rs.require(has_v3 if history else has_v2, 'PORTAL_GENERATION_INCOMPLETE')
+        with rs._directory(fd, (generation,), device) as gen:
             names = {'hosts.html', *(h + '.html' for h in published.manifest['expected_host_ids'])}
             expected = names | {portal._RECEIPT}
             present = set(rs._entries(gen, len(expected)))
@@ -153,7 +159,8 @@ def _portal_status(fd, device, published, marker, budget):
             _capacity_if(total > portal._MAX_TOTAL_HTML)
             rs.require(present == expected, 'PORTAL_GENERATION_INCOMPLETE')
             try:
-                index, pages, receipt = portal._render_v2(published, marker, expected_css)
+                render = portal._render_v3 if history else portal._render_v2
+                index, pages, receipt = render(published, marker, expected_css)
             except rs.StoreError as exc:
                 # In this fixed renderer, these are generated HTML and receipt
                 # byte limits, not a persisted page/receipt mismatch.
@@ -162,8 +169,8 @@ def _portal_status(fd, device, published, marker, budget):
                 raise
             rs.require(current == index, 'PORTAL_OUTPUT_COLLISION')
             portal._generation(gen, device, pages, receipt, complete=True)
-            _same_entry(fd, portal._GENERATION, gen)
-        return 'AVAILABLE', 'portal-v2'
+            _same_entry(fd, generation, gen)
+        return 'AVAILABLE', generation
     except CapacityError:
         raise
     except (rs.StoreError, OSError):
@@ -457,7 +464,7 @@ def _validate_row(row):
     rs._int(row['missing_artifact_count'], 0, rs.MAX_SLOTS)
     rs.require(rs._match(row['manifest_sha256'], rs.HEX), 'INVALID_CATALOG')
     if pstatus == 'AVAILABLE':
-        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2'))
+        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3'))
         rs.require(row['href'] == rid + '/index.html' and row['reason_code'] == 'PUBLISHED', 'INVALID_CATALOG')
     else:
         rs.require(pstatus in ('NOT_GENERATED', 'INVALID') and row['portal_generation'] is None and
@@ -641,6 +648,29 @@ def _generations(root, device):
 
 def _slots(root, device, generations):
     return {name: _stable_slot(root, device, name, generations) for name in (JSON, HTML)}
+
+
+@contextmanager
+def _history_root(report_root):
+    """Pin a coherent catalog for a single opted-in portal publication.
+
+    No catalog creation or recovery; the caller must hold no run locks on
+    entry. Keep the original stable pair and generation directory identity
+    checked through the renderer's final index switch.
+    """
+    with _locked_root(report_root, shared=True) as (store, root_check):
+        with _generations(store._fd, store._device) as gen:
+            slots = _slots(store._fd, store._device, gen)
+            rs.require(_coherent(slots), 'CATALOG_RECOVERY_REQUIRED')
+            _same_entry(store._fd, GENERATIONS, gen)
+            def check():
+                root_check()
+                _same_entry(store._fd, GENERATIONS, gen)
+                rs.require(_slots(store._fd, store._device, gen) == slots,
+                           'ARTIFACT_CHANGED')
+            check()
+            yield store, check
+            check()
 
 
 @rs._public

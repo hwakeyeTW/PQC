@@ -1,4 +1,4 @@
-# Run Catalog (V2.0, slice A)
+# Run Catalog and history navigation (V2.0)
 
 The catalog is an offline snapshot of direct children of an existing,
 Owner-approved private report root. It does not launch scans, recover runs,
@@ -31,8 +31,70 @@ Open `reports/index.html` locally. The table works with JavaScript disabled; no
 server, external styles, fonts, network or local JSON fetch. Move or archive and
 extract the **whole** report root, including `catalog.generations`, preserving
 private permissions for further Controller operations. Existing Portal v1/v2
-pages are not changed. Return links from individual runs and Portal v3 belong to
-slice B and are not provided by this slice.
+pages are not changed by a catalog rebuild.
+
+## Opt-in Portal v3 history navigation
+
+The catalog links to every verified available batch dashboard. To add return
+links for a specific run, first publish a coherent catalog, then explicitly
+render that run with history enabled:
+
+```sh
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --with-history
+# For an existing exact v1 or v2 portal, explicitly authorize replacement:
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --refresh-portal --with-history
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.run_catalog --report-root /approved/private/reports --check
+```
+
+Use only the applicable render command. Replace RID with the approved run ID;
+the run need not already be listed in the catalog. There is no automatic
+refresh of all historical runs, and no scan, SSH or reassessment. Without
+`--with-history`, a new portal remains v2; `--refresh-portal` alone allows
+only the original v1-to-v2 upgrade (or an exact existing portal no-op).
+`--with-history` alone does not replace an existing v1/v2 index. An exact v3
+portal is verified without rewriting it, for all four flag combinations,
+even when the current catalog is missing or inconsistent. That no-op does not
+prove the history link currently opens; use the explicit catalog operations
+above to restore the entrance. The renderer never creates or recovers a
+catalog automatically. CLI exit 0 (`PORTAL_RENDERED`) means derived publication
+or no-op verification, 1 a fixed failure reason, 2 invalid arguments.
+
+Portal v3 uses the stable run `index.html` and fixed `portal-v3/hosts.html`,
+`portal-v3/<host-id>.html` and `portal-v3/portal_receipt.json` (format 3).
+History breadcrumbs link to the stable root `index.html`: `../index.html` from
+the batch, `../../index.html` from nested pages. Batch/host-list/host links,
+anchors and verified artifact references remain relative; the whole root
+can be moved with both v2/v3 generations and the catalog snapshots intact.
+CBOM is not provided by this slice. Old v1/v2 pages are still accessible from
+the catalog; a retained v2 host page can return to the newly upgraded batch.
+The v3 history link does not bind a catalog generation hash. Rebuilding the
+catalog after the explicit upgrade records `portal-v3` in its new snapshot;
+previous coherent snapshots remain valid historical records, not freshness
+proofs.
+
+The new v3 publication holds a shared `.catalog.lock` from coherent catalog
+validation through the stable run index switch. The lock order is catalog
+then run; a run-only probe is released before acquiring the catalog lock.
+Ordinary v1/v2 rendering and exact v3 no-ops do not require a catalog lock.
+New v3 generation checks the pinned root/lock and coherent stable slots again
+before the index switch. Run Store authority, frozen scope and the original
+core-byte rechecks remain in force. Only exact old v1/v2 index/CSS (and the
+complete v2 generation for a v2 upgrade) may be replaced by the opted-in
+v3 index. Old v2 pages/receipt, CSS and immutable core files are retained;
+the old stable index is not separately archived. A v3 marker is a routing
+hint, never proof of a generation. All expected pages and the deterministic
+receipt must match exactly. Existing unknown/corrupt/unsafe output is refused,
+not repaired. The same per-page, total HTML, CSS and receipt caps apply.
+
+The renderer writes missing exact v3 pages no-replace, seals the receipt after
+the complete page set, syncs and publishes the stable index last. A known
+exact partial generation can be resumed; a present receipt requires a complete
+matching set. A failure before the stable switch leaves the old entry intact;
+a failed sync after a switch is `DURABILITY_UNCONFIRMED`, not success or
+rollback. Retry verifies the exact visible version and reconfirms durability.
+Do not remove unknown staging or change permissions to force a retry.
 
 ## Interpretation
 
@@ -52,13 +114,15 @@ zero or a guessed failed scan.
 | INVALID | Unsafe/casefold collision or unverified marker, lock or core. |
 | BUSY | Could not obtain the run's shared lock. Outcome unknown. |
 
-The separate `portal_status` is AVAILABLE (exact verified v1 or v2),
+The separate `portal_status` is AVAILABLE (exact verified v1, v2 or v3),
 NOT_GENERATED (no derived slots), INVALID (incomplete, unsafe, unknown or
 inconsistent derived output), or NOT_VERIFIED (publication not verified).
-Only AVAILABLE has a relative `run_id/index.html` link. Unreferenced v2 staging
-is not followed when an exact v1 index and CSS are still valid. A v2 index needs
-the complete expected page set and matching receipt/manifest/CSS bytes. There
-is no historical trend or security/readiness score.
+Only AVAILABLE has a relative `run_id/index.html` link. Only the version
+referenced by the stable run index is verified: exact v1 ignores both newer
+staging directories, v2 ignores v3, and v3 ignores retained v2. A v2/v3 index
+needs the complete expected page set and matching receipt/manifest/CSS bytes.
+The catalog schema, version, render format and immutable snapshot contract
+are unchanged. There is no historical trend or security/readiness score.
 
 Case-insensitive duplicate IDs are all rejected; reserved/temporary/non-ID
 entries are counted rather than interpreted or printed. No recursive discovery
@@ -120,7 +184,7 @@ contract.
 ## Verification boundary
 
 The focused engineering tests use actual synthetic Run Store/legacy import and
-Portal v1/v2 output, exact HTML/JSON oracles, local locks, fault injection and
-relocation. Official Controller/local filesystem/power-loss/load qualification,
+Portal v1/v2/v3 output, fixed pre-change v1/v2 hash oracles, exact HTML/JSON,
+local locks, fault injection and relocation. Official Controller/local filesystem/power-loss/load qualification,
 Windows/Linux `file://` browser and network-zero verification remain #27/#28
 release QA. Do not use engineering fixture success as formal release acceptance.
