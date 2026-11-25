@@ -179,6 +179,7 @@ _LEGACY_FIELDS = frozenset(('original-collected-at', 'os-distribution', 'release
     'legacy-tls-port', 'tls-protocol', 'key-exchange', 'cipher', 'peer-signature',
     'server-signature', 'crypto-policy-result', 'sshd-crypto-lines-count',
     'sshd-crypto-lines-commented-count'))
+_LEGACY_PACKAGE_FIELDS = frozenset(('rpm-release', 'rpm-architecture', 'rpm-epoch'))
 
 
 def _collection_section(row):
@@ -206,8 +207,11 @@ def _facts(row, collection):
     facts = [(key, data.get(key)) for key in _FIELDS.get(kind, ())]
     if kind == 'LEGACY_OBSERVATION':
         # Only the reviewed legacy field vocabulary has a display value.
+        field = data['field']
         if (collection['collector_id'] == 'legacy-import' and
-                row['source']['source_kind'] == 'LEGACY_IMPORT' and data['field'] in _LEGACY_FIELDS):
+                row['source']['source_kind'] == 'LEGACY_IMPORT' and
+                (field in _LEGACY_FIELDS or
+                 (field in _LEGACY_PACKAGE_FIELDS and collection['scope_key'] == 'packages'))):
             facts.append(('value', data['value']))
         else:
             facts.append(('value', 'Not displayed (unclassified legacy field)'))

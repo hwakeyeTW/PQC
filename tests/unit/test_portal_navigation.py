@@ -239,7 +239,12 @@ def test_actual_i3_import_to_portal(root):
     from tools import cff
     report = {'host':'fixture-legacy.example.invalid','collected_at':STAMP,
               'openssl_version':'OpenSSL 3.5.0','openssl_version_rc':0,
-              'openssl_tls1_3_groups':'X25519MLKEM768','openssl_tls1_3_groups_rc':0}
+              'openssl_tls1_3_groups':'X25519MLKEM768','openssl_tls1_3_groups_rc':0,
+              'openssl_packages':{'openssl-libs':[
+                  {'version':'3.5.0','release':'1.fixture','arch':'x86_64','epoch':0,
+                   'source':'rpm','fixture-extra':'unclassified-rpm-fixture-value'},
+                  {'version':'3.5.0','release':'2.fixture','arch':'aarch64','epoch':1,'source':'rpm'}],
+                  'openssl':[{'version':'3.5.0','source':'rpm'}]}}
     missing = 'missing.example.invalid'
     value = {'run_id':'fixture-old','generated_at':STAMP,'selected_hosts':[report['host'],missing],
              'successful_hosts':[report['host']],'hosts_without_report':[missing],
@@ -262,10 +267,66 @@ def test_actual_i3_import_to_portal(root):
         assert not any(r['evidence_kind']=='AUTHORIZED_NEGOTIATION' for r in pub.document['evidence'])
         if h['target_id']==missing:
             assert h['reason_code']=='LEGACY_REPORT_MISSING' and page.text['host-state']=='ERROR'
+            assert 'platform-evidence' not in page.tables
+            assert not any(r['host_id']==h['host_id'] for r in pub.document['evidence'])
         else:
             assert 'openssl-tls13-group' in page.text['runtime'] and 'L2 observation' in page.text['runtime']
             assert 'L4 observation' not in page.text['tls']
+            hid = h['host_id']
+            packages = [r for r in pub.document['evidence']
+                        if r['host_id']==hid and r['evidence_kind']=='PACKAGE_INVENTORY']
+            assert Counter((r['data']['name'], r['data']['version']) for r in packages) == {
+                ('openssl-libs', '3.5.0'): 2, ('openssl', '3.5.0'): 1}
+            assert len({r['asset_id'] for r in packages}) == 3
+            assets = {a['asset_id']: a for a in pub.document['assets']}
+            collections = {c['collection_id']: c for c in pub.document['collections']}
+            rpm_fields = ('rpm-release', 'rpm-architecture', 'rpm-epoch')
+            builds = set()
+            for package in packages:
+                aid = package['asset_id']
+                asset = assets[aid]
+                collection = collections[package['collection_id']]
+                assert asset['host_id']==hid and asset['asset_kind']=='package'
+                assert collection['collector_id']=='legacy-import' and collection['scope_key']=='packages'
+                related = [r for r in pub.document['evidence'] if r['asset_id']==aid]
+                assert {r['evidence_id'] for r in related} == set(asset['evidence_ids'])
+                assert all(r['host_id']==hid and r['collection_id']==collection['collection_id']
+                           and r['source']['source_kind']=='LEGACY_IMPORT' for r in related)
+                rows = [r for r in related if r['evidence_kind']=='LEGACY_OBSERVATION']
+                if package['data']['name']=='openssl':
+                    assert not rows
+                    continue
+                fields = {r['data']['field']: r['data']['value'] for r in rows}
+                assert len(rows)==3 and set(fields)==set(rpm_fields)
+                builds.add(tuple(fields[field] for field in rpm_fields))
+                for r in rows:
+                    field, value = r['data']['field'], r['data']['value']
+                    # The existing HTML parser concatenates text around <br>.
+                    cells = [cells[1] for cells in page.tables['platform-evidence']
+                             if r['evidence_id'] in cells[0]]
+                    assert cells == [f'field: {field}value: {value}'], (field, value, cells)
+                    assert '#' + aid in page.references[r['evidence_id']]
+            assert builds == {('1.fixture','x86_64',0), ('2.fixture','aarch64',1)}
+            assert 'unclassified-rpm-fixture-value' not in page.text['platform']
+    # The actual importer drops unknown input fields; do not pretend they
+    # were persisted as typed observations. Test the display seam separately.
+    assert 'unclassified-rpm-fixture-value' not in json.dumps(pub.document)
     assert snapshot(root,pub)==core and read(root)==pub and source.read_bytes()==original
+
+
+def test_legacy_rpm_facts_allowlist():
+    def facts(field, value, *, collector='legacy-import', scope='packages', source='LEGACY_IMPORT'):
+        row = {'evidence_kind':'LEGACY_OBSERVATION','source':{'source_kind':source},
+               'data':{'field':field,'value':value}}
+        return portal._facts(row, {'collector_id':collector,'scope_key':scope})
+
+    suppressed = 'Not displayed (unclassified legacy field)'
+    for field, value in (('rpm-release','1.fixture'), ('rpm-architecture','x86_64'), ('rpm-epoch',0)):
+        assert facts(field,value) == [('field',field),('value',value)]
+        for kwargs in ({'collector':'packages'}, {'scope':'platform'}, {'source':'SYNTHETIC'}):
+            assert facts(field,value,**kwargs) == [('field',field),('value',suppressed)]
+    assert facts('fixture-extra','unclassified-rpm-fixture-value') == [('field','fixture-extra'),('value',suppressed)]
+    assert facts('os-distribution','oracle-linux',scope='platform') == [('field','os-distribution'),('value','oracle-linux')]
 
 
 def test_same_display_identity_empty_scopes_and_escaping(root):
