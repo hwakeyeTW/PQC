@@ -53,40 +53,164 @@ connection argv and effective SSH proof must agree with preflight. Any
 missing proof, unexpected host or change is denied; S1's terminal stop does
 not call the original native `_run`.
 
-The initial compatible configuration subset is deliberately narrow: native
-SSH only, trusted `/usr/bin/ssh` (or the same executable found via PATH),
-explicit existing absolute `-F` configuration with a restricted literal
-syntax, host-key checking enabled, bounded ConnectTimeout, BatchMode,
-no persistent multiplexing, local commands, ProxyCommand, forwarding,
-implicit Include/Match, password payload, inline private key, or unsafe
-transport overrides. Literal ProxyJump intent and explicit identity paths
-are supported candidates. The tool does not edit user/system configuration,
-replace legitimate ProxyJump, install SSH or silently relax options. An
-unsupported configuration is rejected with a fixed reason. This is not a
-claim that every legitimate existing SSH configuration is supported. In
-particular the Ansible default multiplexing options and implicit OpenSSH
-config loading are not accepted in this candidate. The exact effective
-OpenSSH configuration is intended to be checked using bounded native
-`ssh -G` for the destination and jump hosts; without that native evidence
-preflight must remain closed.
+### B compatibility candidate (Draft PR #70, R2 review pending)
 
-For the allowed explicit `-F` subset, the bounded validated raw bytes and
-fingerprint are bound to a fresh private snapshot for each effective-config
-proof. A worker-created 0700 directory and exclusive 0600 regular file under
-the fixed trusted `/tmp` root hold the exact bytes (no re-rendering). No
-Inventory, CLI or environment setting selects this snapshot path. Only the assessment's `-F` value is substituted, for the
-destination and every ProxyJump consumer; the original native argv/path and
-fingerprint remain in the connection binding. The existing absolute-path
-and restricted syntax checks exclude Include, Match exec and relative
-identity/known-hosts paths, so no new config-relative semantics are introduced.
-At the native boundary, a changed original argv or fingerprint is denied
-before re-evaluation. The source is checked before consumers and at completion.
-Persistent source drift denies the proof; even if a transient edit is restored, a child
-can read only the validated snapshot, never the edited original pathname.
-Snapshots are removed before proof return, including on rejection, exception
-and bounded-command timeout; creation or reported cleanup failure denies the
-proof. This assumes the original trusted controller worker/UID and system
-paths, not hostile code with its privileges or cleanup after SIGKILL.
+The B candidate retains native SSH only, trusted `/usr/bin/ssh` (or the
+same executable found via PATH), the private Ansible context and the hard
+transport stop. It validates the raw option vectors and native control-path
+options before the actual builder, binds them separately from the consumed
+argv, and makes a private per-Connection normalization to
+`ControlMaster=no`, `ControlPersist=no`, `ControlPath=none`. Normalization
+precedes `_build_command` on the retained connection and actual native
+worker; raw drift is denied even when normalized argv would be unchanged.
+The temporary private connection options are restored after the builder.
+This does not inspect, connect to, remove or create a mux socket or directory
+or change the operator's Ansible/SSH configuration.
+
+An explicit absolute `-F` keeps its native root-selection semantics. The
+candidate closure reads only bounded regular files using directory-relative
+no-follow opens, validates literal nonexecuting syntax before native
+parsing, and fingerprints file identity and bytes, ordered Include edges,
+absence and glob enumeration. Limits are 32 regular files, depth 8,
+256 KiB aggregate and 64 KiB per file. The local conservative implementation
+also bounds expansions to 32 and enumerated directory entries to 256;
+accepted literal ControlPersist durations, including compound literals
+validated against the native parser, are at most seven days. The latter
+are provisional conservative implementation choices, not broader
+compatibility guarantees. Safe absolute Include paths and relative Include
+source roots are restricted; lexical globs are evaluated in verified C-like
+locale, and `Match final all` is the only admitted Match form. Unknown
+syntax, arbitrary links, unsafe owners/modes, commands and host-key
+downgrades remain denied. No source bytes or native output enter the
+terminal manifest.
+
+Each proof uses a new 0700 private `/tmp` directory and exclusive 0600
+regular files. The simple explicit source remains byte-exact; the closed
+Include graph uses private filenames preserving order and source scope.
+The implicit composition uses ordered user then system sources. The
+qualified-client synthetic source-selection oracle retains native first-set
+precedence, Include roots and Match final reparse semantics. A no-mux prelude applies to every
+snapshot consumer when needed. Bounded `ssh -G` checks destination and
+successive literal ProxyJump children with the same snapshot, including
+child port/user and remaining jump prefix. Every consumer checks the
+original closure fingerprint, and the proof checks it again before return.
+Restored transient changes cannot change the private consumer bytes and
+now also deny on changed source identity. Creation, drift or reported
+cleanup failure denies; this retains the existing trusted UID assumptions.
+The per-consumer timeout is at most five seconds and remaining guard time.
+
+Implicit source qualification uses private, explicit client-source
+contracts. The development contract is the exact Debian amd64
+`openssh-client` package `1:10.0p1-7+deb13u4` (package SHA-256
+`8fff343654f86c3b3266f94cd338c7b4da2e386da029327815118ea00bce03b9`;
+original signed-package evidence in Issue #8, comment 7140990021).
+The 1,047,584-byte ELF has SHA-256
+`af3b04ec5653755032fc18ad02445e4e51170e75d8bac4265647d423caa9a83e`.
+The same package supplies `/etc/ssh/ssh_config`, `ssh(1)` and
+`ssh_config(5)`. Its shipped manuals identify the passwd-home user
+configuration, the system configuration and first-set order; the shipped
+configuration is part of that package evidence. This is a build identity
+contract, not a version-string or OS-minor-version inference. The fixed
+client must pass owner/mode, no-follow identity, exact-size and digest
+checks; the qualified build, binary identity and native passwd-home
+source selection enter the closure fingerprint. Unknown or changed
+clients fail closed (`SSH_IMPLICIT_ROOT_UNQUALIFIED`). There is no product
+binary or root override.
+
+For Oracle Linux 9, the installed-package contract uses the trusted local
+OS/admin and RPM database rather than a per-release ELF allowlist. Oracle's
+client configuration documentation identifies the system and per-user
+configuration entries. Oracle ELSA-2026-13381 (8.7p1) and ELSA-2026-19219
+(9.9p1) identify the official package families; Oracle Linux 9 documents
+RPM 4.16 with SQLite. This is not an inference from the managed host OS or
+an assertion that every Oracle package has been independently verified.
+The controller's fixed `/etc/os-release` (regular or stock link to
+`/usr/lib/os-release`) must identify `ol` major 9. The fixed `/usr/bin/ssh`
+and `/usr/bin/rpm`, standard system `rpmrc` and macros, and `/var/lib/rpm`
+SQLite database and known sidecars must have trusted ownership, no-follow
+identity and non-writable-by-other-users modes. A fixed, sanitized, bounded
+`rpm -qf` query of `/usr/bin/ssh` uses the fixed DB path, explicit system
+macro inputs, SQLite backend and no plugins; no verify scripts, package
+inventory dump, installation, network, user macro or caller-controlled
+path is used. The query returns one package's typed file metadata, not
+contents of its other files. Exactly one `openssh-clients` package must
+match Oracle America, the 8.7p1 or 9.9p1 version family, EL9 release,
+controller architecture, valid epoch and matching `openssh` source RPM.
+The package must record the system config and exactly one SSH binary,
+whose size and SHA-256/384/512 file digest must match the selected bytes.
+Executable reads are bounded to 16 MiB, OS identity to 16 KiB, system
+macro input files to 256 KiB each; query output is bounded to 64 KiB per
+stream and at most 256 file rows. One query has at most five seconds
+within the existing remaining guard, reserving cleanup time. The actual
+OS, tool, DB/sidecar and binary identities and validated package metadata
+enter the original closure fingerprint. A destination/jump proof reuses
+only the metadata for the same freshly rechecked state; each new proof
+and dispatch qualifies afresh, without a TTL or per-hop RPM process.
+Unknown, changed, unsupported or ambiguous state fails closed. The local
+RPM database is trusted OS inventory, not independent package-signature
+attestation. Actual installed OL9 binary, RPM/DB and complete stock
+configuration qualification remain formal-environment NOT_TESTED.
+Public source references:
+- https://linux.oracle.com/errata/ELSA-2026-13381.html
+- https://linux.oracle.com/errata/ELSA-2026-19219.html
+- https://docs.oracle.com/en/operating-systems/oracle-linux/openssh/openssh-ModifyingOpenSSHServerConfigurationFiles.html
+
+Only the OS-managed SSH and crypto-policy roots (`/etc/ssh`,
+`/etc/crypto-policies`, `/usr/share/crypto-policies`) may supply a
+qualified file symlink. Production traversals require root-owned,
+non-group/world-writable directories and final regular files; links
+require trusted owner, single link and pinned parent, and include their
+identity and literal target in the graph. Crypto-policy link targets
+are restricted to client `openssh.config` and `openssh.txt` names.
+Absolute targets or unambiguous relative targets with leading parent
+components must remain in the same closed set of managed roots. Directory
+symlinks, cycles, dangling or foreign targets, unsafe owner/mode and
+secret-name paths are rejected before any native parser. Link traversal
+is bounded to eight hops and 32 total link traversals per closure without
+increasing the existing Include expansion, bytes, files or guard limits.
+The native consumer receives the validated regular-file bytes in the
+same private snapshot, not the original link. Link and target identity
+or byte drift invalidates the proof, including retarget-and-restore.
+
+Stock configuration qualification admits `SendEnv` solely as a syntax
+and effective-pattern proof. The same validator checks the entire closure,
+raw option groups and actual consumed `-o` argv. Literal names are LANG,
+LANGUAGE, LC_ALL, LC_CTYPE, LC_NUMERIC, LC_TIME, LC_COLLATE, LC_MONETARY,
+LC_MESSAGES, LC_PAPER, LC_NAME, LC_ADDRESS, LC_TELEPHONE, LC_MEASUREMENT,
+LC_IDENTIFICATION, COLORTERM, NO_COLOR and XMODIFIERS, plus exactly the
+LC_* pattern. The same allowed names/patterns may have a leading `-`
+for native removal semantics. Preserve order, duplicates, Host/Include
+and Match final behavior; do not expand patterns or consult local values.
+At most 32 tokens per directive, 128 per expanded closure and 128 across
+consumed option groups; unknown names/wildcards, interpolation, assignment,
+SetEnv and malformed syntax remain denied. `HashKnownHosts` admits only
+native yes/no. Both settings are included in the actual destination and
+jump effective proof and raw/source drift detection. The `-G` proof child
+has a fixed minimal environment, does not inherit the caller's environment,
+does not send any variables and does not read or write known_hosts contents.
+HashKnownHosts does not authorize a host-key policy downgrade or any write.
+Unapproved `GSSAPIAuthentication` is rejected for all values and keyword
+case variants, including in `-o`, Includes and inactive Host blocks; it is
+not ignored or normalized to `no`. Configurations containing it, including
+otherwise valid stock configurations, remain outside the admitted syntax.
+The two prior same-package stock defects are covered by real `-G` comparison
+with the validated snapshot. The OL9 engineering route is tested using
+synthetic typed RPM metadata through a real bounded local process and the
+approved actual native client; this does not claim an OL9 ELF/RPM execution
+or full stock configuration coverage. The fixed product client entry and
+actual Controller configuration remain NOT_TESTED pending release QA.
+
+Arbitrary symlinks, unsafe Includes, Match exec, external commands,
+forwarding, unknown directives and unsupported syntax remain denied.
+No adapter/live grant is added. A future real transport must consume the
+same private closure while its files remain alive, prove a safe exact
+minimal environment for the destination and every jump (the LC_* pattern
+is not an arbitrary environment transmission grant), and validate
+known_hosts/host-key verification and write side effects independently.
+This candidate still cleans up before returning proof and retains
+`LIVE_NOT_AVAILABLE`. Engineering delivery is not independent review,
+formal OL support or release acceptance.
+
 The S1 layer alone does not assert a 15-second complete
 handshake/chain deadline or 30-second remote command termination. S2 below
 implements and exercises those bounds on the restricted synthetic path. It also cannot guarantee DNS aliases are never local,
@@ -120,6 +244,18 @@ fail-closed behavior. The native guard case retains the actual Ansible
 context/argv and terminal `_run` stop while substituting synthetic `-G`
 records and the fixed-binary availability check in the test only. These
 cases do not replace the required real OpenSSH effective-config proof.
+The B tests additionally exercise native parser field equivalence (except mux),
+ordered closure, caps and denials, retained connection and native synthetic
+worker consumption, and raw-option drift. The source-qualification tests
+exercise the real digest/identity resolver with the approved native ELF,
+unknown/changed builds, passwd-home selection, absent-root and late
+binary drift; managed-link fixtures exercise the same bounded resolver
+with controlled owner and roots, including native worker consumers and
+retarget/target drift. A private verified client path is a test-only seam,
+not a product fixed-path proof. The two identified SendEnv/HashKnownHosts
+stock defects are resolved at the engineering level. The B candidate is
+pending R2 review; complete official OL9 stock configurations, the installed
+client path and actual Controller qualification remain NOT_TESTED.
 The existing plan-only CLI gets one directly relevant synthetic check; no
 historical full-suite rerun is required. Any release/production validation
 remains Issue #28. Owner-approved restricted development (A/B/C, 7143603231)
@@ -341,9 +477,13 @@ and partial-start failure, timer/handler restoration, and uncertain cleanup
 of a connection-failure callback. Faults are injected only in trusted
 synthetic tests, including reported cleanup uncertainty after actual safe
 reaping. The two-stage connection surrogate exercises the full 15-second budget.
-Both are synthetic proof, not real OpenSSH qualification. Actual fixed-path
-`ssh -G` evidence and implicit/Include/multiplexing compatibility remain
-HOLD; real SSH transport and live execution remain hard closed. Actual
+Both are synthetic proof, not real SSH transport qualification. The B
+candidate has controlled-source native parser/builder evidence and the two
+identified stock directive corrections; R2 review remains pending. Complete
+official OL9 stock configuration, installed-path and actual Controller
+qualification remain NOT_TESTED.
+Actual fixed-path `ssh -G` and real SSH transport remain unqualified; live
+execution remains hard closed. Actual
 Controller/OL9.7-9.9, legitimate native SSH/ProxyJump, remote lifetime,
 performance and offline deployment are required release QA (#28).
 

@@ -4,6 +4,7 @@ This adapter is for an exclusive, trusted, isolated controller worker. The
 private Ansible APIs below are version-gated; an unverified version is denied.
 """
 import contextlib
+import contextvars
 import copy
 import hashlib
 import importlib.util
@@ -264,23 +265,71 @@ def _native_binding(ctx, name):
     return conn
 
 
-# Only an explicit existing SSH config with a closed, non-executing subset is
-# eligible for S1. Do not rewrite SSH configuration or silently disable options.
+# B: the validated configuration graph is bounded before native parsing.
+# Implicit source qualification is separate from the synthetic source seam.
+_CONFIG_FILES = 32
+_CONFIG_DEPTH = 8
+_CONFIG_TOTAL = 256 * 1024
+_CONFIG_FILE = 64 * 1024
+_CONFIG_EXPANSIONS = 32
+_CONFIG_ENUM = 256
+_SENDENV_DIRECTIVE = 32
+_SENDENV_CLOSURE = 128
+_SENDENV_NAMES = frozenset(('LANG', 'LANGUAGE', 'LC_*', 'LC_ALL', 'LC_CTYPE',
+                            'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE', 'LC_MONETARY',
+                            'LC_MESSAGES', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS',
+                            'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+                            'COLORTERM', 'NO_COLOR', 'XMODIFIERS'))
+
+
+def _sendenv(value):
+    # Syntax only. Do not consult or expand the local environment. OpenSSH
+    # owns order, duplicates and removal of these exact allowed patterns.
+    tokens = _literal(value).split()
+    require(0 < len(tokens) <= _SENDENV_DIRECTIVE and
+            all(t in _SENDENV_NAMES or t.startswith('-') and t[1:] in _SENDENV_NAMES
+                for t in tokens), 4, 'UNSUPPORTED_SSH_OPTION')
+    return tokens
+_MUX = frozenset(('controlmaster', 'controlpersist', 'controlpath'))
+_NO_MUX = ('-o', 'ControlMaster=no', '-o', 'ControlPersist=no', '-o', 'ControlPath=none')
+_NO_MUX_CONFIG = b'ControlMaster no\nControlPersist no\nControlPath none\n'
 _OPTION = frozenset(('port', 'user', 'identityfile', 'identitiesonly', 'stricthostkeychecking',
                      'userknownhostsfile', 'globalknownhostsfile', 'connecttimeout', 'batchmode',
-                     'controlmaster', 'controlpath', 'proxyjump', 'canonicalizehostname',
+                     'controlmaster', 'controlpersist', 'controlpath', 'proxyjump', 'canonicalizehostname',
                      'passwordauthentication', 'kbdinteractiveauthentication', 'preferredauthentications',
-                     'compression', 'loglevel', 'serveraliveinterval', 'serveralivecountmax', 'numberofpasswordprompts'))
+                     'compression', 'loglevel', 'serveraliveinterval', 'serveralivecountmax', 'numberofpasswordprompts',
+                     'ciphers', 'macs', 'kexalgorithms', 'hostkeyalgorithms', 'pubkeyacceptedalgorithms',
+                     'casignaturealgorithms', 'hostbasedacceptedalgorithms',
+                     'sendenv', 'hashknownhosts'))
+
+
+def _mux_path(value, ansible=False):
+    value = _literal(value)
+    if ansible and value.startswith('%(directory)s/'):
+        value = '/pqc-control-dir/' + value[len('%(directory)s/'):]
+    # Syntax only: never expand, stat, create or connect to a mux pathname.
+    require(value.lower() == 'none' or re.fullmatch(r'(?:/|~/)[A-Za-z0-9_./%+-]+', value)
+            and not any(x == '..' for x in value.split('/'))
+            and not re.search(r'%(?![%CdhijkLlnpru])', value), 4, 'UNSUPPORTED_SSH_OPTION')
 
 
 def _option(key, value):
     key, value = key.lower(), _literal(value)
+    if key == 'sendenv':
+        _sendenv(value)
+        return key, value
     if value.startswith('"') and value.endswith('"'):
         value = value[1:-1]
-    require(key in _OPTION and value and re.fullmatch(r'[A-Za-z0-9_./@:,=*-]+', value),
-            4, 'UNSUPPORTED_SSH_OPTION')
+    require(key in _OPTION and value, 4, 'UNSUPPORTED_SSH_OPTION')
+    if key == 'hashknownhosts':
+        require(value.lower() in ('yes', 'no'), 4, 'UNSUPPORTED_SSH_OPTION')
+        return key, value
+    if key == 'controlpath':
+        _mux_path(value)
+        return key, value
+    require(re.fullmatch(r'[A-Za-z0-9_./@:,=*!?+~%-]+', value), 4, 'UNSUPPORTED_SSH_OPTION')
     if key in ('port', 'connecttimeout', 'serveraliveinterval', 'serveralivecountmax'):
-        require(value.isdecimal(), 4, 'UNSUPPORTED_SSH_OPTION')
+        require(value.isdecimal() and len(value) <= 6, 4, 'UNSUPPORTED_SSH_OPTION')
         number = int(value)
         require((1 <= number <= 65535 if key == 'port' else 1 <= number <= 15
                  if key == 'connecttimeout' else 0 <= number <= 60), 4, 'UNSUPPORTED_SSH_OPTION')
@@ -290,22 +339,40 @@ def _option(key, value):
         require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', value), 4, 'UNSUPPORTED_SSH_OPTION')
     elif key == 'stricthostkeychecking':
         require(value.lower() in ('yes', 'ask'), 4, 'HOST_KEY_CHECKING_REQUIRED')
-    elif key in ('controlmaster', 'canonicalizehostname', 'passwordauthentication', 'kbdinteractiveauthentication'):
+    elif key in ('canonicalizehostname', 'passwordauthentication', 'kbdinteractiveauthentication'):
         require(value.lower() == 'no', 4, 'UNSUPPORTED_SSH_OPTION')
+    elif key == 'controlmaster':
+        require(value.lower() in ('no', 'yes', 'auto', 'autoask', 'ask'), 4, 'UNSUPPORTED_SSH_OPTION')
+    elif key == 'controlpersist':
+        if value.lower() not in ('no', 'yes'):
+            # OpenSSH accepts compound literal durations (e.g. 1h30m).
+            # Bound syntax and total before the scan-only no-mux override;
+            # never expand the value or extend the existing seven-day cap.
+            duration = value.lower()
+            require(len(duration) <= 64 and
+                    re.fullmatch(r'(?:[0-9]{1,6}[smhdw])*[0-9]{1,6}[smhdw]?', duration),
+                    4, 'UNSUPPORTED_SSH_OPTION')
+            units = {'':1, 's':1, 'm':60, 'h':3600, 'd':86400, 'w':604800}
+            require(sum(int(n) * units[u] for n, u in re.findall(r'([0-9]+)([smhdw]?)', duration)) <= 604800,
+                    4, 'UNSUPPORTED_SSH_OPTION')
     elif key == 'batchmode':
         require(value.lower() == 'yes', 4, 'UNSUPPORTED_SSH_OPTION')
-    elif key == 'controlpath':
-        require(value.lower() == 'none', 4, 'UNSUPPORTED_SSH_OPTION')
     elif key in ('identityfile', 'userknownhostsfile', 'globalknownhostsfile'):
-        p = Path(value)
+        require(re.fullmatch(r'(?:/|~/)[A-Za-z0-9_./+-]+', value) and '..' not in value.split('/'),
+                4, 'UNSUPPORTED_SSH_OPTION')
+        p = (_passwd_ssh_dir().parent / value[2:] if value.startswith('~/') else Path(value))
         require(p.is_absolute() and p.resolve() != Path('/dev/null'), 4, 'UNSUPPORTED_SSH_OPTION')
     elif key == 'proxyjump':
         if value.lower() != 'none':
+            require(len(value.split(',')) <= _CONFIG_FILES, 4, 'UNSUPPORTED_SSH_OPTION')
             for jump in value.split(','):
-                match = re.fullmatch(r'(?:([A-Za-z_][A-Za-z0-9_.-]{0,63})@)?([A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]+))?', jump)
+                match = re.fullmatch(r'(?:([A-Za-z_][A-Za-z0-9_.-]{0,63})@)?([A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,5}))?', jump)
                 require(match is not None, 4, 'UNSUPPORTED_SSH_OPTION')
                 _address(match[2])
                 require(match[3] is None or 1 <= int(match[3]) <= 65535, 4, 'UNSUPPORTED_SSH_OPTION')
+    else:
+        # Non-mux options never carry tokens, shell syntax or variable expansion.
+        require(not re.search(r'[%~?]', value), 4, 'UNSUPPORTED_SSH_OPTION')
     return key, value
 
 
@@ -313,97 +380,640 @@ def _args(tokens):
     configs, options = [], []
     i = 0
     while i < len(tokens):
-        arg = _literal(tokens[i])
-        i += 1
+        arg = _literal(tokens[i]); i += 1
         if arg == '-C':
             continue
         require(arg in ('-F', '-o') and i < len(tokens), 4, 'UNSUPPORTED_SSH_OPTION')
-        value = _literal(tokens[i])
-        i += 1
+        value = _literal(tokens[i]); i += 1
         if arg == '-F':
-            require(re.fullmatch(r'/[A-Za-z0-9_./-]+', value), 4, 'SSH_CONFIG_UNVERIFIED')
+            _config_path(value)
             configs.append(value)
         else:
             key, sep, val = value.partition('=')
             require(sep == '=', 4, 'UNSUPPORTED_SSH_OPTION')
             options.append(_option(key, val))
-    require(len(configs) == 1, 4, 'SSH_CONFIG_UNVERIFIED')
-    return configs[0], tuple(options)
+    require(sum(len(_sendenv(v)) for k, v in options if k == 'sendenv') <= _SENDENV_CLOSURE,
+            4, 'SSH_CONFIG_LIMIT')
+    require(len(configs) <= 1, 4, 'SSH_CONFIG_UNVERIFIED')
+    return configs[0] if configs else None, tuple(options)
 
 
-def _config_bytes(path):
-    # Explicit -F avoids implicit user/system Include/Match exec. A config
-    # outside this initial audited subset is denied, never edited.
-    p = Path(path)
+def _config_path(value, pattern=False):
+    chars = r'[A-Za-z0-9_.+*?\[\]-]' if pattern else r'[A-Za-z0-9_.+-]'
+    require(isinstance(value, str) and len(value) <= 4096 and value.startswith('/')
+            and all(x not in ('', '.', '..') and re.fullmatch(chars + '+', x)
+                    for x in value.split('/')[1:]), 4, 'SSH_CONFIG_UNVERIFIED')
+    return Path(value)
+
+
+def _passwd_ssh_dir():
+    import pwd
     try:
-        require(p.is_absolute() and p.resolve(strict=True) == p, 4, 'SSH_CONFIG_UNVERIFIED')
-        with os.fdopen(os.open(p, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), 'rb') as f:
-            require(stat.S_ISREG(os.fstat(f.fileno()).st_mode), 4, 'SSH_CONFIG_UNVERIFIED')
-            raw = f.read(65537)
-        require(len(raw) <= 65536, 4, 'SSH_CONFIG_UNVERIFIED')
-        require(not re.search(rb'[\x00-\x08\x0b-\x1f\x7f]', raw), 4, 'SSH_CONFIG_UNVERIFIED')
-        for line in raw.decode('ascii').splitlines():
-            if not line.strip() or line.lstrip().startswith('#'):
+        return _config_path(pwd.getpwuid(os.geteuid()).pw_dir) / '.ssh'
+    except (KeyError, OSError, UnicodeError):
+        raise Denied(4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED') from None
+
+
+# Fixed, extensible build contracts, not an OS-version guess or a runtime
+# allowlist supplied by Inventory. The signed-package evidence in #8
+# 7140990021 identifies this archive and ELF. The same archive ships
+# /etc/ssh/ssh_config and ssh(1)/ssh_config(5), which explicitly document
+# the default per-user and system paths and first-set order. Unknown or
+# rebuilt clients are unqualified until their own contract is established.
+_IMPLICIT_BUILDS = {
+    (1047584, 'af3b04ec5653755032fc18ad02445e4e51170e75d8bac4265647d423caa9a83e'):
+        ('Debian openssh-client 1:10.0p1-7+deb13u4 amd64', '/etc/ssh'),
+}
+
+
+def _qualified_implicit_client(binary):
+    # Only _fixed_ssh selects the product binary. A private native test may
+    # exercise this exact same qualification on an approved local copy.
+    events = []
+    try:
+        owner = 0 if binary == Path('/usr/bin/ssh') else os.geteuid()
+        with _directory(binary.parent, events, owner=owner, managed_root=binary.parent) as fd:
+            st = os.stat(binary.name, dir_fd=fd, follow_symlinks=False)
+            _trusted_stat(st, owner=owner)
+            require(0 < st.st_size <= 16 * 1024**2
+                    and st.st_mode & 0o111 and not st.st_mode & 0o7000,
+                    4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+            with os.fdopen(os.open(binary.name, flags, dir_fd=fd), 'rb') as stream:
+                before = _node_id(os.fstat(stream.fileno()), True)
+                require(before == _node_id(st, True), 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+                raw = stream.read(st.st_size + 1)
+                require(len(raw) == st.st_size and before == _node_id(os.fstat(stream.fileno()), True)
+                        and before == _node_id(os.stat(binary.name, dir_fd=fd, follow_symlinks=False), True),
+                        4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+            digest = hashlib.sha256(raw).hexdigest()
+            build = _IMPLICIT_BUILDS.get((st.st_size, digest))
+            if build is not None:
+                return Path(build[1]), (build[0], digest, before, tuple(events))
+            return _ol9_qualified_client(binary, raw, before, tuple(events))
+    except (OSError, ValueError, Denied):
+        raise Denied(4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED') from None
+
+
+
+# OL9 stock installed-package contract: Oracle ELSA-2026-13381 (8.7p1)
+# and ELSA-2026-19219 (9.9p1), Oracle OpenSSH client documentation,
+# and OL9 RPM 4.16/SQLite. The existing trusted OS/admin and RPM DB are
+# the local authority, not a fresh signature or remote attestation.
+_OL9_SSH = Path('/usr/bin/ssh')
+_OL9_RPM = Path('/usr/bin/rpm')
+_OL9_OS_RELEASE = Path('/etc/os-release')
+_OL9_OS_RELEASE_TARGET = Path('/usr/lib/os-release')
+_OL9_RPM_DB = Path('/var/lib/rpm')
+_OL9_RPM_RC = Path('/usr/lib/rpm/rpmrc')
+_OL9_RPM_MACROS = Path('/usr/lib/rpm/macros')
+_OL9_OWNER = 0
+_OL9_DIGESTS = {'8': 'sha256', '9': 'sha384', '10': 'sha512'}
+_OL9_QF = ('PQC_PACKAGE\t%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t'
+           '%{VENDOR}\t%{SOURCERPM}\t%{FILEDIGESTALGO}\n'
+           '[PQC_FILE\t%{FILENAMES}\t%{FILESIZES}\t%{FILEDIGESTS}\n]')
+_RPM_PROOF = contextvars.ContextVar('_pqc_rpm_proof', default=None)
+
+
+def _ol9_file(path, cap, executable=False):
+    events = []
+    with _directory(path.parent, events, owner=_OL9_OWNER, managed_root=path.parent) as fd:
+        st = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        _trusted_stat(st, owner=_OL9_OWNER)
+        require(0 < st.st_size <= cap and not st.st_mode & 0o7000
+                and (not executable or st.st_mode & 0o111), 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        identity = _node_id(st, True)
+        with os.fdopen(os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              dir_fd=fd), 'rb') as stream:
+            require(_node_id(os.fstat(stream.fileno()), True) == identity,
+                    4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+            raw = stream.read(st.st_size + 1)
+            require(len(raw) == st.st_size and _node_id(os.fstat(stream.fileno()), True) == identity
+                    and _node_id(os.stat(path.name, dir_fd=fd, follow_symlinks=False), True) == identity,
+                    4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    return raw, (str(path), identity, tuple(events), hashlib.sha256(raw).hexdigest())
+
+
+def _ol9_identity():
+    # /etc/os-release takes precedence; admit only the stock link to
+    # /usr/lib/os-release, not an arbitrary administrator/user pathname.
+    path = _OL9_OS_RELEASE
+    events = []
+    with _directory(path.parent, events, owner=_OL9_OWNER, managed_root=path.parent) as fd:
+        st = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        source = _node_id(st, True)
+        if stat.S_ISLNK(st.st_mode):
+            link = os.readlink(path.name, dir_fd=fd)
+            require(st.st_uid == _OL9_OWNER and st.st_nlink == 1
+                    and link in ('../usr/lib/os-release', '/usr/lib/os-release'),
+                    4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+            path = _OL9_OS_RELEASE_TARGET
+        raw, proof = _ol9_file(path, 16384)
+        require(_node_id(os.stat(_OL9_OS_RELEASE.name, dir_fd=fd, follow_symlinks=False), True) == source,
+                4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    fields = {}
+    for line in raw.decode('ascii').splitlines():
+        key, sep, value = line.partition('=')
+        if key not in ('ID', 'VERSION_ID'):
+            continue
+        require(sep and key not in fields, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        fields[key] = value
+    require(fields.get('ID') == 'ol' and re.fullmatch(r'9(?:\.[0-9]+)?', fields.get('VERSION_ID', '')),
+            4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    arch = os.uname().machine
+    require(arch in ('x86_64', 'aarch64'), 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    return arch, (tuple(events), source, proof, tuple(sorted(fields.items())))
+
+
+def _ol9_db_identity():
+    # Only the fixed OL9 SQLite DB and its known sidecars; never enumerate
+    # the package inventory or read DB contents directly. Absence is bound.
+    events = []
+    with _directory(_OL9_RPM_DB, events, owner=_OL9_OWNER, managed_root=_OL9_RPM_DB) as fd:
+        entries = []
+        ds = _node_id(os.fstat(fd), True)
+        for name in ('rpmdb.sqlite', 'rpmdb.sqlite-wal', 'rpmdb.sqlite-shm', '.rpm.lock'):
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                require(name != 'rpmdb.sqlite', 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+                entries.append((name, None)); continue
+            _trusted_stat(st, owner=_OL9_OWNER)
+            require(name != 'rpmdb.sqlite' or st.st_size > 0, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+            entries.append((name, _node_id(st, True)))
+        require(_node_id(os.fstat(fd), True) == ds, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    return tuple(events), ds, tuple(entries)
+
+
+def _ol9_metadata(out, raw, arch):
+    # Exactly one owner package and one record for the fixed binary. The
+    # array is from that one package only; other files are never opened.
+    require(len(out) <= 65536 and not re.search(rb'[\x00-\x08\x0b-\x1f\x7f]', out),
+            4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    rows = out.decode('ascii').splitlines()
+    require(2 <= len(rows) <= 257, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    header = rows[0].split('\t')
+    require(len(header) == 9 and header[0] == 'PQC_PACKAGE', 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    name, epoch, version, release, package_arch, vendor, source, algo = header[1:]
+    require(name == 'openssh-clients' and (epoch == '(none)' or re.fullmatch(r'[0-9]{1,4}', epoch))
+            and version in ('8.7p1', '9.9p1')
+            and re.fullmatch(r'[0-9][A-Za-z0-9.]*\.el9(?:_[0-9]+)?(?:\.[0-9]+)*', release)
+            and package_arch == arch and vendor == 'Oracle America'
+            and source == 'openssh-' + version + '-' + release + '.src.rpm'
+            and algo in _OL9_DIGESTS, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    files = {}
+    for line in rows[1:]:
+        fields = line.split('\t')
+        require(len(fields) == 4 and fields[0] == 'PQC_FILE' and fields[1].startswith('/')
+                and fields[1] not in files, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        files[fields[1]] = tuple(fields[2:])
+    require('/usr/bin/ssh' in files and '/etc/ssh/ssh_config' in files,
+            4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    size, digest = files['/usr/bin/ssh']
+    actual = hashlib.new(_OL9_DIGESTS[algo], raw).hexdigest()
+    require(size.isascii() and size.isdecimal() and len(size) <= 9 and int(size) == len(raw)
+            and digest == actual, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    return tuple(header[1:]), (size, digest)
+
+
+def _ol9_qualified_client(binary, raw, before, events):
+    require(binary == _OL9_SSH, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+    # Same fixed paths and actual file identities at every recheck. During
+    # one destination/jump proof reuse only a result for the exact same
+    # state; a new proof or dispatch obtains fresh RPM metadata. No TTL.
+    def local_state():
+        arch, os_proof = _ol9_identity()
+        _, rpm_proof = _ol9_file(_OL9_RPM, 16 * 1024**2, executable=True)
+        _, rc_proof = _ol9_file(_OL9_RPM_RC, 256 * 1024)
+        _, macros_proof = _ol9_file(_OL9_RPM_MACROS, 256 * 1024)
+        return arch, os_proof, rpm_proof, rc_proof, macros_proof, _ol9_db_identity()
+    local = local_state()
+    state = (before, events, hashlib.sha256(raw).hexdigest(), local)
+    cache = _RPM_PROOF.get()
+    if cache is not None and cache:
+        require(cache[0] == state, 4, 'CONNECTION_CONTEXT_DRIFT')
+        metadata = cache[1]
+    else:
+        # The stock rpm query is read-only, no verify scripts, plugins,
+        # user macros or arbitrary caller-selected query/path. Fixed macro
+        # inputs are trusted files, with an explicit SQLite DB location.
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        budget = min(5, left - 0.05) if left > 0 else 5
+        require(budget > 0, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        argv = [str(_OL9_RPM), '--noplugins', '--rcfile', str(_OL9_RPM_RC),
+                '--macros', str(_OL9_RPM_MACROS), '--dbpath', str(_OL9_RPM_DB),
+                '--define', '_db_backend sqlite', '-qf', '--queryformat', _OL9_QF, '/usr/bin/ssh']
+        rc, out, err = _scope.bounded_command(argv, {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'HOME': '/'},
+                                               timeout=budget, out_cap=65536, err_cap=65536)
+        require(rc == 0 and not err and local_state() == local, 4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        # Recheck the selected executable after metadata acquisition as well.
+        current, identity = _ol9_file(binary, 16 * 1024**2, executable=True)
+        require(current == raw and identity[1] == before and identity[2] == events,
+                4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED')
+        metadata = _ol9_metadata(out, raw, local[0])
+        if cache is not None:
+            cache.extend((state, metadata))
+    return Path('/etc/ssh'), ('Oracle Linux 9 installed openssh-clients', metadata, state)
+
+def _implicit_roots():
+    try:
+        system, binding = _qualified_implicit_client(_fixed_ssh((b'/usr/bin/ssh',)))
+        return _passwd_ssh_dir(), system, binding
+    except (OSError, ValueError, Denied):
+        raise Denied(4, 'SSH_IMPLICIT_ROOT_UNQUALIFIED') from None
+
+
+def _managed_config_roots():
+    # No Inventory, CLI, environment or user-config path can designate an
+    # OS-managed trust root. Tests exercise the same checks on isolated trees.
+    return (Path('/etc/ssh'), Path('/etc/crypto-policies'), Path('/usr/share/crypto-policies')), 0
+
+
+def _trusted_stat(s, directory=False, owner=None):
+    sticky = owner is None and directory and s.st_uid == 0 and bool(s.st_mode & stat.S_ISVTX)
+    owners = (0, os.geteuid()) if owner is None else (owner,)
+    require(s.st_uid in owners and (not s.st_mode & 0o022 or sticky),
+            4, 'SSH_CONFIG_UNVERIFIED')
+    require(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode) and s.st_nlink == 1,
+            4, 'SSH_CONFIG_UNVERIFIED')
+
+
+def _node_id(s, content=False):
+    return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid) + (
+        (s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns) if content else ())
+
+
+@contextlib.contextmanager
+def _directory(path, events, absent=False, owner=None, managed_root=None):
+    # Pin every traversed directory with no-follow directory descriptors.
+    # Production system roots require root-owned, non-writable ancestors too.
+    # The nonzero owner form is used solely with private synthetic roots.
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _trusted_stat(os.fstat(fd), True, owner=0 if owner == 0 else None)
+        current = Path('/')
+        for part in path.parts[1:]:
+            current = current / part
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                require(absent, 4, 'SSH_CONFIG_UNVERIFIED')
+                events.append(('missing-dir', str(path), _node_id(os.fstat(fd), True), part))
+                yield None
+                return
+            os.close(fd); fd = child
+            ds = os.fstat(fd)
+            strict = owner if owner == 0 or (managed_root is not None and _is_under(current, managed_root)) else None
+            _trusted_stat(ds, True, owner=strict)
+            events.append(('directory', part, _node_id(ds)))
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _is_under(path, root):
+    return path == root or root in path.parents
+
+
+def _config_name(path):
+    # Never treat key, known-host or arbitrary file names in an Include glob
+    # as candidate configuration. Explicit -F remains an operator config path.
+    name = path.name.lower()
+    return name in ('config', 'ssh_config') or name.endswith(('.conf', '.config'))
+
+
+class _ConfigClosure:
+    def __init__(self, path):
+        self.path = path
+        self.events, self.files, self.roots = [], {}, []
+        self.total = self.expansions = self.enumerated = self.links = self.sendenv = 0
+        self.overlay = path is None
+        self.managed, self.managed_owner = _managed_config_roots()
+        user = _passwd_ssh_dir()
+        if path is None:
+            user, system, binding = _implicit_roots()
+            self.events.append(('implicit-client', binding, str(user), str(system)))
+            roots = ((user / 'config', user, True), (system / 'ssh_config', system, True))
+        else:
+            p = _config_path(path)
+            roots = ((p, user, False),)
+            system = self.managed[0]
+        self.allowed = {user, system, *self.managed}
+        if path is not None:
+            # An explicit private config directory is an additional trusted
+            # absolute Include root; relative Include still uses passwd .ssh.
+            parent = Path(path).parent
+            if parent != Path('/'):
+                with _directory(parent, self.events) as fd:
+                    ds = os.fstat(fd)
+                    if ds.st_uid == os.geteuid() and stat.S_IMODE(ds.st_mode) == 0o700:
+                        self.allowed.add(parent)
+        try:
+            for p, relative, absent in roots:
+                self.roots.append(self.visit(p, relative, (), 0, absent))
+        except (OSError, UnicodeError, ValueError):
+            raise Denied(4, 'SSH_CONFIG_UNVERIFIED') from None
+        self.fingerprint = hashlib.sha256(repr((self.roots, self.events)).encode('utf-8')).hexdigest()
+
+    def managed_root(self, path):
+        return next((r for r in self.managed if _is_under(path, r)), None)
+
+    def directory(self, path, absent=False):
+        root = self.managed_root(path)
+        return _directory(path, self.events, absent=absent,
+                          owner=self.managed_owner if root is not None else None,
+                          managed_root=root)
+
+    def link_target(self, path, value):
+        # Relative links may traverse pinned ancestors (leading ../ only).
+        # Reject ambiguous a/../b, intermediate symlinks, unverified roots
+        # and secret-name targets before opening a target file.
+        require(isinstance(value, str) and len(value) <= 4096 and value,
+                4, 'SSH_CONFIG_OS_LINK_UNQUALIFIED')
+        if value.startswith('/'):
+            target = _config_path(value)
+        else:
+            parts = value.split('/')
+            parent = path.parent
+            if parts[0] == '.':
+                parts.pop(0)
+            while parts and parts[0] == '..':
+                require(parent != Path('/'), 4, 'SSH_CONFIG_OS_LINK_UNQUALIFIED')
+                parent = parent.parent; parts.pop(0)
+            require(parts and all(re.fullmatch(r'[A-Za-z0-9_.+-]+', x) and x not in ('.', '..') for x in parts),
+                    4, 'SSH_CONFIG_OS_LINK_UNQUALIFIED')
+            target = _config_path(str(parent.joinpath(*parts)))
+        root = self.managed_root(target)
+        # Distribution crypto-policy client backends commonly use a .txt
+        # target; admit only the named OpenSSH client policy basename there.
+        require(root is not None and root != target and
+                ((_config_name(target) if root == self.managed[0] else
+                  target.name in ('openssh.config', 'openssh.txt')))
+                and not re.search(r'^(?:id_|known_hosts|authorized_keys)|\.(?:pem|key|p12|pfx)$', target.name, re.I),
+                4, 'SSH_CONFIG_OS_LINK_UNQUALIFIED')
+        return target
+
+    def read(self, path, absent, links=()):
+        root = self.managed_root(path)
+        owner = self.managed_owner if root is not None else None
+        with self.directory(path.parent, absent=absent) as fd:
+            if fd is None:
+                self.events.append(('absent', str(path)))
+                return None
+            try:
+                st = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                require(absent, 4, 'SSH_CONFIG_UNVERIFIED')
+                self.events.append(('absent', str(path), _node_id(os.fstat(fd), True)))
+                return None
+            if stat.S_ISLNK(st.st_mode):
+                require(root is not None, 4, 'SSH_CONFIG_UNVERIFIED')
+                require((root == self.managed[0] and _config_name(path) or
+                         root in self.managed[1:] and path.name in ('openssh.config', 'openssh.txt'))
+                        and st.st_uid == owner and st.st_nlink == 1
+                        and path not in links and len(links) < _CONFIG_DEPTH,
+                        4, 'SSH_CONFIG_OS_LINK_UNQUALIFIED')
+                self.links += 1
+                require(self.links <= _CONFIG_EXPANSIONS, 4, 'SSH_CONFIG_LIMIT')
+                parent = _node_id(os.fstat(fd), True)
+                identity = _node_id(st, True)
+                value = os.readlink(path.name, dir_fd=fd)
+                target = self.link_target(path, value)
+                self.events.append(('os-link', str(path), identity, parent, value, str(target)))
+                raw = self.read(target, False, (*links, path))
+                require(raw is not None and parent == _node_id(os.fstat(fd), True)
+                        and identity == _node_id(os.stat(path.name, dir_fd=fd, follow_symlinks=False), True)
+                        and value == os.readlink(path.name, dir_fd=fd), 4, 'CONNECTION_CONTEXT_DRIFT')
+                return raw
+            _trusted_stat(st, owner=owner)
+            require(st.st_size <= _CONFIG_FILE, 4, 'SSH_CONFIG_LIMIT')
+            f = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=fd)
+            with os.fdopen(f, 'rb') as stream:
+                before = os.fstat(stream.fileno()); _trusted_stat(before, owner=owner)
+                require(_node_id(before, True) == _node_id(st, True), 4, 'CONNECTION_CONTEXT_DRIFT')
+                require(before.st_size <= _CONFIG_FILE, 4, 'SSH_CONFIG_LIMIT')
+                raw = stream.read(_CONFIG_FILE + 1)
+                require(len(raw) <= _CONFIG_FILE and len(raw) == before.st_size
+                        and _node_id(before, True) == _node_id(os.fstat(stream.fileno()), True)
+                        and _node_id(before, True) == _node_id(os.stat(path.name, dir_fd=fd, follow_symlinks=False), True),
+                        4, 'SSH_CONFIG_LIMIT_OR_DRIFT')
+                self.events.append(('file', str(path), _node_id(before, True), hashlib.sha256(raw).hexdigest()))
+                return raw
+
+    def matches(self, value, relative):
+        import fnmatch
+        require(re.fullmatch(r'[A-Za-z0-9_./+*?\[\]~-]+', value) is not None,
+                4, 'SSH_CONFIG_UNVERIFIED')
+        require('..' not in value.split('/') and '.' not in value.split('/')
+                and '//' not in value, 4, 'SSH_CONFIG_UNVERIFIED')
+        if value.startswith('~/'):
+            path = _passwd_ssh_dir().parent / value[2:]
+        elif value.startswith('/'):
+            path = Path(value)
+        else:
+            path = relative / value
+        _config_path(str(path), pattern=True)
+        bases = sorted((r for r in self.allowed if _is_under(path, r)), key=lambda r: -len(r.parts))
+        require(bases and path != bases[0], 4, 'SSH_CONFIG_INCLUDE_UNVERIFIED')
+        base = bases[0]; parts = path.relative_to(base).parts
+        wildcard = any(re.search(r'[*?\[]', part) for part in parts)
+        if wildcard:
+            require((os.environ.get('LC_ALL') or os.environ.get('LC_COLLATE') or os.environ.get('LANG') or 'C')
+                    in ('C', 'C.UTF-8', 'C.utf8', 'POSIX'), 4, 'SSH_CONFIG_GLOB_ORDER_UNVERIFIED')
+        current = [base]
+        for part in parts:
+            if not re.search(r'[*?\[]', part):
+                current = [x / part for x in current]
                 continue
-            require(re.fullmatch(r'[A-Za-z0-9_./@:,=*-]+(?:[ \t]+[A-Za-z0-9_./@:,=*-]+)+', line.strip()),
-                    4, 'SSH_CONFIG_UNVERIFIED')
-            parts = line.split()
-            require(len(parts) == 2, 4, 'SSH_CONFIG_UNVERIFIED')
-            if parts[0].lower() == 'host':
-                require(parts[1] == '*' or _scope.HOST.fullmatch(parts[1]), 4, 'SSH_CONFIG_UNVERIFIED')
+            found = []
+            for parent in current:
+                with self.directory(parent, absent=True) as fd:
+                    if fd is None:
+                        continue
+                    before = _node_id(os.fstat(fd), True)
+                    with os.scandir(fd) as it:
+                        for item in it:
+                            self.enumerated += 1
+                            require(self.enumerated <= _CONFIG_ENUM, 4, 'SSH_CONFIG_LIMIT')
+                            if (not item.name.startswith('.') or part.startswith('.')) and fnmatch.fnmatchcase(item.name, part):
+                                _config_path(str(parent / item.name)); found.append(parent / item.name)
+                    require(before == _node_id(os.fstat(fd), True), 4, 'CONNECTION_CONTEXT_DRIFT')
+                    self.events.append(('glob-dir', str(parent), before))
+            current = found
+        current.sort(key=lambda p: os.fsencode(str(p)))
+        require(len(current) <= _CONFIG_FILES and all(_config_name(p) for p in current), 4, 'SSH_CONFIG_INCLUDE_UNVERIFIED')
+        self.events.append(('include', value, str(relative), tuple(map(str, current))))
+        return current, wildcard
+
+    def visit(self, path, relative, chain, depth, absent=False):
+        require(depth <= _CONFIG_DEPTH and path not in chain, 4, 'SSH_CONFIG_LIMIT_OR_CYCLE')
+        # Explicit root is operator-selected configuration, not a key or
+        # known-host input. Included files have the closed config-name gate.
+        require(not re.search(r'^(?:id_|known_hosts|authorized_keys)|\.(?:pem|key|p12|pfx)$', path.name, re.I),
+                4, 'SSH_CONFIG_INCLUDE_UNVERIFIED')
+        raw = self.read(path, absent)
+        if raw is None:
+            return None
+        self.expansions += 1; self.total += len(raw)
+        require(self.expansions <= _CONFIG_EXPANSIONS and self.total <= _CONFIG_TOTAL
+                and len(self.files) < _CONFIG_FILES, 4, 'SSH_CONFIG_LIMIT')
+        require(not re.search(rb'[\x00-\x08\x0b-\x1f\x7f]', raw), 4, 'SSH_CONFIG_UNVERIFIED')
+        parts = []
+        for line in raw.decode('ascii').splitlines(keepends=True):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                parts.append(line.encode('ascii')); continue
+            # Closed syntax, not a shell interpreter. Native parser owns Host
+            # and Match final application and first-set option precedence.
+            fields = stripped.split(); key = fields[0].lower(); values = fields[1:]
+            if key == 'host':
+                require(values and all(re.fullmatch(r'!?[A-Za-z0-9_.?*-]+', x) for x in values),
+                        4, 'SSH_CONFIG_UNVERIFIED')
+            elif key == 'match':
+                require([v.lower() for v in values] == ['final', 'all'], 4, 'SSH_CONFIG_UNVERIFIED')
+            elif key == 'include':
+                require(values, 4, 'SSH_CONFIG_UNVERIFIED')
+                children = []
+                for value in values:
+                    matches, wildcard = self.matches(value, relative)
+                    children.extend(self.visit(p, relative, (*chain, path), depth + 1, wildcard) for p in matches)
+                parts.append(('include', tuple(children))); continue
+            elif key == 'sendenv':
+                _, value = _option(key, ' '.join(values))
+                self.sendenv += len(_sendenv(value))
+                require(self.sendenv <= _SENDENV_CLOSURE, 4, 'SSH_CONFIG_LIMIT')
             else:
-                _option(*parts)
-        return raw
+                require(len(values) == 1, 4, 'SSH_CONFIG_UNVERIFIED')
+                k,v = _option(key, values[0])
+                if k in _MUX and v.lower() not in {'controlmaster': ('no',), 'controlpersist': ('no','0'), 'controlpath': ('none',)}[k]:
+                    self.overlay = True
+            parts.append(line.encode('ascii'))
+        node = (str(path), str(relative))
+        if node in self.files:
+            require(self.files[node] == parts, 4, 'CONNECTION_CONTEXT_DRIFT')
+        self.files[node] = parts
+        return node
+
+
+def _config(path):
+    try:
+        return _ConfigClosure(path).fingerprint
     except (OSError, UnicodeError, ValueError):
         raise Denied(4, 'SSH_CONFIG_UNVERIFIED') from None
 
 
-def _config(path):
-    return hashlib.sha256(_config_bytes(path)).hexdigest()
-
-
 @contextlib.contextmanager
 def _validated_snapshot(path, fingerprint):
-    # Bind the bounded, validated read to what OpenSSH will actually open.
-    # Reopening the original pathname after a hash check is not safe: a
-    # transient edit can disappear before a subsequent hash check.
-    raw = _config_bytes(path)
-    require(hashlib.sha256(raw).hexdigest() == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
+    try:
+        closure = _ConfigClosure(path)
+    except (OSError, UnicodeError, ValueError):
+        raise Denied(4, 'SSH_CONFIG_UNVERIFIED') from None
+    require(closure.fingerprint == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
     try:
         temporary = tempfile.TemporaryDirectory(prefix='pqc-ssh-', dir='/tmp')
     except OSError:
         raise Denied(4, 'SSH_CONFIG_SNAPSHOT_ERROR') from None
     try:
         try:
-            directory = Path(temporary.name)
-            ds = directory.lstat()
+            directory = Path(temporary.name); ds = directory.lstat()
             require(directory.resolve(strict=True) == directory and stat.S_ISDIR(ds.st_mode)
                     and stat.S_IMODE(ds.st_mode) == 0o700 and ds.st_uid == os.geteuid(),
                     4, 'SSH_CONFIG_SNAPSHOT_ERROR')
             snapshot = directory / 'config'
-            # No caller-selected destination, existing file or symlink. This
-            # private file is shared only by the bounded consumers in this
-            # trusted worker, not by inventory/provider or maintenance paths.
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            with os.fdopen(os.open(snapshot, flags, 0o600), 'w+b') as f:
-                fs = os.fstat(f.fileno())
-                require(stat.S_ISREG(fs.st_mode) and stat.S_IMODE(fs.st_mode) == 0o600
-                        and fs.st_uid == os.geteuid() and fs.st_nlink == 1,
-                        4, 'SSH_CONFIG_SNAPSHOT_ERROR')
-                require(f.write(raw) == len(raw), 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
-                f.flush()
-                f.seek(0)
-                require(f.read(65537) == raw, 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+            names = {node: directory / ('source-%02d.conf' % i) for i, node in enumerate(closure.files)}
+            if not closure.overlay and len(closure.roots) == 1 and closure.roots[0] is not None:
+                names[closure.roots[0]] = snapshot
+            def write(p, raw):
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                with os.fdopen(os.open(p, flags, 0o600), 'w+b') as f:
+                    fs = os.fstat(f.fileno())
+                    require(stat.S_ISREG(fs.st_mode) and stat.S_IMODE(fs.st_mode) == 0o600
+                            and fs.st_uid == os.geteuid() and fs.st_nlink == 1, 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+                    require(f.write(raw) == len(raw), 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+                    f.flush(); f.seek(0); require(f.read(len(raw)+1) == raw, 4, 'SSH_CONFIG_SNAPSHOT_ERROR')
+            for node, parts in closure.files.items():
+                data = []
+                for part in parts:
+                    if isinstance(part, bytes):
+                        data.append(part)
+                    else:
+                        children = [os.fsencode(names[x]) for x in part[1] if x is not None]
+                        data.append(b'Include ' + (b' '.join(children) if children else os.fsencode(directory/'empty-*')) + b'\n')
+                write(names[node], b''.join(data))
+            if snapshot not in names.values():
+                roots = [os.fsencode(names[x]) for x in closure.roots if x is not None]
+                write(snapshot, _NO_MUX_CONFIG + b''.join(b'Include ' + p + b'\n' for p in roots))
         except (OSError, ValueError):
             raise Denied(4, 'SSH_CONFIG_SNAPSHOT_ERROR') from None
         yield str(snapshot)
     finally:
-        # Cleanup must complete before any proof can be returned; errors are
-        # a closed failure, including after a successful final consumer.
         try:
             temporary.cleanup()
         except OSError:
             raise Denied(4, 'SSH_CONFIG_SNAPSHOT_CLEANUP_FAILED') from None
+
+
+_MUX_OPTIONS = ('ssh_args', 'ssh_common_args', 'ssh_extra_args', 'control_path', 'control_path_dir')
+
+
+def _native_raw(conn):
+    raw = tuple(_scalar(conn.get_option(k)) for k in _MUX_OPTIONS)
+    require(all(v is None or isinstance(v, str) for v in raw), 4, 'UNSUPPORTED_SSH_OPTION')
+    try:
+        tokens = [shlex.split(_literal(v or '')) for v in raw[:3]]
+    except ValueError:
+        raise Denied(4, 'UNSUPPORTED_SSH_OPTION') from None
+    for group in tokens:
+        _args(group)
+    path, _ = _args([x for group in tokens for x in group])
+    for v in raw[3:]:
+        if v:
+            _mux_path(v, ansible=True)
+    return raw, tokens, path
+
+
+@contextlib.contextmanager
+def _no_mux(conn):
+    raw, groups, _ = _native_raw(conn)
+    saved = {k: getattr(conn, k, None) for k in ('_persistent','control_path','control_path_dir')}
+    try:
+        for i, (k, tokens) in enumerate(zip(_MUX_OPTIONS[:3], groups)):
+            normalized = list(_NO_MUX) if i == 0 else []
+            j = 0
+            while j < len(tokens):
+                if tokens[j] == '-o' and tokens[j+1].partition('=')[0].lower() in _MUX:
+                    j += 2
+                else:
+                    normalized.append(tokens[j]); j += 1
+            conn.set_option(k, shlex.join(normalized))
+        conn.set_option('control_path', None)
+        yield
+    finally:
+        for k, v in zip(_MUX_OPTIONS, raw):
+            conn.set_option(k, v)
+        for k, v in saved.items():
+            setattr(conn, k, v)
+
+
+@contextlib.contextmanager
+def _consume_builder(conn, expected_raw, end=None):
+    original = conn._build_command
+    def build(*args, **kwargs):
+        def consume():
+            require(_native_raw(conn)[0] == expected_raw, 4, 'CONNECTION_CONTEXT_DRIFT')
+            with _no_mux(conn):
+                return original(*args, **kwargs)
+        if end is not None:
+            with _deadline(end - time.monotonic()):
+                return consume()
+        return consume()
+    conn._build_command = build
+    try:
+        yield
+    finally:
+        conn._build_command = original
 
 
 def _native_argv(conn):
@@ -414,33 +1024,46 @@ def _native_argv(conn):
             4, 'CONNECTION_POLICY_DENIED')
     binary = conn.get_option('ssh_executable')
     require(binary in ('ssh', '/usr/bin/ssh'), 4, 'UNSUPPORTED_SSH_EXECUTABLE')
-    tokens = []
-    for k in ('ssh_args', 'ssh_common_args', 'ssh_extra_args'):
-        tokens.extend(shlex.split(_literal(conn.get_option(k) or '')))
-    path, _ = _args(tokens)  # reject unsafe inputs before native builder side effects
+    _, _, path = _native_raw(conn)  # reject before builder side effects
     fingerprint = _config(path)
     host = _address(conn.get_option('host') or conn._play_context.remote_addr)
     conn.host = host
-    argv = tuple(conn._build_command(binary, 'ssh', host, COMMAND))
+    with _no_mux(conn):
+        argv = tuple(conn._build_command(binary, 'ssh', host, COMMAND))
     actual_path, _ = _args([x.decode('utf-8') for x in argv[1:-2]])
     require(actual_path == path and argv[-2:] == (host.encode(), COMMAND.encode()), 4, 'CONNECTION_POLICY_DENIED')
     return argv, fingerprint
 
 
-def _effective_ssh(argv, fingerprint):
-    """Verify the exact native argv with actual OpenSSH -G; never run a remote command."""
-    path, _ = _args([x.decode('utf-8') for x in argv[1:-2]])
-    require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
+def _fixed_ssh(argv):
     binary = Path('/usr/bin/ssh')
     selected = shutil.which(os.fsdecode(argv[0]))
     require(binary.is_file() and os.access(binary, os.X_OK) and selected is not None
             and Path(selected).resolve() == binary.resolve(), 3, 'OPENSSH_EFFECTIVE_CONFIG_UNAVAILABLE')
-    # -G evaluates configuration without connecting. The restricted explicit
-    # config/argv disallow Match exec, Include, ProxyCommand and forwarding.
+    return binary
+
+
+def _effective_ssh(argv, fingerprint):
+    """Verify actual native argv against the private validated closure."""
+    token = _RPM_PROOF.set([])
+    try:
+        return _effective_ssh_proof(argv, fingerprint)
+    finally:
+        _RPM_PROOF.reset(token)
+
+
+def _effective_ssh_proof(argv, fingerprint):
+    path, _ = _args([x.decode('utf-8') for x in argv[1:-2]])
+    require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
+    binary = _fixed_ssh(argv)
+    # -G evaluates only the validated private closure, never a live transport.
     def dump(args):
         require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
-        rc, out, _ = _scope.bounded_command([str(binary), '-G', *args], dict(os.environ),
-                                             timeout=5, out_cap=65536, err_cap=65536)
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        budget = min(5, left) if left > 0 else 5
+        rc, out, _ = _scope.bounded_command([str(binary), '-G', *args],
+                                             {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'},
+                                             timeout=budget, out_cap=65536, err_cap=65536)
         require(rc == 0, 3, 'OPENSSH_EFFECTIVE_CONFIG_UNAVAILABLE')
         entries = {}
         for line in out.decode('utf-8').splitlines():
@@ -458,15 +1081,19 @@ def _effective_ssh(argv, fingerprint):
         one('stricthostkeychecking', ('yes', 'ask', 'true'))
         one('controlmaster', ('no', 'false'))
         one('controlpersist', ('no', '0', 'false'))
+        require(entries.get('controlpath', ['none']) == ['none'], 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
         one('canonicalizehostname', ('no', 'false'))
         one('batchmode', ('yes', 'true'))
+        one('hashknownhosts', ('yes', 'no'))
+        for pattern in entries.get('sendenv', []):
+            require(pattern in _SENDENV_NAMES, 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
         for key in ('forwardagent', 'forwardx11', 'permitlocalcommand'):
             one(key, ('no', 'false'))
         for key in ('identityfile', 'userknownhostsfile', 'globalknownhostsfile'):
             require(entries.get(key), 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
             for record in entries[key]:
                 for value in record.split():
-                    p = Path(value).expanduser()
+                    p = (_passwd_ssh_dir().parent / value[2:] if value.startswith('~/') else Path(value))
                     require(p.is_absolute() and p.resolve() != Path('/dev/null')
                             and value.lower() != 'none', 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
         require(not entries.get('proxycommand') or entries['proxycommand'] == ['none'],
@@ -477,17 +1104,21 @@ def _effective_ssh(argv, fingerprint):
         return entries, hashlib.sha256(out).hexdigest()
     with _validated_snapshot(path, fingerprint) as snapshot:
         args = [x.decode('utf-8') for x in argv[1:-1]]
-        # _args validated exactly one separate -F argument. Only the -G
-        # assessment uses the snapshot; retain original native argv/path for
-        # the binding and late-drift guard. Preserve all other options/order.
-        args[args.index('-F') + 1] = snapshot
+        # Only the proof consumer uses the private closure. Native guarded
+        # argv retains its source selection and fixed scan-only mux policy.
+        if '-F' in args:
+            args[args.index('-F') + 1] = snapshot
+        else:
+            args = ['-F', snapshot, *args]
         effective, digest = dump(args)
         jumps = effective.get('proxyjump', ['none'])
         require(len(jumps) == 1, 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
         _option('proxyjump', jumps[0])
         proofs = [digest]
         if jumps[0] != 'none':
-            for jump in jumps[0].split(','):
+            chain = jumps[0].split(',')
+            for i in reversed(range(len(chain))):
+                jump = chain[i]
                 userhost, port = (jump.rsplit(':', 1) if ':' in jump else (jump, None))
                 user, host = (userhost.split('@', 1) if '@' in userhost else (None, userhost))
                 ja = ['-F', snapshot]
@@ -495,8 +1126,11 @@ def _effective_ssh(argv, fingerprint):
                     ja += ['-o', 'Port=' + port]
                 if user:
                     ja += ['-o', 'User=' + user]
+                prefix = ','.join(chain[:i])
+                if prefix:
+                    ja += ['-o', 'ProxyJump=' + prefix]
                 j, proof = dump(ja + [host])
-                require(j.get('proxyjump', ['none']) == ['none'], 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
+                require(j.get('proxyjump', ['none']) == [prefix or 'none'], 4, 'UNSUPPORTED_SSH_EFFECTIVE_CONFIG')
                 proofs.append(proof)
         require(_config(path) == fingerprint, 4, 'CONNECTION_CONTEXT_DRIFT')
     return tuple(proofs)
@@ -525,7 +1159,7 @@ class _Context:
             for name in self._targets:
                 conn = _native_binding(self, name)
                 argv, fingerprint = _native_argv(conn)
-                proofs[name] = (argv, fingerprint, _effective_ssh(argv, fingerprint))
+                proofs[name] = (argv, fingerprint, _effective_ssh(argv, fingerprint), _native_raw(conn)[0])
                 bindings[name] = conn
             self._bound, self._proofs = bindings, proofs
 
@@ -540,9 +1174,11 @@ class _Context:
             # Recheck the whole batch, then compare the actual consumed argv at
             # the native plugin's _run boundary. Never call its original _run.
             for target in self._targets:
-                argv, fingerprint = _native_argv(_native_binding(self, target))
+                current = _native_binding(self, target)
+                argv, fingerprint = _native_argv(current)
                 expected = self._proofs[target]
-                require((argv, fingerprint) == expected[:2], 4, 'CONNECTION_CONTEXT_DRIFT')
+                require((argv, fingerprint) == expected[:2] and _native_raw(current)[0] == expected[3],
+                        4, 'CONNECTION_CONTEXT_DRIFT')
                 require(_effective_ssh(argv, fingerprint) == expected[2], 4, 'CONNECTION_CONTEXT_DRIFT')
             conn = self._bound[name]
             expected = self._proofs[name]
@@ -556,8 +1192,11 @@ class _Context:
                 return _stop_s1()
 
             try:
+                require(_native_raw(conn)[0] == expected[3] and _native_argv(conn) == expected[:2],
+                        4, 'CONNECTION_CONTEXT_DRIFT')
                 conn._run = guarded
-                return conn.exec_command(COMMAND, sudoable=False)
+                with _consume_builder(conn, expected[3]):
+                    return conn.exec_command(COMMAND, sudoable=False)
             finally:
                 conn._run = original
 
@@ -960,6 +1599,8 @@ def _worker_boundary(ctx, name, registry, collect=None):
     original_run = ssh.Connection._run
     original_get = TaskExecutor._get_connection
     used = False
+    guard_end = None
+    raw_proof = None
 
     def get_connection(executor, cvars, templar, current_connection):
         require(current_connection in ('ssh', 'ansible.builtin.ssh') and executor._host.name == name
@@ -976,10 +1617,18 @@ def _worker_boundary(ctx, name, registry, collect=None):
                 and connection.become is None, 4, 'BATCH_GUARD_DENIED')
         native_exec = connection.exec_command
         def exec_witness(cmd, in_data=None, sudoable=True):
+            nonlocal guard_end, raw_proof
             require(cmd == COMMAND and in_data is None and connection.become is None,
                     4, 'BATCH_GUARD_DENIED')
-            return native_exec(cmd, in_data=None, sudoable=False)
+            guard_end = time.monotonic() + _GUARD_SECONDS
+            with _deadline(_GUARD_SECONDS):
+                raw_proof = _native_raw(connection)[0]
+                require(raw_proof == expected[3] and _native_argv(connection) == expected[:2],
+                        4, 'BATCH_GUARD_DENIED')
+            with _consume_builder(connection, expected[3], guard_end):
+                return native_exec(cmd, in_data=None, sudoable=False)
         connection.exec_command = exec_witness
+        connection.reset = lambda *a, **k: deny(*a, **k)
         connection._run = lambda argv, in_data, sudoable=True, checkrc=True: guarded(
             connection, argv, in_data, sudoable, checkrc)
         return connection
@@ -989,14 +1638,15 @@ def _worker_boundary(ctx, name, registry, collect=None):
         require(not used and in_data is None and sudoable is False and conn.become is None
                 and tuple(argv) == expected[0], 4, 'BATCH_GUARD_DENIED')
         used = True
-        with _deadline(_GUARD_SECONDS):
+        require(guard_end is not None and raw_proof == expected[3], 4, 'BATCH_GUARD_DENIED')
+        with _deadline(guard_end - time.monotonic()):
             require(_source_identity(ctx._source) == ctx._source_id
                     and _project(ctx._inventory, ctx._variables, ctx._request)
                     == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
             # Verify the actual native option consumer and exact argv again,
             # including the existing validated -F snapshot proof.
-            actual = _native_argv(conn)
-            require(actual == expected[:2] and _effective_ssh(tuple(argv), expected[1]) == expected[2],
+            require(_native_raw(conn)[0] == expected[3]
+                    and _effective_ssh(tuple(argv), expected[1]) == expected[2],
                     4, 'BATCH_GUARD_DENIED')
         result = _collect(name, flags, registry) if collect is None else collect(name, flags, registry)
         raw = json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')
