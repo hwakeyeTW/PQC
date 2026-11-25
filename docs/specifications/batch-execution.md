@@ -53,7 +53,7 @@ connection argv and effective SSH proof must agree with preflight. Any
 missing proof, unexpected host or change is denied; S1's terminal stop does
 not call the original native `_run`.
 
-### B compatibility candidate (local checkpoint, HOLD)
+### B compatibility candidate (Draft PR #70, R2 review pending)
 
 The B candidate retains native SSH only, trusted `/usr/bin/ssh` (or the
 same executable found via PATH), the private Ansible context and the hard
@@ -189,7 +189,11 @@ jump effective proof and raw/source drift detection. The `-G` proof child
 has a fixed minimal environment, does not inherit the caller's environment,
 does not send any variables and does not read or write known_hosts contents.
 HashKnownHosts does not authorize a host-key policy downgrade or any write.
-The prior same-package stock defects are covered by real `-G` comparison
+Unapproved `GSSAPIAuthentication` is rejected for all values and keyword
+case variants, including in `-o`, Includes and inactive Host blocks; it is
+not ignored or normalized to `no`. Configurations containing it, including
+otherwise valid stock configurations, remain outside the admitted syntax.
+The two prior same-package stock defects are covered by real `-G` comparison
 with the validated snapshot. The OL9 engineering route is tested using
 synthetic typed RPM metadata through a real bounded local process and the
 approved actual native client; this does not claim an OL9 ELF/RPM execution
@@ -248,7 +252,10 @@ unknown/changed builds, passwd-home selection, absent-root and late
 binary drift; managed-link fixtures exercise the same bounded resolver
 with controlled owner and roots, including native worker consumers and
 retarget/target drift. A private verified client path is a test-only seam,
-not a product fixed-path proof. Stock directive compatibility remains HOLD.
+not a product fixed-path proof. The two identified SendEnv/HashKnownHosts
+stock defects are resolved at the engineering level. The B candidate is
+pending R2 review; complete official OL9 stock configurations, the installed
+client path and actual Controller qualification remain NOT_TESTED.
 The existing plan-only CLI gets one directly relevant synthetic check; no
 historical full-suite rerun is required. Any release/production validation
 remains Issue #28. Owner-approved restricted development (A/B/C, 7143603231)
@@ -470,10 +477,11 @@ and partial-start failure, timer/handler restoration, and uncertain cleanup
 of a connection-failure callback. Faults are injected only in trusted
 synthetic tests, including reported cleanup uncertainty after actual safe
 reaping. The two-stage connection surrogate exercises the full 15-second budget.
-Both are synthetic proof, not real SSH transport qualification. The B local
-checkpoint has controlled-source native parser/builder evidence but remains
-HOLD pending stock directive compatibility; installed-path and actual
-Controller qualification remain separate.
+Both are synthetic proof, not real SSH transport qualification. The B
+candidate has controlled-source native parser/builder evidence and the two
+identified stock directive corrections; R2 review remains pending. Complete
+official OL9 stock configuration, installed-path and actual Controller
+qualification remain NOT_TESTED.
 Actual fixed-path `ssh -G` and real SSH transport remain unqualified; live
 execution remains hard closed. Actual
 Controller/OL9.7-9.9, legitimate native SSH/ProxyJump, remote lifetime,

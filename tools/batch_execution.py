@@ -299,7 +299,7 @@ _OPTION = frozenset(('port', 'user', 'identityfile', 'identitiesonly', 'strictho
                      'passwordauthentication', 'kbdinteractiveauthentication', 'preferredauthentications',
                      'compression', 'loglevel', 'serveraliveinterval', 'serveralivecountmax', 'numberofpasswordprompts',
                      'ciphers', 'macs', 'kexalgorithms', 'hostkeyalgorithms', 'pubkeyacceptedalgorithms',
-                     'casignaturealgorithms', 'hostbasedacceptedalgorithms', 'gssapiauthentication',
+                     'casignaturealgorithms', 'hostbasedacceptedalgorithms',
                      'sendenv', 'hashknownhosts'))
 
 

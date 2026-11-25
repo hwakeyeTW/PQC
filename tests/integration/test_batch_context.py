@@ -1194,6 +1194,28 @@ def test_b_stock_syntax_rejects_both_sources(tmp_path,key,value):
     assert exc.value.code==4
 
 
+
+@pytest.mark.parametrize('key', ['GSSAPIAuthentication', 'gssapiauthentication', 'gSsApIaUtHeNtIcAtIoN'])
+@pytest.mark.parametrize('value', ['yes', 'no', 'nonsense'])
+@pytest.mark.parametrize('entry', ['config', 'argv', 'include-inactive-host'])
+def test_b_gssapi_authentication_denied(tmp_path, key, value, entry):
+    # Reject every value before native parsing, even in an inactive Host
+    # block of an included source. Do not ignore or normalize to "no".
+    cfg = tmp_path / 'config'
+    if entry == 'config':
+        cfg.write_text(f'Host *\n{key} {value}\n')
+    elif entry == 'include-inactive-host':
+        part = tmp_path / 'included.conf'
+        part.write_text(f'Host unselected.example.invalid\n{key} {value}\n')
+        cfg.write_text(f'Host *\nInclude {part}\n')
+    with pytest.raises(batch.Denied) as exc:
+        if entry == 'argv':
+            batch._args(['-o', key + '=' + value])
+        else:
+            batch._config(str(cfg))
+    assert exc.value.code == 4
+    assert exc.value.reason == 'UNSUPPORTED_SSH_OPTION'
+
 def test_b_stock_sendenv_aggregate_limit(tmp_path):
     cfg=tmp_path/'config'; part=tmp_path/'part.conf'
     part.write_text('SendEnv '+' '.join(['LANG']*32)+'\n')
