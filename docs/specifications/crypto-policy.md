@@ -180,3 +180,75 @@ actual system policy files, actual update-crypto-policies, real Controller and
 OL9.7/9.8/9.9, remote transport/termination/load and final report integration
 remain NOT_TESTED, subject to #8 and #28. No formal support or release acceptance
 is inferred from this internal development slice. No historical full suite.
+
+## I1b CP1: fixed native acquisition (Issue #57)
+
+CP1 adds `pqc_policy_acquire` (short name and collection FQCN), without
+changing the #16 role, normalizer, schema, rules, or public dispatch. Only a
+trusted caller with the separately approved execution context may select a
+stage. The module accepts exactly `stage=reader`, `show-bin` or `show-sbin`;
+no root, paths, argv, timeouts, environment, or flags can be supplied. It
+supports check mode, is no_log, and returns changed=false. The actual trusted
+AnsiballZ zip loader and same-archive helper are required. The private child
+uses the fixed interpreter with -I -S -B and a fixed stage entry point.
+
+The reader returns exactly the eight non-show slots defined above. The #16
+literal grammar is embedded byte-for-byte. Root is fixed to `/`; directory
+FD traversal, pinned regular files, trusted ownership/mode, link allowlist,
+file and path-chain identity checks and the fixed kernel pseudo-file apply.
+The four-hop backend allowlist and direct local.d scope are unchanged. Source
+and link drift, nonregular files, untrusted directories, unsafe links and
+permission failures are gaps, not negative algorithm evidence. The original
+16 KiB/file, 64 KiB raw aggregate, 32 entries and 64 values (including the
+aggregate nested override values) limits still apply. Raw aggregate overflow
+returns all eight slots as ERROR/TOTAL_LIMIT. No truncation is a success.
+
+The two show stages return exactly the profile-show slot. Each invokes only
+its named regular, trusted executable with --show; it rechecks executable
+and path identity before/after capture, does not search PATH or fall back to
+the other stage, uses closed stdin, C locale and combined raw stdout/stderr
+<=16 KiB. Reader and show have a 23-second internal deadline (alarm for
+blocking I/O); the native outer helper owns a 30-second envelope including
+cleanup. The show child stays in that helper's process group (no nested
+session); timeout/interrupt/output and residual processes require independent
+outer group cleanup and reaping. No claim covers hostile root, arbitrary
+programs that detach, or uninterruptible kernel I/O. Installed OL9 sources,
+actual vendor show executable and remote execution remain untested here.
+
+The native receipt has exactly six keys: `format` (integer 1), `stage`,
+`reason_code`, `rc`, `cleanup_confirmed`, `payload`. `rc` is the outer child
+rc, not the show command rc inside a typed slot. COMMAND_OK requires outer
+rc=0, confirmed cleanup, and the exact validated stage payload. Other outer
+outcomes carry null payload, never partial raw output. The original typed
+slot/override shape and reasons are retained; malformed receipt, extra keys,
+wrong stage/types, duplicate JSON keys, NaN/float and inconsistent cleanup
+are rejected. Inner CLEANUP_FAILED, INTERRUPTED, invalid contract and
+unconfirmed outer cleanup are not usable acquisition results; a later
+integrator must stop as required by its separate approved contract.
+
+`pqc_bounded_execution.run_policy_bounded` is a private fixed CP1 helper
+entry; it shares the original runner/cleanup with `run_bounded`, but has a
+Policy-only combined child-frame limit of 64 KiB plus one LF. The child
+writes canonical compact ASCII JSON (sorted keys, no NaN), at most 64 KiB
+payload plus LF. The compact typed receipt is at most 66 KiB and the native
+wrapper at most 128 KiB. A serialized payload overflow becomes the same
+closed all-eight TOTAL_LIMIT gap for reader (OUTPUT_LIMIT for show), never
+a truncated positive. The existing run_bounded limit of 16 KiB, its 30s
+maximum and cleanup/outcome contract are unchanged for P1/O1; CP1 does not
+change their receipts, shared handoff limits, host bounds or other budgets.
+
+CP1 does not select a show stage from platform evidence, combine the nine
+slots, bind them to a host or invoke the acquisition through the batch
+bridge. Those steps are CP2 and require separate approval. The existing
+normalize_snapshot handles profile conflict without choosing a winner, and
+preserves true/false/unknown kernel FIPS independently. No policy value
+establishes actual runtime use, FIPS validation or a PQC readiness claim.
+The public registries and real transport denial remain unchanged.
+
+Focused development checks cover actual short/FQCN native packaging using
+private literal-substitution fixtures, original parser/normalizer parity,
+large legal reader projection, closed receipts, unsafe/changed sources,
+fixed commands, raw/typed caps and actual owned process group cleanup.
+The formal Controller, OL9.7-9.9 stock files and symlinks, vendor executable,
+real SSH/remote lifetime, load, Before-After and offline deployment remain
+NOT_TESTED for #28. CP1 is not CP2 integration or release acceptance.
