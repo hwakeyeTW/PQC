@@ -30,7 +30,7 @@ busy/recovery/durability failure; exit 2 denotes invalid arguments.
 Open `reports/index.html` locally. The table works with JavaScript disabled; no
 server, external styles, fonts, network or local JSON fetch. Move or archive and
 extract the **whole** report root, including `catalog.generations`, preserving
-private permissions for further Controller operations. Existing Portal v1/v2
+private permissions for further Controller operations. Existing Portal v1/v2/v3/v4
 pages are not changed by a catalog rebuild.
 
 ## Opt-in Portal v3 history navigation
@@ -96,6 +96,79 @@ a failed sync after a switch is `DURABILITY_UNCONFIRMED`, not success or
 rollback. Retry verifies the exact visible version and reconfirms durability.
 Do not remove unknown staging or change permissions to force a retry.
 
+## Opt-in Portal v4 crypto indexes
+
+A v4 portal includes history navigation and the evidence-backed Algorithms and
+Libraries indexes. The default for a new run remains v2; `--with-history`
+without the new flag still selects v3. First explicitly publish a coherent
+catalog, then render only the approved RID:
+
+```sh
+python -m tools.run_catalog --report-root /approved/private/reports
+# Fresh run with no stable portal index:
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --with-crypto-indexes
+# Existing exact v1, v2 or v3 portal (explicit replacement):
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --refresh-portal --with-crypto-indexes
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.run_catalog --report-root /approved/private/reports --check
+```
+
+Use only the applicable render command. `--with-crypto-indexes` itself includes
+history; also specifying `--with-history` is valid. The equivalent API is
+`render_run(root, rid, with_crypto_indexes=True)`, with `refresh_portal=True`
+required to replace a proven old index. All three flags are keyword-only
+Booleans. CLI abbreviations are rejected. Without refresh, existing v1/v2/v3
+cannot be overwritten by v4. Exact existing v4 is verified without rewriting
+or downgrading under every combination of the three flags, even if the current
+catalog is missing or inconsistent. That no-op does not establish a working
+history link; use the explicit catalog operations to restore it. No automatic
+catalog rebuild/recovery, scan, or reassessment occurs.
+
+The fixed `portal-v4/` directory contains `hosts.html`, every expected
+`<host-id>.html`, `algorithms.html`, `libraries.html`, `crypto_indexes.json`,
+and `portal_receipt.json`. The stable run entry remains `index.html`. Format 4
+receipt binds the manifest, index and CSS SHA-256 and the sorted fixed derived
+file names/sizes/hashes (including the JSON). The JSON is the exact bounded
+canonical projection used by the two index pages, not separately computed
+statistics. Each group links to its recorded host, asset, evidence and saved
+claim anchors; backlinks are the reverse of those explicit memberships.
+Unresolved saved claims stay unresolved and point to the unresolved section.
+Counts are unique-set cardinalities, not readiness scores; package presence,
+CLI or provider metadata never establishes service library use. The two
+reviewed index templates and projection rules are unchanged.
+
+The v4 batch and host pages link to the two index pages and JSON via fixed
+same-generation relative paths. History/Batch/Hosts/peer and evidence links
+work offline with the complete report root retained. Prior generations are
+not amended; their stable batch link can return to the upgraded index. Do not
+copy just one page or mix generations. Catalog refresh records `portal-v4`
+only after exact proof of the currently referenced stable entry; old coherent
+catalog snapshots remain valid, not fresh. No browser script, external
+resources, or JSON fetch is needed.
+
+The same catalog-first shared lock and pinned root / run locking order as v3
+apply to a new or upgraded v4. The Store must validate the published core and
+frozen scope; the old index/CSS and its referenced v2/v3 generation must be
+exact before an upgrade. The v4 writer verifies the fixed slot set and
+file/directory identities and content again before the stable switch. Missing
+exact staging files can be resumed no-replace; a present receipt requires the
+complete exact set. Unknown, corrupt, or unsafe slots are refused, not repaired.
+The receipt is sealed after all derived files and the stable index is switched
+last, with fsync. A failure after the switch is not success or rollback; retry
+verifies the visible exact generation and its durability. Old v2/v3 files,
+CSS, manifest, journal and immutable core bytes remain unchanged.
+
+The per-HTML-page cap is 16 MiB and the combined HTML cap (including the stable
+index and both index pages) is 128 MiB. The only fixed non-HTML generation
+slot, `crypto_indexes.json`, has a separate 32 MiB cap and is excluded from the
+HTML aggregate; CSS is capped at 256 KiB and the receipt at 256 KiB. Each
+admitted derived file, including this JSON, counts once toward the existing
+4 GiB catalog admission limit. Generated or actual proven capacity excess is
+fatal for the whole catalog rebuild/recover; ordinary corruption stays an
+invalid unlinked row. No output truncation or implicit downgrade. Actual
+filesystem/power-loss/load and Windows/Linux file-browser acceptance remain
+release QA; an engineering relative-link check is not browser certification.
+
 ## Interpretation
 
 `run_catalog.json` is canonical catalog version 1 / render format 1, with
@@ -114,13 +187,14 @@ zero or a guessed failed scan.
 | INVALID | Unsafe/casefold collision or unverified marker, lock or core. |
 | BUSY | Could not obtain the run's shared lock. Outcome unknown. |
 
-The separate `portal_status` is AVAILABLE (exact verified v1, v2 or v3),
+The separate `portal_status` is AVAILABLE (exact verified v1, v2, v3 or v4),
 NOT_GENERATED (no derived slots), INVALID (incomplete, unsafe, unknown or
 inconsistent derived output), or NOT_VERIFIED (publication not verified).
 Only AVAILABLE has a relative `run_id/index.html` link. Only the version
-referenced by the stable run index is verified: exact v1 ignores both newer
-staging directories, v2 ignores v3, and v3 ignores retained v2. A v2/v3 index
-needs the complete expected page set and matching receipt/manifest/CSS bytes.
+referenced by the stable run index is verified; unreferenced v2/v3/v4 retained
+or staging directories are not opened. A v2/v3/v4 index needs the complete
+expected generation and matching receipt/manifest/CSS bytes. V4 also verifies
+the exact canonical crypto index JSON with its separate cap.
 The catalog schema, version, render format and immutable snapshot contract
 are unchanged. There is no historical trend or security/readiness score.
 
