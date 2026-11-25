@@ -57,14 +57,26 @@ class _Budget:
         self.used += size
 
     def file(self, fd, name, device, limit):
-        f = rs._open_file(fd, name, device)
-        try:
-            size = rs._stat_file(f, device).st_size
-            rs.require(0 <= size <= limit, 'ARTIFACT_SIZE')
-            self.add(size)
-            return size
-        finally:
-            os.close(f)
+        size = _safe_size(fd, name, device, limit)
+        self.add(size)
+        return size
+
+
+def _capacity_if(exceeded):
+    if exceeded:
+        raise CapacityError('CATALOG_CAPACITY')
+
+
+def _safe_size(fd, name, device, limit):
+    # An untrusted pathname or unsafe inode is not evidence of capacity.
+    f = rs._open_file(fd, name, device)
+    try:
+        size = rs._stat_file(f, device).st_size
+        rs.require(size >= 0, 'ARTIFACT_SIZE')
+        _capacity_if(size > limit)
+        return size
+    finally:
+        os.close(f)
 
 
 def _identity(fd):
@@ -113,7 +125,15 @@ def _portal_status(fd, device, published, marker, budget):
         rs.require(has_index and has_css, 'PORTAL_GENERATION_INCOMPLETE')
         current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
         css = rs._read(fd, 'portal.css', device, portal._MAX_CSS, css_size)
-        old, expected_css = portal._render(published)
+        try:
+            old, expected_css = portal._render(published)
+        except rs.StoreError as exc:
+            # V1 uses this code for an empty trusted CSS as well as overflow.
+            # The installed renderer/templates are trusted, fixed inputs.
+            if (exc.code == 'PORTAL_SIZE_LIMIT' and
+                    (portal._TEMPLATES / 'portal.css').stat().st_size > 0):
+                raise CapacityError('CATALOG_CAPACITY') from None
+            raise
         rs.require(css == expected_css, 'PORTAL_OUTPUT_COLLISION')
         if current == old:
             # Unreferenced v2 staging is deliberately not opened.
@@ -130,9 +150,16 @@ def _portal_status(fd, device, published, marker, budget):
                 size = budget.file(gen, name, device, cap)
                 if name != portal._RECEIPT:
                     total += size
-            rs.require(present == expected and total <= portal._MAX_TOTAL_HTML,
-                       'PORTAL_GENERATION_INCOMPLETE')
-            index, pages, receipt = portal._render_v2(published, marker, expected_css)
+            _capacity_if(total > portal._MAX_TOTAL_HTML)
+            rs.require(present == expected, 'PORTAL_GENERATION_INCOMPLETE')
+            try:
+                index, pages, receipt = portal._render_v2(published, marker, expected_css)
+            except rs.StoreError as exc:
+                # In this fixed renderer, these are generated HTML and receipt
+                # byte limits, not a persisted page/receipt mismatch.
+                if exc.code in ('PORTAL_SIZE_LIMIT', 'SIZE_LIMIT'):
+                    raise CapacityError('CATALOG_CAPACITY') from None
+                raise
             rs.require(current == index, 'PORTAL_OUTPUT_COLLISION')
             portal._generation(gen, device, pages, receipt, complete=True)
             _same_entry(fd, portal._GENERATION, gen)
@@ -143,6 +170,157 @@ def _portal_status(fd, device, published, marker, budget):
         return 'INVALID', None
 
 
+def _core_slot(key, kind):
+    parts, cap = rs._slot(*key)
+    if key[0] == 'cff':
+        cap = min(cap, rs.MAX_CFF)
+        if kind == 'LEGACY_IMPORT':
+            # The legacy projection has a stricter byte cap than the generic slot.
+            from tools import cff
+            cap = min(cap, cff.MAX_BYTES)
+    return parts, cap
+
+
+def _declared_capacity(header, rid):
+    """Diagnose only a failed header's count/size admission, not publication.
+
+    Check all original fixed identities and positive typed sizes before using
+    a diagnostic projection of the header with bounded counts/sizes. Reuse
+    the actual Store header/scope validators for all other scope constraints;
+    no projected header is passed to open(), used for a row, or written.
+    """
+    rs._keys(header, rs.MANIFEST_KEYS)
+    rs.require(header['manifest_version'] == rs.VERSION and
+               header['publication_state'] == 'PUBLISHED' and header['run_id'] == rid,
+               'MANIFEST_IDENTITY')
+    rs._enum(header['run_kind'], rs.KINDS)
+    kind = header['run_kind']
+    hosts = header['hosts']
+    rs.require(type(hosts) is list and bool(hosts), 'HOST_LIMIT')
+    ids, targets = [], []
+    for row in hosts:
+        rs.require(type(row) is dict and 'host_id' in row and 'target_id' in row,
+                   'INVALID_SHAPE')
+        ids.append(rs._id(row['host_id']))
+        target = row['target_id']
+        rs.require(target is None or type(target) is str, 'INVALID_TARGET')
+        if target is not None:
+            targets.append(target)
+    host_ids = set(ids)
+    rs.require(len(host_ids) == len(ids) and ids == sorted(host_ids) and
+               header['expected_host_ids'] == ids and len(set(targets)) == len(targets),
+               'HOST_MANIFEST')
+    flags = header['flags']
+    if kind == 'LEGACY_IMPORT':
+        host_cap = 1000
+        rs.require(flags is None, 'LEGACY_SCOPE')
+    else:
+        rs._keys(header['limits'], 'max_hosts forks serial ssh_timeout_s command_timeout_s')
+        host_cap = header['limits']['max_hosts']
+        rs._int(host_cap, 1, 10)
+        rs.require(type(flags) is dict and flags.keys() == host_ids, 'PROFILE_FLAGS')
+    # Requirements use a separate bounded slot list. Validate all original
+    # references, including duplicates across diagnostic groups.
+    requirements = header['requirements']
+    rs._keys(requirements, 'assessment cff details')
+    details = requirements['details']
+    detail_cap = rs.MAX_SLOTS - 6
+    rs.require(type(details) is list and detail_cap >= 0, 'SLOT_LIMIT')
+    required = set()
+    step = max(1, detail_cap)
+    for start in range(0, len(details) or 1, step):
+        group = rs._requirements({**requirements, 'details': details[start:start + step]},
+                                 host_ids, kind)
+        rs.require(not required & group, 'INVALID_DETAIL_REQUIREMENT')
+        required.update(group)
+    rows = header['artifacts']
+    rs.require(type(rows) is list and bool(rows), 'SLOT_LIMIT')
+    entries, total = {}, 0
+    overflow = len(hosts) > host_cap or len(rows) > rs.MAX_SLOTS or len(details) > detail_cap
+    for row in rows:
+        rs._keys(row, rs.ENTRY_KEYS)
+        key = (row['kind'], row['host_id'], row['slot'])
+        parts, cap = _core_slot(key, kind)
+        rs.require(row['path'] == '/'.join(parts) and key not in entries and
+                   (key[0] != 'detail' or key[1] in host_ids), 'INVALID_SLOT')
+        rs.require(type(row['size']) is int and row['size'] > 0, 'INVALID_INTEGER')
+        rs._bool(row['required'])
+        rs.require(rs._match(row['sha256'], rs.HEX), 'ARTIFACT_HASH')
+        version = (header['evidence_schema_version'] if key[0] in ('evidence', 'assessed') else
+                   header['rule_version'] if key[0] == 'rules' else rs.VERSION)
+        rs.require(type(version) is str and row['format_version'] == version, 'INVALID_SLOT')
+        for field, ref_kind in (('collection_ids', 'collection'), ('asset_ids', 'asset'),
+                                ('evidence_ids', 'evidence')):
+            refs = row[field]
+            rs.require(type(refs) is list and (key[0] == 'detail' or not refs), 'INVALID_REFS')
+            for ref in refs:
+                rs._id(ref, ref_kind)
+            rs.require(refs == sorted(set(refs)), 'INVALID_REFS')
+        entries[key] = row
+        total += row['size']
+        overflow |= row['size'] > cap
+    overflow |= total > rs.MAX_CORE
+    if not overflow:
+        return False
+    # The evidence slot is mandatory for any genuine published run. Validate
+    # the original scope in bounded groups, not a truncated catalog/run. All
+    # original counts/slots/identities above were checked before this probe.
+    rs.require(('evidence', None, None) in entries, 'MISSING_EVIDENCE')
+    evidence_slot = {**entries['evidence', None, None], 'size': 1}
+    for start in range(0, len(hosts), host_cap):
+        group = hosts[start:start + host_cap]
+        group_ids = ids[start:start + host_cap]
+        probe = {**header, 'hosts': group, 'expected_host_ids': group_ids,
+                 'flags': None if flags is None else {hid: flags[hid] for hid in group_ids},
+                 'requirements': {**requirements, 'details': []}, 'artifacts': [evidence_slot]}
+        rs._manifest_header(probe, rid)
+    return True
+
+
+def _admitted_entries(header, rid):
+    try:
+        _, _, entries = rs._manifest_header(header, rid)
+    except rs.StoreError as exc:
+        if exc.code in ('INVALID_INTEGER', 'HOST_LIMIT', 'SLOT_LIMIT', 'CORE_SIZE_LIMIT'):
+            try:
+                overflow = _declared_capacity(header, rid)
+            except (rs.StoreError, evidence.EvidenceError):
+                overflow = False
+            _capacity_if(overflow)
+        raise
+    # A CFF declaration can fit the generic Store header limit but exceed the
+    # stricter actual projection byte limit. Apply the same typed proof, not
+    # the ambiguous CFF_PROJECTION_LIMIT from later content validation.
+    if any(row['size'] > _core_slot(key, header['run_kind'])[1]
+           for key, row in entries.items()):
+        _capacity_if(_declared_capacity(header, rid))
+        raise rs.StoreError('INVALID_SLOT')
+    return entries
+
+
+def _admit_core(fd, device, header, entries):
+    # Stat only: indexed declarations have already been charged once.
+    total, invalid = 0, None
+    for key, row in entries.items():
+        parts, cap = _core_slot(key, header['run_kind'])
+        _capacity_if(row['size'] > cap)
+        try:
+            with rs._directory(fd, parts[:-1], device) as parent:
+                size = _safe_size(parent, parts[-1], device, cap)
+            total += size
+            _capacity_if(total > rs.MAX_CORE)
+            rs.require(size == row['size'], 'ARTIFACT_SIZE')
+        except CapacityError:
+            raise
+        except (rs.StoreError, OSError) as exc:
+            # Do not open any raw/foreign path, but other admitted fixed slots
+            # may still provide positive capacity evidence. No core bytes read.
+            if invalid is None:
+                invalid = exc
+    if invalid is not None:
+        raise invalid
+
+
 def _published_row(store, rid, fd, lock, budget):
     device = store._device
     if not rs._exists(fd, 'run_manifest.json'):
@@ -151,12 +329,13 @@ def _published_row(store, rid, fd, lock, budget):
     marker = rs._read(fd, 'run_manifest.json', device, rs.MAX_MANIFEST, marker_size)
     header = rs._loads(marker)
     rs.require(marker == rs._json_bytes(header), 'NONCANONICAL_MANIFEST')
-    _, _, entries = rs._manifest_header(header, rid)
+    entries = _admitted_entries(header, rid)
     budget.add(sum(x['size'] for x in entries.values()))
     journal_size = budget.file(fd, 'journal.json', device, rs.MAX_MANIFEST)
     journal = rs._read(fd, 'journal.json', device, rs.MAX_MANIFEST, journal_size)
     _same_entry(store._fd, rid, fd)
     _same_entry(fd, '.writer.lock', lock)
+    _admit_core(fd, device, header, entries)
     store.expected = (rid, _identity(fd), _identity(lock))
     try:
         pub = store.open(rid)

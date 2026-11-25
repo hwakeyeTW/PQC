@@ -544,3 +544,322 @@ def test_root_contract_rejects_relative_symlink_and_mode(root):
         assert not list(root.iterdir())
     root.chmod(0o755)
     assert cli(root).returncode == 1 and not list(root.iterdir())
+
+
+def catalog_state(root):
+    # Only small catalog files, never traverse/read a sparse oversized run.
+    return (stable(root), {name: stat.S_IMODE((root / name).stat().st_mode)
+                          for name in (cat.JSON, cat.HTML)},
+            tree_bytes(root / cat.GENERATIONS),
+            sorted(p.name for p in (root / cat.GENERATIONS).iterdir()))
+
+
+def sparse(path, size):
+    with path.open('r+b') as stream:
+        stream.truncate(size)
+    assert path.stat().st_size == size and stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_per_run_capacity_does_not_publish(root, monkeypatch):
+    pub = publish(root, monkeypatch, 'old')
+    v1(root, 'old', pub)
+    cat.build_catalog(root)
+    old = catalog_state(root)
+    old_run = tree_bytes(root / 'old')
+    pub = publish(root, monkeypatch, 'oversized')
+    v1(root, 'oversized', pub)
+    pub = publish(root, monkeypatch, 'valid')
+    v1(root, 'valid', pub)
+    path = root / 'oversized' / cat.HTML
+    sparse(path, portal._MAX_HTML + 1)
+    signature = path.stat()
+    for args in ((), ('--recover',)):
+        result = cli(root, *args)
+        assert (result.returncode, result.stdout, result.stderr) == (1, b'', b'CATALOG_CAPACITY\n')
+        assert catalog_state(root) == old
+    assert cli(root, '--check').returncode == 0
+    assert_html_snapshot(root)
+    assert tree_bytes(root / 'old') == old_run
+    assert (path.stat().st_ino, path.stat().st_size, path.stat().st_mtime_ns) == (
+        signature.st_ino, signature.st_size, signature.st_mtime_ns)
+    # The real reader/renderer still run for the other valid publications.
+    # Only the specific oversized fixed slot is forbidden to reach _read.
+    actual_read, actual_render = rs._read, portal._render
+    parent_stat = path.parent.stat()
+    def guarded_read(fd, name, device, limit, *args, **kwargs):
+        s = os.fstat(fd)
+        assert not (s.st_ino == parent_stat.st_ino and name == cat.HTML)
+        return actual_read(fd, name, device, limit, *args, **kwargs)
+    def guarded_render(published):
+        assert published.manifest['run_id'] != 'oversized'
+        return actual_render(published)
+    with monkeypatch.context() as m:
+        m.setattr(rs, '_read', guarded_read)
+        m.setattr(portal, '_render', guarded_render)
+        with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'):
+            cat.build_catalog(root)
+    assert catalog_state(root) == old
+
+
+@pytest.mark.parametrize('slot', ['marker', 'journal', 'core', 'detail', 'css', 'receipt', 'page', 'legacy-cff'])
+def test_actual_fixed_slot_capacity(root, monkeypatch, slot):
+    cat.build_catalog(root)
+    old = catalog_state(root)
+    if slot == 'legacy-cff':
+        pub = legacy(root, 'run')
+    else:
+        with monkeypatch.context() as m:
+            m.setattr(fixture, 'RID', 'run')
+            pub = fixture.publish(root, details=slot == 'detail')
+    run = root / 'run'
+    if slot in ('css', 'receipt', 'page'):
+        portal.render_run(root, 'run')
+    if slot == 'legacy-cff':
+        from tools import cff
+        path, cap = run / rs.FILES['cff'][0], cff.MAX_BYTES
+    elif slot == 'detail':
+        entry = next(x for x in pub.manifest['artifacts'] if x['kind'] == 'detail')
+        path, cap = run / entry['path'], rs.MAX_DETAIL
+    else:
+        name, cap = {'marker': ('run_manifest.json', rs.MAX_MANIFEST),
+                     'journal': ('journal.json', rs.MAX_MANIFEST),
+                     'core': rs.FILES['evidence'],
+                     'css': ('portal.css', portal._MAX_CSS),
+                     'receipt': (portal._GENERATION + '/' + portal._RECEIPT, portal._MAX_RECEIPT),
+                     'page': (portal._GENERATION + '/hosts.html', portal._MAX_HTML)}[slot]
+        path = run / name
+    sparse(path, cap + 1)
+    before = path.stat()
+    actual_read = rs._read
+    parent_stat = path.parent.stat()
+    def guarded_read(fd, name, device, limit, *args, **kwargs):
+        assert not (name == path.name and os.fstat(fd).st_ino == parent_stat.st_ino), slot
+        return actual_read(fd, name, device, limit, *args, **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(rs, '_read', guarded_read)
+        with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'):
+            cat.build_catalog(root)
+    assert catalog_state(root) == old and cat.check_catalog(root) == data(root)['generation']
+    after = path.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns, after.st_mode) == (
+        before.st_ino, before.st_size, before.st_mtime_ns, before.st_mode)
+
+
+@pytest.mark.parametrize('cap_kind', ['declared-size', 'declared-core-total', 'actual-core-total',
+                                      'host-count', 'slot-count', 'legacy-cff-size'])
+def test_typed_capacity_admission(root, monkeypatch, cap_kind):
+    cat.build_catalog(root)
+    old = catalog_state(root)
+    if cap_kind == 'legacy-cff-size':
+        pub = legacy(root, 'run')
+    elif cap_kind == 'slot-count':
+        with monkeypatch.context() as m:
+            m.setattr(fixture, 'RID', 'run')
+            pub = fixture.publish(root, ('COMPLETE',) * 3, details=True, assessed=True, cff=True)
+    else:
+        pub = publish(root, monkeypatch, 'run', ('COMPLETE', 'COMPLETE'))
+    run = root / 'run'
+    marker = run / 'run_manifest.json'
+    value = json.loads(marker.read_bytes())
+    entry = next(x for x in value['artifacts'] if x['kind'] == 'evidence')
+    original_size = entry['size']
+    with monkeypatch.context() as m:
+        if cap_kind == 'declared-size':
+            entry['size'] = rs.FILES['evidence'][1] + 1
+            put(marker, rs._json_bytes(value))
+        elif cap_kind == 'declared-core-total':
+            m.setattr(rs, 'MAX_CORE', sum(x['size'] for x in value['artifacts']) - 1)
+        elif cap_kind == 'actual-core-total':
+            m.setattr(rs, 'MAX_CORE', sum(x['size'] for x in value['artifacts']))
+            sparse(run / entry['path'], original_size + 1)
+        elif cap_kind == 'host-count':
+            value['limits']['max_hosts'] = 1
+            assert len(value['hosts']) == 2
+            put(marker, rs._json_bytes(value))
+        elif cap_kind == 'slot-count':
+            assert len(value['artifacts']) > 7
+            m.setattr(rs, 'MAX_SLOTS', 7)
+        else:
+            from tools import cff
+            size = next(x['size'] for x in value['artifacts'] if x['kind'] == 'cff')
+            m.setattr(cff, 'MAX_BYTES', size - 1)
+        # The original Store is still the publication authority. Capacity
+        # must be proved by admitted metadata/stat before any core read.
+        actual_read = rs._read
+        def guarded_read(fd, name, device, limit, *args, **kwargs):
+            assert name not in {rs.FILES[k][0] for k in rs.FILES}
+            return actual_read(fd, name, device, limit, *args, **kwargs)
+        m.setattr(rs, '_read', guarded_read)
+        with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'):
+            cat.build_catalog(root)
+    assert catalog_state(root) == old
+    assert cat.check_catalog(root) == data(root)['generation']
+
+
+@pytest.mark.parametrize('cap_kind', ['v2-total', 'v1-generated', 'v2-generated', 'receipt-generated'])
+def test_portal_total_and_generated_capacity(root, monkeypatch, cap_kind):
+    cat.build_catalog(root)
+    old = catalog_state(root)
+    pub = publish(root, monkeypatch, 'run')
+    portal.render_run(root, 'run')
+    run, gen = root / 'run', root / 'run' / portal._GENERATION
+    with monkeypatch.context() as m:
+        if cap_kind == 'v2-total':
+            total = (run / cat.HTML).stat().st_size + sum(p.stat().st_size for p in gen.glob('*.html'))
+            m.setattr(portal, '_MAX_TOTAL_HTML', total - 1)
+        elif cap_kind == 'v1-generated':
+            # The persisted index fits, but actual v1 generation exceeds cap.
+            old_index, _ = portal._render(pub)
+            put(run / cat.HTML, b'ordinary-short-index')
+            m.setattr(portal, '_MAX_HTML', len(old_index) - 1)
+        elif cap_kind == 'v2-generated':
+            marker = (run / 'run_manifest.json').read_bytes()
+            old_index, css = portal._render(pub)
+            index, pages, _ = portal._render_v2(pub, marker, css)
+            total = len(index) + sum(map(len, pages.values()))
+            # Actual admitted bytes fit, but deterministic v2 output does not.
+            put(gen / 'hosts.html', b'short')
+            m.setattr(portal, '_MAX_TOTAL_HTML', total - 1)
+        else:
+            size = (gen / portal._RECEIPT).stat().st_size
+            put(gen / portal._RECEIPT, b'{}')
+            m.setattr(portal, '_MAX_RECEIPT', size - 1)
+        with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'):
+            cat.build_catalog(root)
+    assert catalog_state(root) == old
+    assert cat.check_catalog(root) == data(root)['generation']
+
+
+def test_mixed_valid_and_ordinary_invalid_publishes(root, monkeypatch):
+    cat.build_catalog(root)
+    initial = data(root)['generation']
+    old_gen = tree_bytes(root / cat.GENERATIONS / initial)
+    valid = publish(root, monkeypatch, 'valid')
+    portal.render_run(root, 'valid')
+    valid_tree = tree_bytes(root / 'valid')
+    faults = ('size-mismatch', 'hash', 'malformed', 'wrong-type', 'bool-size', 'zero', 'negative',
+              'foreign-path', 'duplicate-slot', 'foreign-host', 'wrong-identity',
+              'unrelated-integer', 'unsafe-large', 'missing-core', 'portal-missing', 'portal-extra')
+    for fault in faults:
+        pub = publish(root, monkeypatch, fault)
+        run = root / fault
+        marker = run / 'run_manifest.json'
+        value = json.loads(marker.read_bytes())
+        entry = next(x for x in value['artifacts'] if x['kind'] == 'evidence')
+        core = run / entry['path']
+        if fault == 'size-mismatch':
+            sparse(core, entry['size'] + 1)
+        elif fault == 'hash':
+            original = core.read_bytes()
+            put(core, b'X' + original[1:])
+        elif fault == 'malformed':
+            put(marker, b'{}')
+        elif fault == 'unsafe-large':
+            sparse(core, rs.FILES['evidence'][1] + 1)
+            core.chmod(0o644)
+        elif fault == 'missing-core':
+            core.unlink()
+        elif fault.startswith('portal-'):
+            portal.render_run(root, fault)
+            gen = run / portal._GENERATION
+            if fault == 'portal-missing':
+                (gen / 'hosts.html').unlink()
+            else:
+                put(gen / 'foreign.html', b'foreign')
+        else:
+            if fault == 'wrong-type':
+                entry['size'] = str(rs.FILES['evidence'][1] + 1)
+            elif fault == 'bool-size':
+                entry['size'] = True
+            elif fault == 'zero':
+                entry['size'] = 0
+            elif fault == 'negative':
+                entry['size'] = -1
+            elif fault == 'unrelated-integer':
+                value['limits']['forks'] = 3
+            else:
+                entry['size'] = rs.FILES['evidence'][1] + 1
+                if fault == 'foreign-path':
+                    entry['path'] = '../foreign.json'
+                elif fault == 'duplicate-slot':
+                    value['artifacts'].append(dict(entry))
+                elif fault == 'foreign-host':
+                    host = 'h-' + 'f' * 64
+                    value['artifacts'].append({**entry, 'kind': 'detail', 'host_id': host,
+                        'slot': 'platform', 'path': f'details/{host}/platform.json'})
+                elif fault == 'wrong-identity':
+                    value['run_id'] = 'foreign'
+            put(marker, rs._json_bytes(value))
+    result = cli(root)
+    assert (result.returncode, result.stdout, result.stderr) == (0, b'CATALOG_PUBLISHED\n', b'')
+    c = assert_html_snapshot(root)
+    assert c == data(root) and c['generation'] != initial
+    rows = {r['run_id']: r for r in c['rows']}
+    assert set(rows) == set(faults) | {'valid'}
+    assert rows['valid']['publication_status'] == 'PUBLISHED'
+    assert rows['valid']['portal_generation'] == 'portal-v2'
+    assert rows['valid']['href'] == 'valid/index.html'
+    for fault in faults:
+        row = rows[fault]
+        assert row['href'] is None
+        if fault.startswith('portal-'):
+            assert row['publication_status'] == 'PUBLISHED' and row['portal_status'] == 'INVALID'
+            assert row['run_state'] == 'COMPLETE'
+        else:
+            assert row['publication_status'] == 'INVALID' and row['reason_code'] == 'RUN_UNVERIFIED'
+            assert row['run_state'] is None and row['portal_status'] == 'NOT_VERIFIED'
+    assert tree_bytes(root / 'valid') == valid_tree
+    assert tree_bytes(root / cat.GENERATIONS / initial) == old_gen
+    assert cat.check_catalog(root) == c['generation']
+    with rs.RunStore(root) as store:
+        assert store.open('valid') == valid
+
+
+def test_capacity_recover_preserves_proven_mixed_pair(root, monkeypatch):
+    cat.build_catalog(root)
+    initial = data(root)['generation']
+    pub = publish(root, monkeypatch, 'new')
+    v1(root, 'new', pub)
+    actual = cat._replace_slot
+    def interrupt(fd, device, name, old, content):
+        if name == cat.HTML:
+            raise rs.StoreError('INJECTED_FAILURE')
+        return actual(fd, device, name, old, content)
+    with monkeypatch.context() as m:
+        m.setattr(cat, '_replace_slot', interrupt)
+        with pytest.raises(rs.StoreError, match='INJECTED_FAILURE'):
+            cat.build_catalog(root)
+    assert data(root)['generation'] != initial
+    assert assert_html_snapshot(root)['generation'] == initial
+    mixed = catalog_state(root)
+    pub = publish(root, monkeypatch, 'oversized')
+    v1(root, 'oversized', pub)
+    sparse(root / 'oversized' / cat.HTML, portal._MAX_HTML + 1)
+    result = cli(root, '--recover')
+    assert (result.returncode, result.stdout, result.stderr) == (1, b'', b'CATALOG_CAPACITY\n')
+    assert catalog_state(root) == mixed and assert_html_snapshot(root)['generation'] == initial
+    result = cli(root, '--check')
+    assert (result.returncode, result.stdout, result.stderr) == (1, b'', b'CATALOG_RECOVERY_REQUIRED\n')
+
+
+def test_legacy_projection_invalid_declaration_not_capacity(root, monkeypatch):
+    cat.build_catalog(root)
+    initial = data(root)['generation']
+    legacy(root, 'bad-legacy')
+    marker = root / 'bad-legacy' / 'run_manifest.json'
+    value = json.loads(marker.read_bytes())
+    entry = next(x for x in value['artifacts'] if x['kind'] == 'cff')
+    from tools import cff
+    # This fits the generic Store slot cap but is not a valid typed indexed
+    # declaration, so the stricter projection cap alone is not proof.
+    entry['size'] = cff.MAX_BYTES + 1
+    entry['format_version'] = None
+    put(marker, rs._json_bytes(value))
+    pub = publish(root, monkeypatch, 'valid')
+    v1(root, 'valid', pub)
+    result = cli(root)
+    assert result.returncode == 0 and result.stdout == b'CATALOG_PUBLISHED\n'
+    rows = {r['run_id']: r for r in assert_html_snapshot(root)['rows']}
+    assert data(root)['generation'] != initial
+    assert rows['bad-legacy']['publication_status'] == 'INVALID' and rows['bad-legacy']['href'] is None
+    assert rows['valid']['href'] == 'valid/index.html'
