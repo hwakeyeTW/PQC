@@ -1215,6 +1215,11 @@ _SSH_SECONDS = 15
 _COMMAND_SECONDS = 30
 _WORKER_GRACE = 2
 _QUEUE_BYTES = 3500
+_PLATFORM_WORKER = contextvars.ContextVar('_pqc_platform_worker', default=None)
+
+
+def _platform_budget():
+    return 3 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
 _COLLECTORS = tuple(sorted(_scope.FLAGS))
 _PASSIVE = frozenset(_COLLECTORS) - {'pqc_collect_tls_services'}
 _VALID = frozenset(('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL'))
@@ -1531,6 +1536,200 @@ def _deadline(seconds, defer=None):
         signal.signal(signal.SIGALRM, previous)
 
 
+class _PlatformLease:
+    """Bounded private shared memory, one per staged native worker wave.
+
+    Each active worker's deadline only decreases. Removing a confirmed worker
+    from the minimum cannot extend a phase already begun. An unavailable
+    lock/lease fails closed, including a worker killed in its tiny critical
+    section. No external service, serialized plan or filesystem grant.
+    """
+    def __init__(self, targets, deadline):
+        from multiprocessing import get_context
+        self.slots = {n: 2 + 2*i for i, n in enumerate(targets)}
+        self.data = get_context('fork').Array('d', [0.0, deadline] + [0.0] * (2*len(targets)))
+
+    @contextlib.contextmanager
+    def locked(self):
+        lock = self.data.get_lock()
+        if not lock.acquire(timeout=.05):
+            raise Denied(3, 'PLATFORM_LEASE_UNAVAILABLE')
+        try:
+            yield self.data.get_obj()
+        finally:
+            lock.release()
+
+    def reserve(self, name, end):
+        with self.locked() as data:
+            require(not data[0] and data[self.slots[name]] == 0, 3, 'INVALID_NATIVE_RESULT')
+            data[self.slots[name]] = min(end, data[1])
+
+    def sync(self, wave):
+        with self.locked() as data:
+            if wave.ledger.stop is not None:
+                data[0] = 1
+            for name, end in wave.ends.items():
+                slot = self.slots[name]
+                if name in wave.confirmed:
+                    data[slot] = 0
+                else:
+                    require(data[slot] > 0, 3, 'INVALID_NATIVE_RESULT')
+                    data[slot] = min(data[slot], end, wave.grace.get(name, end))
+
+    def stop(self):
+        with self.locked() as data:
+            data[0] = 1
+
+    def _limit(self, data, name):
+        if data[0]:
+            raise _Cancelled()
+        require(data[self.slots[name]] > 0, 3, 'PLATFORM_LEASE_UNAVAILABLE')
+        return min([data[1]] + [data[i] for i in self.slots.values() if data[i] > 0])
+
+    def limit(self, name):
+        with self.locked() as data:
+            return self._limit(data, name)
+
+    def begin(self, name, horizon):
+        with self.locked() as data:
+            now = time.monotonic()
+            end = min(horizon, self._limit(data, name))
+            if end - now < _COMMAND_SECONDS + 1:
+                raise _Deadline()
+            slot = self.slots[name] + 1
+            require(data[slot] == 0, 3, 'INVALID_NATIVE_RESULT')
+            data[slot] = 1
+            return now + _COMMAND_SECONDS + 1
+
+    def clean(self, name):
+        with self.locked() as data:
+            data[self.slots[name] + 1] = 0
+
+    def pending(self, name):
+        try:
+            with self.locked() as data:
+                return data[self.slots[name] + 1] != 0
+        except Denied:
+            return True
+
+
+class _PlatformWorker:
+    """Only constructed inside the actual native fixed raw witness."""
+    def __init__(self, name, task_uuid, host_end, lease, verify):
+        self.name, self.task_uuid = name, task_uuid
+        self.host_end, self.lease, self.verify = host_end, lease, verify
+        self.producer_end = None
+        self.validation_left = _GUARD_SECONDS
+        self.ordinal = 0
+        self.run_id = None
+
+    def limit(self, end):
+        end = min(end, self.host_end, self.lease.limit(self.name))
+        if end <= time.monotonic():
+            raise _Deadline()
+        return end
+
+    def start(self, run_id):
+        require(self.producer_end is None, 3, 'INVALID_NATIVE_RESULT')
+        self.run_id = run_id
+        self.producer_end = min(self.host_end, time.monotonic() + _platform_budget())
+
+    def validate(self, fn, *args, **kwargs):
+        # Cumulative platform-only 30s validation, not 30s for each stage.
+        start = time.monotonic()
+        end = self.limit(min(self.producer_end, start + self.validation_left))
+        try:
+            with _deadline(end - time.monotonic()):
+                result = fn(*args, **kwargs)
+            self.limit(end)
+            return result
+        finally:
+            self.validation_left -= time.monotonic() - start
+
+    def invoke(self, prepare, binding):
+        from tools import scan_collectors as b
+        require(type(binding) is b._StageBinding and binding.run_id == self.run_id
+                and binding.target_id == self.name and binding.task_uuid == self.task_uuid
+                and binding.ordinal == self.ordinal and self.ordinal < len(b._PLATFORM_STAGES)
+                and binding.stage == b._PLATFORM_STAGES[self.ordinal], 3, 'INVALID_NATIVE_RESULT')
+        self.ordinal += 1
+        used = False
+        trusted_clean = False
+        command_end = None
+        try:
+            start = time.monotonic()
+            stage_end = self.limit(min(self.producer_end,
+                                      start + _GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1))
+            # Packaging and both guard checks share one G budget. No launch
+            # inside prepare. Recheck the actual consumed binding immediately
+            # after the separate synthetic connection witness.
+            with _deadline(self.limit(min(stage_end, start + _GUARD_SECONDS)) - time.monotonic()):
+                self.verify()
+                launch = prepare(binding)
+                require(callable(launch), 3, 'INVALID_NATIVE_RESULT')
+            guard_left = _GUARD_SECONDS - (time.monotonic() - start)
+            with _deadline(self.limit(min(stage_end, time.monotonic() + _SSH_SECONDS)) - time.monotonic()):
+                if _restricted_connection(self.name) != 'CONNECTED':
+                    raise b._StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
+            with _deadline(self.limit(min(stage_end, time.monotonic() + guard_left)) - time.monotonic()):
+                self.verify()
+            end = self.limit(stage_end)
+            if end - time.monotonic() < _COMMAND_SECONDS + 1:
+                raise _Deadline()
+
+            def begin():
+                # Called exactly once by the trusted launcher immediately
+                # before P1 dispatch. No path/argv or deadline input.
+                nonlocal used, command_end
+                require(not used, 3, 'INVALID_NATIVE_RESULT')
+                command_end = self.lease.begin(self.name, end)
+                used = True
+                timer = signal.getitimer(signal.ITIMER_REAL)[0]
+                left = command_end - time.monotonic()
+                if timer <= 0 or left <= 0:
+                    raise _Deadline()
+                if left < timer:
+                    signal.setitimer(signal.ITIMER_REAL, left)
+                return command_end
+
+            with _deadline(end - time.monotonic()):
+                completion = launch(begin)
+                # No arbitrary launch path and no second consumption. A
+                # missing or replayed completion cannot clear the active slot.
+                if not used:
+                    raise b._StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
+                try:
+                    receipt = b._stage_receipt(completion, binding)
+                    trusted_clean = True
+                except b._StageFailure as exc:
+                    trusted_clean = exc.clean
+                    raise
+                finally:
+                    if trusted_clean:
+                        self.lease.clean(self.name)
+                self.limit(command_end)
+            self.limit(command_end)
+            return receipt
+        except b._StageFailure:
+            raise
+        except _Cancelled:
+            # The controller has already observed a stop; do not produce a
+            # later successful envelope or dispatch another stage.
+            raise
+        except _Deadline:
+            clean = not used or trusted_clean
+            raise b._StageFailure('CONTROLLER_TIMEOUT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED',
+                                  clean=clean) from None
+        except Denied as exc:
+            clean = not used or trusted_clean
+            reason = 'GUARD_REJECTED' if exc.code == 4 else 'INVALID_ADAPTER_RESULT'
+            raise b._StageFailure(reason if clean else 'REMOTE_CLEANUP_UNCONFIRMED', clean=clean) from None
+        except Exception:
+            clean = not used or trusted_clean
+            raise b._StageFailure('INVALID_ADAPTER_RESULT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED',
+                                  clean=clean) from None
+
+
 def _collect(name, flags, registry):
     """Trusted adapter bridge, one connection and at most one call per slot."""
     try:
@@ -1589,7 +1788,7 @@ def _task(ctx, names):
 
 
 @contextlib.contextmanager
-def _worker_boundary(ctx, name, registry, collect=None):
+def _worker_boundary(ctx, name, registry, collect=None, staged=None):
     """Inherited only by the next native fork; never invoke original SSH _run."""
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.connection import ssh
@@ -1601,8 +1800,11 @@ def _worker_boundary(ctx, name, registry, collect=None):
     used = False
     guard_end = None
     raw_proof = None
+    native_builder = None
+    actual_executor = None
 
     def get_connection(executor, cvars, templar, current_connection):
+        nonlocal native_builder, actual_executor
         require(current_connection in ('ssh', 'ansible.builtin.ssh') and executor._host.name == name
                 and executor._task.action == 'ansible.builtin.raw' and not executor._task.delegate_to
                 and not executor._task.loop and not executor._task.run_once
@@ -1615,6 +1817,10 @@ def _worker_boundary(ctx, name, registry, collect=None):
         import inspect
         require(Path(inspect.getfile(type(connection))).resolve() == Path(ssh.__file__).resolve()
                 and connection.become is None, 4, 'BATCH_GUARD_DENIED')
+        if staged is not None:
+            require(executor._task._uuid == staged[0] and executor._task.no_log is True,
+                    4, 'BATCH_GUARD_DENIED')
+        actual_executor, native_builder = executor, connection._build_command
         native_exec = connection.exec_command
         def exec_witness(cmd, in_data=None, sudoable=True):
             nonlocal guard_end, raw_proof
@@ -1648,7 +1854,43 @@ def _worker_boundary(ctx, name, registry, collect=None):
             require(_native_raw(conn)[0] == expected[3]
                     and _effective_ssh(tuple(argv), expected[1]) == expected[2],
                     4, 'BATCH_GUARD_DENIED')
-        result = _collect(name, flags, registry) if collect is None else collect(name, flags, registry)
+        if staged is None:
+            result = _collect(name, flags, registry) if collect is None else collect(name, flags, registry)
+        else:
+            task_uuid, host_end, lease = staged
+
+            def verify():
+                require(actual_executor._host.name == name and actual_executor._task._uuid == task_uuid
+                        and actual_executor._task.no_log is True and conn.become is None
+                        and _source_identity(ctx._source) == ctx._source_id
+                        and _project(ctx._inventory, ctx._variables, ctx._request)
+                        == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
+                # Recheck the whole existing preflight closure, including
+                # effective proof and the actual native connection consumer.
+                # Do not execute a second raw witness or original SSH _run.
+                for target in ctx._targets:
+                    current = _native_binding(ctx, target)
+                    proof = ctx._proofs[target]
+                    av, fingerprint = _native_argv(current)
+                    require((av, fingerprint) == proof[:2] and _native_raw(current)[0] == proof[3]
+                            and _effective_ssh(av, fingerprint) == proof[2], 4, 'CONNECTION_CONTEXT_DRIFT')
+                # _consume_builder is still on the original witness stack;
+                # use its original native builder for this guarded rebuild,
+                # not the expired initial guard timer. Never call _run.
+                builder = conn._build_command
+                try:
+                    conn._build_command = native_builder
+                    require(_native_raw(conn)[0] == expected[3] and _native_argv(conn) == expected[:2]
+                            and _effective_ssh(tuple(argv), expected[1]) == expected[2],
+                            4, 'CONNECTION_CONTEXT_DRIFT')
+                finally:
+                    conn._build_command = builder
+
+            token = _PLATFORM_WORKER.set(_PlatformWorker(name, task_uuid, host_end, lease, verify))
+            try:
+                result = collect(name, flags, registry)
+            finally:
+                _PLATFORM_WORKER.reset(token)
         raw = json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')
         require(len(raw) <= _QUEUE_BYTES - 350, 3, 'INVALID_NATIVE_RESULT')
         return 0, raw, b''
@@ -1747,8 +1989,8 @@ def _drain(queue, ledger, after_accept=None):
         raw = queue.get()
         require(type(raw) is bytes and len(raw) <= _QUEUE_BYTES, 3, 'INVALID_NATIVE_RESULT')
         ledger.accept(_scope.strict_json(raw))
-        if after_accept is not None:
-            after_accept()
+        if after_accept is not None and after_accept() is False:
+            break
 
 
 def _stop_workers(workers):
@@ -1885,13 +2127,21 @@ class _WorkerWave:
 
 class _ProducerWorkerWave(_WorkerWave):
     """V2 receipt work shares the scheduler's existing deadline."""
-    def __init__(self, ledger, queue, phase):
+    def __init__(self, ledger, queue, phase, lease=None):
         super().__init__(ledger, queue)
         self.phase = phase
+        self.lease = lease
+
+    def track(self, name, worker, task_uuid, end):
+        super().track(name, worker, task_uuid, end)
+        if self.lease is not None:
+            self.lease.sync(self)
 
     def _drain_receipts(self):
         # Includes queue read, receipt validation and actual normalization.
         # An exit drain may follow a newly established shorter grace.
+        if self.lease is not None and self.ledger.stop is not None:
+            return
         with self.phase():
             _drain(self.queue, self.ledger, self._receipt_accepted)
 
@@ -1903,14 +2153,19 @@ class _ProducerWorkerWave(_WorkerWave):
             if n not in self.confirmed and n not in self.faults and n in self.ledger.rows and worker.is_alive():
                 self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
         self._grace_changed()
+        return None if self.lease is None else self.ledger.stop is None
 
     def _grace_changed(self):
+        if self.lease is not None:
+            self.lease.sync(self)
         with self.phase():
             pass
 
     def poll(self):
         with self.phase():
             super().poll()
+            if self.lease is not None:
+                self.lease.sync(self)
 
     def finish(self, workers):
         # A timeout/cancellation/fatal stop is not permission for another
@@ -1925,6 +2180,11 @@ class _ProducerWorkerWave(_WorkerWave):
         except (Exception, SystemExit):
             self.ledger.fail('INVALID_NATIVE_RESULT')
         finally:
+            if self.lease is not None:
+                try:
+                    self.lease.stop()
+                except Denied:
+                    self.ledger.fail('REMOTE_CLEANUP_UNCONFIRMED')
             # The phase has unwound. This is the separate bounded termination
             # budget, not a new worker/receipt deadline. Do not consume late
             # receipts after forced termination; retain already validated rows.
@@ -1940,6 +2200,10 @@ class _ProducerWorkerWave(_WorkerWave):
                 reason = ('CONTROLLER_CLEANUP_UNCONFIRMED' if not quiet else
                           self.faults.get(n, stopped if stopped in ('CONTROLLER_TIMEOUT', 'INTERRUPTED')
                                           else 'CONTROLLER_WORKER_FAILED'))
+                if self.lease is not None and self.lease.pending(n):
+                    # Controller-group exit is not independent P1 target
+                    # cleanup. A missing trusted completion remains fatal.
+                    reason = 'REMOTE_CLEANUP_UNCONFIRMED'
                 self.ledger.worker_failed(n, reason)
         return quiet
 
@@ -2082,6 +2346,8 @@ def _execute_batch(ctx, producer_session=None):
                         raise _Deadline()
                     if remaining < timer:
                         signal.setitimer(signal.ITIMER_REAL, remaining)
+                    if producer_session is not None and producer_session.staged:
+                        wave.lease.reserve(name, end)
                     fork_critical = True
                     try:
                         original_start(worker)
@@ -2093,7 +2359,8 @@ def _execute_batch(ctx, producer_session=None):
                         raise _Deadline()
                 BaseProcess.start = start_worker
                 boundary = (_worker_boundary(ctx, name, registry) if producer_session is None else
-                            _worker_boundary(ctx, name, registry, producer_session.collect))
+                            _worker_boundary(ctx, name, registry, producer_session.collect,
+                                             (task._uuid, end, wave.lease) if producer_session.staged else None))
                 with boundary:
                     strategy._queue_task(host, task, vals, pc)
         finally:
@@ -2130,8 +2397,10 @@ def _execute_batch(ctx, producer_session=None):
         names = [n for n in ledger.targets if ledger.eligible[n]]
         if names:
             width = min(ctx._request['forks'], 2)
-            budgets = {n: _GUARD_SECONDS + _SSH_SECONDS + (_COMMAND_SECONDS + 1) * len(ledger.eligible[n])
-                       + _WORKER_GRACE + 5 for n in names}
+            budgets = {n: _GUARD_SECONDS + _SSH_SECONDS + (
+                producer_session.budget(ledger.eligible[n]) if producer_session is not None else
+                (_COMMAND_SECONDS + 1) * len(ledger.eligible[n]))
+                + _WORKER_GRACE + 5 for n in names}
             # Initial projection and preflight each have the existing guard
             # cap; account for both in the single absolute invocation budget.
             deadline = started + 2 * _GUARD_SECONDS + sum(2 * _GUARD_SECONDS + budgets[n] for n in names) + 5
@@ -2171,7 +2440,8 @@ def _execute_batch(ctx, producer_session=None):
                         tqm._initialize_processes(len(selected))
                         strategy = _queue_strategy(tqm)
                     wave = (_WorkerWave(ledger, queue) if producer_session is None else
-                            _ProducerWorkerWave(ledger, queue, phase))
+                            _ProducerWorkerWave(ledger, queue, phase,
+                                _PlatformLease(selected, deadline) if producer_session.staged else None))
                     try:
                         for n in selected:
                             if not poll():
@@ -2289,6 +2559,11 @@ def _valid_v2_outcome(row, flag, requested, cap):
         if reduced.get('state') != 'ERROR' or reduced.get('rc') is not None:
             return False
         reduced['reason_code'] = 'COMMAND_IO_FAILED'
+    if (reduced.get('state') == 'ERROR'
+            and reduced.get('reason_code') in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')):
+        if flag != 'pqc-platform' or reduced.get('state') != 'ERROR' or reduced.get('rc') is not None or ids:
+            return False
+        reduced['reason_code'] = 'INVALID_ADAPTER_RESULT'
     return _valid_outcome(reduced, flag, requested) and (row['state'] != 'UNREACHABLE' or not ids)
 
 
@@ -2415,6 +2690,7 @@ class _ProducerSession:
         self.run_id = None
         self.started_at = None
         self.handlers = {}
+        self.staged = False
 
     def _identity(self, ctx):
         import uuid
@@ -2425,7 +2701,10 @@ class _ProducerSession:
         self._identity(ctx)
         registry = self.bridge._producer_adapters()
         require(type(registry) is dict and registry.keys() <= set(self.bridge.PRODUCERS)
-                and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+                and all(callable(v) if type(v) is not self.bridge._PlatformStageAdapter else
+                        k == self.bridge.PLATFORM and callable(v.prepare) for k, v in registry.items()),
+                3, 'INVALID_ADAPTER_REGISTRY')
+        self.staged = type(registry.get(self.bridge.PLATFORM)) is self.bridge._PlatformStageAdapter
         try:
             eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
         except self.bridge.BridgeError:
@@ -2442,12 +2721,20 @@ class _ProducerSession:
             self._identity(ctx)
         return _ProducerLedger(ctx, self, {n: () for n in ctx._targets})
 
+    def budget(self, producers):
+        return sum(_platform_budget() if self.staged and p == self.bridge.PLATFORM else
+                   _COMMAND_SECONDS + 1 for p in producers)
+
     def collect(self, name, flags, registry):
         """Called only after the unchanged native per-dispatch/argv guard."""
         b = self.bridge
         records = []
+        worker = _PLATFORM_WORKER.get()
+        if self.staged:
+            require(type(worker) is _PlatformWorker and worker.name == name, 3, 'INVALID_NATIVE_RESULT')
         try:
-            with _deadline(_SSH_SECONDS):
+            seconds = _SSH_SECONDS if worker is None else worker.limit(time.monotonic() + _SSH_SECONDS) - time.monotonic()
+            with _deadline(seconds):
                 connected = _restricted_connection(name)
         except (_Deadline, Exception):
             connected = 'REMOTE_CLEANUP_UNCONFIRMED'
@@ -2458,23 +2745,36 @@ class _ProducerSession:
             for producer in b.requested(flags):
                 value = None
                 try:
-                    # One bounded synthetic surrogate per producer. I1b must
-                    # separately prove each actual remote command and cleanup.
-                    with _deadline(_COMMAND_SECONDS + 1):
-                        gap = producer != b.PLATFORM and b._platform_status(platform_snapshot) != 'UNVERIFIED'
-                        if gap:
-                            value = dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
-                                         snapshot=b._gap_snapshot(producer, flags, b._platform_status(platform_snapshot)))
-                        else:
-                            value = registry[producer](name, copy.deepcopy(flags), copy.deepcopy(platform_snapshot))
-                        row = b.record(producer, value, flags, platform_snapshot, self.run_id, name, gap=gap)
+                    if self.staged and producer == b.PLATFORM:
+                        worker.start(self.run_id)
+                        value = registry[producer].collect(self.run_id, name, worker.task_uuid,
+                                                           worker.invoke, worker.validate)
+                        row = worker.validate(b.record, producer, value, flags, platform_snapshot, self.run_id, name)
+                    else:
+                        # Legacy single-call surrogate budget unchanged. A
+                        # staged host's later producers also observe the lease.
+                        seconds = _COMMAND_SECONDS + 1
+                        if worker is not None:
+                            seconds = worker.limit(time.monotonic() + seconds) - time.monotonic()
+                        with _deadline(seconds):
+                            gap = producer != b.PLATFORM and b._platform_status(platform_snapshot) != 'UNVERIFIED'
+                            if gap:
+                                value = dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                                             snapshot=b._gap_snapshot(producer, flags, b._platform_status(platform_snapshot)))
+                            else:
+                                value = registry[producer](name, copy.deepcopy(flags), copy.deepcopy(platform_snapshot))
+                            row = b.record(producer, value, flags, platform_snapshot, self.run_id, name, gap=gap)
+                        if worker is not None:
+                            worker.limit(worker.host_end)
                 except _Deadline:
-                    row = b.failed_record(producer, 'REMOTE_CLEANUP_UNCONFIRMED')
+                    clean = (self.staged and producer == b.PLATFORM and not worker.lease.pending(name))
+                    row = b.failed_record(producer, 'CONTROLLER_TIMEOUT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
                 except Exception:
                     # A malformed projection is not a successful acquisition.
                     # Only a genuine adapter cleanup receipt permits the less
                     # severe invalid-result classification.
-                    clean = type(value) is dict and value.get('cleanup_confirmed') is True
+                    clean = (not worker.lease.pending(name) if self.staged and producer == b.PLATFORM else
+                             type(value) is dict and value.get('cleanup_confirmed') is True)
                     row = b.failed_record(producer, 'INVALID_ADAPTER_RESULT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
                 records.append(row)
                 if producer == b.PLATFORM:
@@ -2483,6 +2783,8 @@ class _ProducerSession:
                         break
                 if b.record_stop(row):
                     break
+        if worker is not None:
+            worker.limit(worker.host_end)
         envelope = dict(handoff_version=b.WIRE_VERSION, run_id=self.run_id, target_id=name,
                         connection=connected, records=records)
         return self.handoff.write(name, envelope)

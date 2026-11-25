@@ -512,6 +512,78 @@ validated observations, and stop subsequent dispatch; a malformed receipt
 never becomes Evidence. The V2 close/final normalization phases remain
 bounded, including caught interrupt handling. Platform prerequisite is
 separate from the eight flags and is not counted as requested-scan success.
-V2 is not a public CLI, a V1 fallback, a persistent store interface or an
-actual acquisition adapter. I1b/I2 and formal compatibility/security/release
-qualification remain separate, with no live opening.
+V2 is not a public CLI, a V1 fallback or a persistent store interface.
+The restricted Platform P2 extension is below; other I1b/I2 work and
+formal compatibility/security/release qualification remain separate,
+with no live opening.
+
+
+### I1b Platform P2: bounded stage execution
+
+The fixed private Platform stage type extends only the restricted V2
+native worker path (#7169477310, #7169696850). The original native raw
+COMMAND witness still intercepts `_run` exactly once and never invokes
+original SSH. No public driver, path, host, argv, command, timeout or
+transport selector; no new requested flag. V1, its manifest validator and
+old single-call synthetic producers keep their original budgets and
+reference limits. Both real registries are empty and
+`_restricted_connection` remains a hard deny. See [collector integration](collector-integration.md) for exact order, gating and bound receipt shape.
+
+Before every fixed stage, use the same actual native host/task UUID,
+no-log/no-become context, frozen Inventory projection/source identity,
+preflight native bindings and effective SSH proof, and recheck the actual
+consumed connection/raw argv. Packaging and these checks share one guard
+budget; after the bounded synthetic connection witness, recheck immediately
+before the one-use launch gate. Do not call a second raw witness, reload
+Inventory, change SSH settings, enable mux, or run original SSH `_run`.
+Any observed identity/guard drift denies subsequent launch.
+
+Fixed seconds: G=30 guard (including packaging), S=15 connection,
+C=30 independent target command (including cleanup), return=1,
+worker exit grace=2. Each stage has at most G+S+C+1=76 seconds. Three
+stages plus one cumulative 30-second Platform validation allowance give
+258 seconds for the explicit staged Platform producer, not for an
+individual command. Metadata operations share one P1 stage deadline;
+inner RPM27s and independent outer30s stay unchanged. All other producer
+budgets, including the legacy single-call Platform, remain 31 seconds.
+The host budget remains G+S+sum(producer budgets)+grace+5; at all five
+producers the staged maximum is 434 seconds. The absolute invocation
+budget remains 2G+sum(2G+host budget)+5 (5005 seconds for ten such hosts).
+These are conservative scheduling bounds, not elapsed-time guarantees;
+the existing bounded teardown/final validation is separate.
+
+Per-stage and cumulative validation deadlines take the minimum of their
+own fixed end, host and producer end, invocation end and current wave
+limit. A launch must have room for the complete independent 30s plus 1s
+return. The private shared-memory wave lease has bounded lock acquisition,
+controller-owned stop and per-active-worker deadline slots and a pending
+stage marker. It is not external configuration or a new persistent wire.
+Controller synchronizes the earliest outstanding worker and exit grace,
+including immediately after a validated receipt, before further receipt
+normalization. Active worker slots only decrease until confirmed normal
+exit; removing a confirmed peer never extends an already started phase
+or command deadline. A worker checks the current lease before every
+stage and at its one-use launch gate, then checks completion before the
+original command end. The controller enforces the earliest outstanding
+limit even while a peer is blocked in a stage. Insufficient time denies
+launch rather than granting a new interval. The existing fork barrier,
+active phase shortening, external/nested timer rejection, SIGINT/SIGTERM
+priority, RC5/6/7 and signal restoration remain. A stop does not authorize
+late normalization or a subsequent successful terminal.
+
+P1 `start_new_session` creates a separate target command group; a normal
+Controller WorkerProcess exit or `_stop_workers` cannot certify its cleanup.
+The trusted local engineering launcher uses actual native AnsiballZ
+packaging and an independent supervisor in a separate session with P1's
+unchanged bounded helper. On consumer loss, controller cancellation or
+peer stop, do not kill the only target cleanup supervisor. The pending
+marker is cleared only on independently verified matching completion and
+cleanup; a missing, foreign or uncertain completion remains fatal, even
+when the Controller group has exited. The controller does not wait for a
+late receipt to turn that host into success. Tests independently reap all
+owned local supervisors and verify descendant group disappearance, including
+shortened test-only timeout, actual WorkerProcess loss, caught interrupt
+and peer fatal stop. Local surrogate cleanup is not proof of real remote
+SSH transport or crash/power-loss cleanup. Real transport and formal
+Controller/OL9.x safety, performance and offline qualification remain
+closed/NOT_TESTED (#8/#17/#28).

@@ -12,6 +12,8 @@ import re
 import stat
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import NamedTuple
 from types import MappingProxyType
 
 from tools import assessment, cert_assets, crypto_policy, evidence, openssl_runtime, platform, ssh_posture
@@ -46,9 +48,11 @@ CONNECTIONS = frozenset(('CONNECTED', 'CONNECTION_FAILED', 'CONNECTION_TIMEOUT',
 FAILURES = frozenset(('COMMAND_FAILED', 'COMMAND_TIMEOUT', 'COMMAND_OUTPUT_LIMIT',
                       'COMMAND_START_FAILED', 'COMMAND_IO_FAILED', 'RESIDUAL_PROCESS',
                       'REMOTE_CLEANUP_UNCONFIRMED', 'INVALID_ADAPTER_RESULT',
-                      'PROCESS_CONTROL_UNAVAILABLE', 'INVALID_COMMAND_CONTRACT'))
+                      'PROCESS_CONTROL_UNAVAILABLE', 'INVALID_COMMAND_CONTRACT',
+                      'GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED'))
 FATAL = frozenset(('REMOTE_CLEANUP_UNCONFIRMED', 'INVALID_ADAPTER_RESULT',
-                   'PROCESS_CONTROL_UNAVAILABLE', 'INVALID_COMMAND_CONTRACT'))
+                   'PROCESS_CONTROL_UNAVAILABLE', 'INVALID_COMMAND_CONTRACT',
+                   'GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED'))
 UNCERTAIN = frozenset(('CLEANUP_FAILED', 'CLEANUP_UNCONFIRMED', 'OUTER_DEADLINE',
                        'HELPER_ERROR', 'EXECUTION_ERROR'))
 GOOD = frozenset(('COLLECTED', 'PARTIAL', 'NOT_APPLICABLE'))
@@ -82,6 +86,138 @@ def _producer_adapters():
     # Deliberately empty. Only trusted test code substitutes synthetic adapters.
     # No payload, CLI, hostvar or serialized plan can register an adapter.
     return {}
+
+
+# I1b P2: fixed private stage bridge. Not a live transport or a public driver
+# registry. A prepare callback may only package the bound fixed P1 stage;
+# the returned launcher must consume its one-use native launch gate before
+# dispatch. It owns independent stage completion and cleanup evidence.
+_PLATFORM_STAGES = ('metadata', *('release-rpm-' + name for name in platform.PACKAGES))
+_STAGE_FRAME_BYTES = 32 * 1024
+_STAGE_RECEIPT_BYTES = 16 * 1024
+_STAGE_RPM_FAILURES = MappingProxyType({
+    'COMMAND_TIMEOUT': 'TIMEOUT', 'COMMAND_OUTPUT_LIMIT': 'OUTPUT_LIMIT',
+    'COMMAND_START_FAILED': 'COMMAND_FAILED', 'COMMAND_FAILED': 'COMMAND_FAILED',
+    'COMMAND_IO_FAILED': 'COMMAND_FAILED', 'RESIDUAL_PROCESS': 'COMMAND_FAILED',
+})
+
+
+class _StageBinding(NamedTuple):
+    run_id: str
+    target_id: str
+    task_uuid: str
+    stage: str
+    ordinal: int
+
+
+class _StageCompletion(NamedTuple):
+    # The binding is the actual controller-issued object, not fields taken
+    # from remote output. clean is the trusted driver's independent lifecycle
+    # receipt, never copied from an unchecked frame. started=False requires
+    # proof that no stage process was launched.
+    binding: _StageBinding
+    stdout: bytes
+    stderr: bytes
+    wrapper_rc: int | None
+    started: bool
+    clean: bool
+
+
+class _StageFailure(BridgeError):
+    def __init__(self, reason, rc=None, clean=False):
+        super().__init__(reason)
+        self.reason, self.rc, self.clean = reason, rc, clean
+
+    def value(self):
+        return dict(reason_code=self.reason, rc=self.rc,
+                    cleanup_confirmed=self.clean, snapshot=None)
+
+
+def _bound_stage_validator():
+    # Lazy import: normal offline consumers do not need Ansible installed.
+    # Use only the canonical fixed product module, never an injected path or
+    # an alternative validator in a test-only packaged copy.
+    from ansible_collections.security.compliance_pqc_readiness.plugins.modules import pqc_platform_acquire
+    expected = (Path(__file__).resolve().parents[1] / 'ansible_collections/security/'
+                'compliance_pqc_readiness/plugins/modules/pqc_platform_acquire.py')
+    require(Path(pqc_platform_acquire.__file__).resolve() == expected
+            and pqc_platform_acquire.STAGES == _PLATFORM_STAGES
+            and pqc_platform_acquire.OUTPUT_BYTES == _STAGE_RECEIPT_BYTES,
+            'INVALID_STAGE_VALIDATOR')
+    return pqc_platform_acquire.validate_receipt
+
+
+def _stage_receipt(completion, binding):
+    # Do not accept a target-provided cleanup bit, a replay/foreign binding,
+    # or process exit alone as an independent completion/cleanup receipt.
+    if (type(completion) is not _StageCompletion or completion.binding is not binding
+            or completion.clean is not True or type(completion.started) is not bool):
+        raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
+    try:
+        out, err, rc = completion.stdout, completion.stderr, completion.wrapper_rc
+        require(type(out) is bytes and type(err) is bytes
+                and len(out) + len(err) <= _STAGE_FRAME_BYTES)
+        if not completion.started:
+            require(rc is None and not out and not err)
+            raise _StageFailure('COMMAND_START_FAILED', clean=True)
+        require(type(rc) is int and rc == 0 and not err and bool(out))
+        frame = json.loads(out.decode('ascii'), object_pairs_hook=_pairs,
+                           parse_constant=_bad_number, parse_float=_bad_number)
+        shape(frame, ('changed', 'invocation', 'receipt'))
+        require(frame['changed'] is False and frame['invocation'] == {
+            'module_args': {'stage': binding.stage}})
+        receipt = _bound_stage_validator()(frame['receipt'], binding.stage)
+        if not receipt['cleanup_confirmed']:
+            raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED', receipt['rc'])
+        return receipt
+    except _StageFailure:
+        raise
+    except Exception:
+        # The independently verified, *same binding* completion is clean,
+        # but invalid data cannot acquire evidence or authorize another stage.
+        raise _StageFailure('INVALID_ADAPTER_RESULT', clean=True) from None
+
+
+def _rpm_eligible(snapshot):
+    facts, _ = platform.normalize_platform(snapshot['facts'], source_kind='SYNTHETIC')
+    tools = platform.normalize_tools(snapshot['tools'])
+    return (snapshot['facts_state'] == 'OK' and facts['platform_status'] == 'UNVERIFIED'
+            and all(tools[k][2]['available'] is True for k in ('rpm', 'timeout')))
+
+
+class _PlatformStageAdapter:
+    """Explicit internal type; legacy synthetic callables retain their path."""
+    def __init__(self, prepare):
+        require(callable(prepare), 'INVALID_STAGE_DRIVER')
+        self.prepare = prepare
+
+    def collect(self, run_id, target, task_uuid, invoke, validate):
+        snapshot = None
+        for ordinal, stage in enumerate(_PLATFORM_STAGES):
+            binding = _StageBinding(run_id, target, task_uuid, stage, ordinal)
+            try:
+                receipt = invoke(self.prepare, binding)
+                reason, rc = receipt['reason_code'], receipt['rc']
+                if reason != 'COMMAND_OK':
+                    raise _StageFailure(reason, rc, receipt['cleanup_confirmed'])
+            except _StageFailure as exc:
+                if (ordinal == 0 or not exc.clean
+                        or exc.reason not in _STAGE_RPM_FAILURES):
+                    return exc.value()
+                # Only an ordinary confirmed failure of an eligible RPM stage
+                # may become a typed error gap and allow the next stage.
+                value = dict(state='ERROR', reason=_STAGE_RPM_FAILURES[exc.reason], rows=[])
+            else:
+                value = receipt['payload']
+            if ordinal == 0:
+                snapshot = {**copy.deepcopy(value), 'rpms': {}}
+                if not validate(_rpm_eligible, snapshot):
+                    break
+            else:
+                package = platform.PACKAGES[ordinal - 1]
+                validate(platform.normalize_rpm, package, value)
+                snapshot['rpms'][package] = copy.deepcopy(value)
+        return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
 
 
 def _json_guard(value):
@@ -404,6 +540,7 @@ def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=Fal
         precheck(producer, snapshot, flags, platform_snapshot, run_id, target, now)
     else:
         require(reason in FAILURES and snapshot is None and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0)
+                and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED') or producer == PLATFORM)
                 and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                 and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean))
     return dict(producer_id=producer, observed_at=now, **copy.deepcopy(value))
@@ -597,6 +734,7 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules):
                 outcomes[f] = _aggregate(f, f == PLATFORM or flags[f], by_flag[f], row)
         else:
             require(reason in FAILURES and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
+                    and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED') or producer == PLATFORM)
                     and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean)
                     and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0))
             for f in fset:

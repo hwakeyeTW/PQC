@@ -817,3 +817,506 @@ def test_v2_earliest_worker_deadline_interrupts_native_receipt_normalization(fix
             with pytest.raises(OSError):
                 os.fstat(fd)
     assert _signal_state()==signals
+
+
+# I1b P2: the product orchestrates, the trusted test driver only packages and
+# executes the single stage named by its actual native worker binding. No
+# prepared receipt replay, public transport, real RPM, or network access.
+class _P2Driver:
+    def __init__(self, tmp, ctx, *, ol=True, versions=None, modes=None, stage_seconds=30, fault=None):
+        self.tmp, self.ctx = tmp, ctx
+        self.ol, self.versions, self.modes = ol, versions or {}, modes or {}
+        self.stage_seconds, self.fault = stage_seconds, fault
+        self.p1 = ROOT / 'ansible_collections/security/compliance_pqc_readiness/plugins/modules/pqc_platform_acquire.py'
+        self.python = os.path.abspath(sys._base_executable)
+        self.original = self.p1.read_text()
+        self.validator = None
+
+    def markers(self, name, suffix='launch'):
+        return sorted(self.tmp.glob(f'{name}-*-{suffix}.json'))
+
+    def prepare(self, binding):
+        import subprocess
+        import selectors
+        from ansible import constants as C
+        from ansible.plugins.loader import module_loader, module_utils_loader
+        from ansible.executor.module_common import modify_module
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        name, stage, ordinal = binding.target_id, binding.stage, binding.ordinal
+        assert binding.run_id and name in self.ctx._targets and os.getpid() != self.parent_pid
+        assert binding.task_uuid and stage == bridge._PLATFORM_STAGES[ordinal]
+        stem = f'{name}-{ordinal}'
+        private = self.tmp / stem
+        private.mkdir(mode=0o700)
+        mode = self.modes.get((name, ordinal), 'ok')
+        source = self.p1
+        module_name = 'security.compliance_pqc_readiness.pqc_platform_acquire'
+        group = self.tmp / (stem + '-group.json')
+        if self.ol:
+            # Only private fact/stat input, fixed RPM literal and (when
+            # required) shortened test-only deadline are changed.
+            data = platform_snapshot()
+            data['facts'].update(self.versions.get(name, {}))
+            tools = data['tools']
+            if mode == 'missing-rpm':
+                tools['rpm'][0] = dict(state='OK', exists=False, isreg=None, islnk=None, executable=None)
+            rpm = private / 'rpm-fixture'
+            script = f'''#!{self.python} -I
+import json,os,sys,time,signal
+assert os.geteuid()=={os.geteuid()} and os.environ['LC_ALL']=='C'
+assert sys.argv[1:4]==['-q','--queryformat','%{{NAME}}\\t%{{VERSION}}\\t%{{RELEASE}}\\t%{{ARCH}}\\n']
+assert len(sys.argv)==5 and sys.argv[4] in {platform.PACKAGES!r}
+assert os.read(0,1)==b''
+mode={mode!r}
+pids=[os.getpid()]
+if mode in ('hang','consumer-loss'):
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    child=os.fork()
+    if child==0:
+        time.sleep(60);os._exit(0)
+    pids.append(child)
+with open({str(group)!r},'x') as f:json.dump(dict(pids=pids,pgid=os.getpgrp(),parent=os.getppid(),package=sys.argv[4]),f)
+if mode in ('hang','consumer-loss'): time.sleep(60)
+if mode=='overflow': os.write(1,b'x'*16385)
+if sys.argv[4].endswith('el9'):
+    print('package '+sys.argv[4]+' is not installed',file=sys.stderr);sys.exit(1)
+print(sys.argv[4]+'\\t9.10\\t0.1\\tx86_64')
+'''
+            rpm.write_text(script); rpm.chmod(0o700)
+            raw = self.original
+            fact_body = ("raise ValueError('FIXTURE_METADATA_FAILURE')" if mode == 'metadata-failure' else
+                         "return 'OK', " + repr(data['facts']))
+            # _stat uses the real fixed path map; return only typed fixture
+            # observations for those paths, never a target-selected path.
+            source_paths = {'/usr/bin/rpm': tools['rpm'][0], '/usr/bin/openssl': tools['openssl'][0],
+                '/usr/bin/ssh': tools['ssh'][0], '/usr/sbin/sshd': tools['sshd'][0],
+                '/usr/bin/ssh-keygen': tools['ssh-keygen'][0],
+                '/usr/bin/update-crypto-policies': tools['update-crypto-policies'][0],
+                '/usr/sbin/update-crypto-policies': tools['update-crypto-policies'][1],
+                '/usr/bin/timeout': tools['timeout'][0]}
+            changes = {"RPM_EXECUTABLE = '/usr/bin/rpm'": 'RPM_EXECUTABLE = ' + repr(str(rpm)),
+                       'STAGE_SECONDS = 30': 'STAGE_SECONDS = ' + str(self.stage_seconds),
+                       'def _facts(archive):': 'def _facts(archive):\n    ' + fact_body,
+                       'def _stat(path):': 'def _stat(path):\n    return ' + repr(source_paths) + '[path]'}
+            for old, new in changes.items():
+                assert raw.count(old) == 1
+                raw = raw.replace(old, new)
+            source = private / self.p1.name
+            source.write_text(raw)
+            module_name = 'pqc_platform_acquire'
+            # The test-only copy is the actual native short-name source.
+            # These private loader paths are not used by the product.
+            module_loader._extra_dirs = [str(private)]
+            module_loader._clear_caches()
+            module_utils_loader.add_directory(str(ROOT / 'plugins/module_utils'))
+        resolved = module_loader.find_plugin_with_context(module_name, '.py')
+        assert resolved.resolved and Path(resolved.plugin_resolved_path).resolve() == source.resolve()
+        # No stale AnsiballZ cache across stage/host/fixture copies.
+        prior_tmp = C.DEFAULT_LOCAL_TMP
+        try:
+            C.DEFAULT_LOCAL_TMP = str(private)
+            bits = modify_module(module_name=module_name, module_path=str(source),
+                module_args={'stage': stage, '_ansible_no_log': True}, templar=Templar(loader=DataLoader()),
+                task_vars={'ansible_python_interpreter': self.python, 'ansible_playbook_python': sys.executable},
+                remote_is_local=False)
+        finally:
+            C.DEFAULT_LOCAL_TMP = prior_tmp
+        assert bits.module_style == 'new'
+        wrapper = private / 'wrapper.py'
+        wrapper.write_bytes(bits.b_module_data); wrapper.chmod(0o600)
+        if self.fault is not None:
+            self.fault('prepare', binding, None)
+
+        def launch(begin):
+            end = begin()
+            try:
+                proc = subprocess.Popen([self.python, '-I', '-B', str(wrapper)], cwd=private,
+                    env={'PATH': '/usr/bin:/bin', 'HOME': str(private), 'TMPDIR': str(private), 'LC_ALL': 'C.UTF-8'},
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
+            except OSError:
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            (self.tmp / (stem + '-launch.json')).write_text(json.dumps(dict(
+                stage=stage, ordinal=ordinal, task=binding.task_uuid, run=binding.run_id,
+                worker=os.getpid(), supervisor=proc.pid, began=time.monotonic(), end=end)))
+            buffers = [bytearray(), bytearray()]
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for i, stream in enumerate((proc.stdout, proc.stderr)):
+                        sel.register(stream, selectors.EVENT_READ, i)
+                    while sel.get_map() or proc.poll() is None:
+                        if mode == 'consumer-loss' and group.exists():
+                            os._exit(17)
+                        left = end - time.monotonic()
+                        assert left > 0
+                        if not sel.get_map():
+                            time.sleep(min(.01, left)); continue
+                        for key, _ in sel.select(min(.02, left)):
+                            room = bridge._STAGE_FRAME_BYTES - sum(map(len, buffers))
+                            data = os.read(key.fd, min(4096, room + 1))
+                            assert len(data) <= room
+                            if data: buffers[key.data].extend(data)
+                            else: sel.unregister(key.fileobj)
+                proc.wait(timeout=max(.01, end-time.monotonic()))
+            finally:
+                proc.stdout.close(); proc.stderr.close()
+                # Never terminate the sole P1 cleanup supervisor. An abandoned
+                # worker's separate session remains bounded by P1 itself; the
+                # parent test reaps it independently, not as worker proof.
+                if proc.poll() is None:
+                    proc.wait(timeout=self.stage_seconds + 1)
+            assert proc.returncode == 0 and not buffers[1]
+            assert not batch._scope.group_exists(proc.pid)
+            if group.exists():
+                witness = json.loads(group.read_bytes())
+                assert witness['pgid'] != proc.pid
+                assert not batch._scope.group_exists(witness['pgid'])
+                assert all(not Path('/proc',str(pid)).exists() for pid in witness['pids'])
+            # Independently witness actual P1 success/cleanup before any test
+            # mutation. The product must still parse, bind and validate the
+            # returned frame itself with the original canonical validator.
+            raw = bytes(buffers[0]); receipt = json.loads(raw)['receipt']
+            self.validator(receipt, stage)
+            assert receipt['cleanup_confirmed'] is True
+            (self.tmp / (stem + '-done.json')).write_text(json.dumps(dict(
+                reason=receipt['reason_code'], rc=receipt['rc'], rpm_rc=receipt['rpm_rc'],
+                state=receipt['payload'].get('state') if receipt['payload'] else None,
+                cleanup=True, ended=time.monotonic())))
+            completion = bridge._StageCompletion(binding, raw, bytes(buffers[1]), proc.returncode, True, True)
+            return self.fault('completion', binding, completion) if self.fault is not None else completion
+        return launch
+
+
+def _p2_register(monkeypatch, ctx, trace, **kwargs):
+    register(monkeypatch, trace, p=0)
+    registry = bridge._producer_adapters()
+    driver = _P2Driver(trace.parent, ctx, **kwargs)
+    driver.parent_pid = os.getpid()
+    # Loader already initialized by the real native InventoryManager.
+    driver.validator = bridge._bound_stage_validator()
+    registry[bridge.PLATFORM] = bridge._PlatformStageAdapter(driver.prepare)
+    monkeypatch.setattr(bridge, '_producer_adapters', lambda: registry)
+    return driver
+
+
+def _p2_rows(driver, name, suffix='launch'):
+    return [json.loads(p.read_bytes()) for p in driver.markers(name, suffix)]
+
+
+def test_p2_platform_fixed_budgets():
+    session = batch._ProducerSession(RULES)
+    assert batch._platform_budget() == 258
+    assert session.budget(bridge.PRODUCERS) == 155
+    session.staged = True
+    assert session.budget(bridge.PRODUCERS) == 382
+    host = batch._GUARD_SECONDS + batch._SSH_SECONDS + session.budget(bridge.PRODUCERS) + batch._WORKER_GRACE + 5
+    assert host == 434 and 2*batch._GUARD_SECONDS + 10*(2*batch._GUARD_SECONDS+host)+5 == 5005
+    assert not bridge._producer_adapters() and not batch._passive_adapters()
+    with pytest.raises(batch.Denied, match='LIVE_NOT_AVAILABLE'):
+        batch._restricted_connection(HOST)
+
+
+@pytest.mark.parametrize('ol', [False, True], ids=['debian-fqcn', 'ol-three-stages-short'])
+def test_p2_platform_actual_native_worker(fixture, monkeypatch, ol):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.PACKAGES))
+    driver=_p2_register(monkeypatch,ctx,trace,ol=ol)
+    launches=_observe_native_queue(monkeypatch)
+    rc,m,bundle=checked(ctx)
+    n=names[0]; stages=_p2_rows(driver,n); done=_p2_rows(driver,n,'done')
+    assert [r['stage'] for r in stages] == list(bridge._PLATFORM_STAGES if ol else ('metadata',)), (m,stages,done)
+    assert len(done)==len(stages) and all(r['cleanup'] for r in done)
+    assert len({r['worker'] for r in stages})==len({r['task'] for r in stages})==len({r['run'] for r in stages})==1
+    assert launches==[(n, stages[0]['worker'])] and stages[0]['worker']!=os.getpid()
+    assert all(not Path('/proc',str(r['supervisor'])).exists() for r in stages)
+    assert all(a['ended'] <= b['began'] for a,b in zip(done,stages[1:]))
+    d=bundle['document']; row=m['hosts'][0]
+    assert len(row['platform']['collection_ids'])==10 and len(d['collections'])==17
+    scopes={c['scope_key']:c for c in d['collections'] if c['collector_id']==bridge.PLATFORM}
+    assert all(c['source']['source_kind']=='SYNTHETIC' for c in scopes.values())
+    if ol:
+        assert rc==0 and [r['rpm_rc'] for r in done]==[None,0,1]
+        assert [r['state'] for r in done[1:]]==['COLLECTED','ABSENT']
+        assert all(scopes[s]['collection_state']=='COLLECTED' for s in bridge._PLATFORM_STAGES[1:])
+        assert (trace.parent/(n+'.'+bridge.OPENSSL+'.json')).exists()
+    else:
+        assert all(scopes[s]['collection_state']=='NOT_SCANNED' and scopes[s]['reason_code']=='NOT_ATTEMPTED' for s in bridge._PLATFORM_STAGES[1:])
+        assert not (trace.parent/(n+'.'+bridge.OPENSSL+'.json')).exists()
+    assert not trap.exists() and trace.read_text().splitlines()==['["--list"]']
+    print('P2_NATIVE_STAGES',json.dumps(dict(ol=ol,stages=stages,done=done,rc=rc,collections=len(d['collections']))))
+
+
+@pytest.mark.parametrize('version,major,family,expected', [
+    ('9.7','9','RedHat',True), ('9.8','9','RedHat',True), ('9.9','9','RedHat',True),
+    ('9.10','9',None,True), ('8.9','8','RedHat',False), ('9.9','8','RedHat',False),
+    ('9','9','RedHat',False), ('9.10','9','Debian',False), (None,'9','RedHat',False),
+])
+def test_p2_platform_numeric_gate(version, major, family, expected):
+    value=platform_snapshot(); value['rpms']={}
+    value['facts'].update(distribution_version=version,distribution_major_version=major,os_family=family)
+    assert bridge._rpm_eligible(value) is expected
+    for tool in ('rpm','timeout'):
+        copy_value=copy.deepcopy(value); copy_value['tools'][tool]=[dict(state='UNKNOWN')]
+        assert bridge._rpm_eligible(copy_value) is False
+    value.update(facts={},facts_state='PERMISSION_DENIED')
+    assert bridge._rpm_eligible(value) is False
+
+
+@pytest.mark.parametrize('fault', ['foreign-target','foreign-run','foreign-task','wrong-order','replayed',
+    'missing','untrusted-cleanup','duplicate-json','nan','frame-overflow','receipt-overflow','bad-rc',
+    'bad-stage','extra-frame','bad-rpm-rc','not-started'], ids=str)
+def test_p2_platform_closed_receipt(fixture, fault):
+    make,_,_,_,_=fixture; make(count=1)
+    stage=bridge._PLATFORM_STAGES[1] if fault=='bad-rpm-rc' else 'metadata'
+    binding=bridge._StageBinding(RUN,HOST,'task-001',stage,1 if stage!='metadata' else 0)
+    payload=platform_snapshot(); payload.pop('rpms')
+    if stage!='metadata':
+        payload=dict(state='ABSENT',reason='PACKAGE_ABSENT',rows=[])
+    receipt=dict(format=1,stage=stage,reason_code='COMMAND_OK',rc=0,cleanup_confirmed=True,
+                 payload=payload,rpm_rc=1 if stage!='metadata' else None)
+    frame=dict(changed=False,invocation={'module_args':{'stage':stage}},receipt=receipt)
+    raw=json.dumps(frame).encode('ascii'); complete=bridge._StageCompletion(binding,raw,b'',0,True,True)
+    assert bridge._stage_receipt(complete,binding)==receipt
+    expected='INVALID_ADAPTER_RESULT'; clean=True
+    if fault in ('foreign-target','foreign-run','foreign-task','wrong-order','replayed'):
+        field,value={'foreign-target':('target_id','other.example.invalid'),'foreign-run':('run_id','other-run'),
+                     'foreign-task':('task_uuid','task-002'),'wrong-order':('ordinal',2),'replayed':('ordinal',binding.ordinal)}[fault]
+        complete=complete._replace(binding=binding._replace(**{field:value}))
+        expected='REMOTE_CLEANUP_UNCONFIRMED'; clean=False
+    elif fault in ('missing','untrusted-cleanup'):
+        complete=None if fault=='missing' else complete._replace(clean=False)
+        expected='REMOTE_CLEANUP_UNCONFIRMED'; clean=False
+    elif fault=='not-started':
+        complete=bridge._StageCompletion(binding,b'',b'',None,False,True)
+        expected='COMMAND_START_FAILED'
+    else:
+        if fault=='duplicate-json': raw=raw.replace(b'"changed": false',b'"changed": false, "changed": false')
+        elif fault=='nan': raw=raw.replace(b'"rc": 0',b'"rc": NaN')
+        elif fault=='frame-overflow': raw=b'x'*(bridge._STAGE_FRAME_BYTES+1)
+        elif fault=='receipt-overflow': frame['receipt']['raw']='x'*(bridge._STAGE_RECEIPT_BYTES+1);raw=json.dumps(frame).encode()
+        elif fault=='bad-rc': frame['receipt']['rc']=True;raw=json.dumps(frame).encode()
+        elif fault=='bad-stage': frame['receipt']['stage']='release-rpm-oraclelinux-release-el9';raw=json.dumps(frame).encode()
+        elif fault=='extra-frame': frame['extra']='DUMMY_PRIVATE_SENTINEL';raw=json.dumps(frame).encode()
+        elif fault=='bad-rpm-rc': frame['receipt']['rpm_rc']=0;raw=json.dumps(frame).encode()
+        complete=complete._replace(stdout=raw)
+    with pytest.raises(bridge._StageFailure) as exc:
+        bridge._stage_receipt(complete,binding)
+    assert exc.value.reason==expected and exc.value.clean is clean
+    assert exc.value.value()['snapshot'] is None and 'DUMMY_PRIVATE_SENTINEL' not in str(exc.value)
+
+
+@pytest.mark.parametrize('mode', ['metadata-failure','missing-rpm','overflow','hang'])
+def test_p2_platform_confirmed_failure_and_gate(fixture,monkeypatch,mode):
+    make,_,trace,trap,_=fixture
+    count=2 if mode=='metadata-failure' else 1
+    ctx,names=make(count=count,forks=1,flags=selected_flags(bridge.PACKAGES))
+    n=names[0]; ordinal=0 if mode in ('metadata-failure','missing-rpm') else 1
+    driver=_p2_register(monkeypatch,ctx,trace,modes={(n,ordinal):mode},stage_seconds=4 if mode=='hang' else 30)
+    rc,m,bundle=checked(ctx)
+    got=_p2_rows(driver,n); done=_p2_rows(driver,n,'done')
+    assert len(got)==len(done)==(1 if ordinal==0 else 3), (m,got,done)
+    assert all(r['cleanup'] for r in done)
+    scopes={c['scope_key']:c for c in bundle['document']['collections']
+            if c['collector_id']==bridge.PLATFORM and c['host_id']==bridge.host_record(got[0]['run'],n)['host_id']}
+    if mode=='metadata-failure':
+        assert rc==5 and m['hosts'][0]['host_state']=='ERROR' and m['hosts'][1]['host_state']=='COMPLETE'
+        assert m['hosts'][0]['platform']['reason_code']=='COMMAND_FAILED' and done[0]['rc']!=0
+        assert not scopes and not (trace.parent/(n+'.'+bridge.OPENSSL+'.json')).exists()
+        assert len(_p2_rows(driver,names[1]))==3
+    elif mode=='missing-rpm':
+        assert len(scopes)==10 and all(scopes[s]['collection_state']=='NOT_SCANNED' for s in bridge._PLATFORM_STAGES[1:])
+        # Missing release-RPM tool is not a blanket ban on later producers.
+        assert (trace.parent/(n+'.'+bridge.OPENSSL+'.json')).exists()
+    else:
+        first,second=bridge._PLATFORM_STAGES[1:]
+        assert scopes[first]['collection_state']=='ERROR' and scopes[first]['reason_code']==('TIMEOUT' if mode=='hang' else 'OUTPUT_LIMIT')
+        assert scopes[second]['collection_state']=='COLLECTED' and done[2]['rpm_rc']==1
+        assert (trace.parent/(n+'.'+bridge.OPENSSL+'.json')).exists()
+        if mode=='hang':
+            assert done[1]['reason']=='COMMAND_TIMEOUT' and done[1]['rc']!=0 and done[1]['rpm_rc'] is None
+        else:
+            assert done[1]['reason']=='COMMAND_OK' and done[1]['state']=='ERROR'
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('fault', ['late-drift','invalid-frame','untrusted-cleanup','foreign-binding','interrupted'])
+def test_p2_platform_fatal_stage_stops_dispatch(fixture,monkeypatch,fault):
+    make,_,trace,trap,cfg=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.PACKAGES))
+    def corrupt(when,binding,completion):
+        if binding.ordinal!=1:return completion
+        if fault=='late-drift' and when=='prepare':
+            with cfg.open('a') as f:f.write('\n# synthetic late source drift\n')
+        elif when=='completion':
+            if fault=='invalid-frame':return completion._replace(stdout=b'{"duplicate":1,"duplicate":2}')
+            if fault=='untrusted-cleanup':return completion._replace(clean=False)
+            if fault=='foreign-binding':return completion._replace(binding=binding._replace(target_id=names[1]))
+            if fault=='interrupted':
+                frame=json.loads(completion.stdout)
+                frame['receipt'].update(reason_code='INTERRUPTED',rc=-15,payload=None,rpm_rc=None)
+                return completion._replace(stdout=json.dumps(frame).encode('ascii'))
+        return completion
+    driver=_p2_register(monkeypatch,ctx,trace,fault=corrupt)
+    before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    rc,m,bundle=checked(ctx)
+    expected={'late-drift':'GUARD_REJECTED','invalid-frame':'INVALID_ADAPTER_RESULT',
+              'untrusted-cleanup':'REMOTE_CLEANUP_UNCONFIRMED','foreign-binding':'REMOTE_CLEANUP_UNCONFIRMED',
+              'interrupted':'INTERRUPTED'}[fault]
+    assert rc==(7 if fault=='interrupted' else 6) and m['reason_code']==expected, m
+    assert m['hosts'][0]['platform']['reason_code']==expected and not bundle['document']['collections']
+    assert m['hosts'][1]['host_state']=='NOT_ATTEMPTED' and [n for n,_ in launches]==names[:1]
+    assert [r['ordinal'] for r in _p2_rows(driver,names[0])]==([0] if fault=='late-drift' else [0,1])
+    assert not _p2_rows(driver,names[1]) and not trap.exists() and _signal_state()==before
+
+
+# Independently reap adopted test-owned supervisors. A worker's normal exit or
+# absence of its own group is NOT proof that the P1 target group has gone.
+# The local test parent is already trusted; these witnesses never enter the
+# product queue, registry, handoff or evidence, and are not transport proofs.
+from contextlib import contextmanager
+
+
+@contextmanager
+def _p2_owned_supervisors(driver):
+    import ctypes
+    libc=ctypes.CDLL(None,use_errno=True); old=ctypes.c_int()
+    assert libc.prctl(37,ctypes.byref(old),0,0,0)==0 and libc.prctl(36,1,0,0,0)==0
+    reaped={}
+    try:
+        yield reaped
+    finally:
+        try:
+            launches=[json.loads(p.read_bytes()) for p in driver.tmp.glob('*-launch.json')]
+            groups=[json.loads(p.read_bytes()) for p in driver.tmp.glob('*-group.json')]
+            end=max([time.monotonic()+.5]+[x['began']+driver.stage_seconds+3 for x in launches])
+            for entry in launches:
+                pid=entry['supervisor']
+                while Path('/proc',str(pid)).exists() and time.monotonic()<end:
+                    try:
+                        got,status=os.waitpid(pid,os.WNOHANG)
+                        if got:reaped[pid]=os.waitstatus_to_exitcode(status);break
+                    except ChildProcessError:
+                        pass
+                    time.sleep(.02)
+                assert not Path('/proc',str(pid)).exists() and not batch._scope.group_exists(pid), 'P1 supervisor still present'
+            for entry in groups:
+                assert not batch._scope.group_exists(entry['pgid']), 'P1 target group still present'
+                assert all(not Path('/proc',str(pid)).exists() for pid in entry['pids']), 'P1 descendant still present'
+            print('P2_OWNED_CLEANUP',json.dumps(dict(supervisors=len(launches),groups=len(groups),adopted_reaped=reaped)))
+        finally:
+            assert libc.prctl(36,old.value,0,0,0)==0
+
+
+def _p2_wait(path,seconds=8):
+    end=time.monotonic()+seconds
+    while not path.exists():
+        if time.monotonic()>=end:raise AssertionError('fixture synchronization timed out')
+        time.sleep(.01)
+
+
+@pytest.mark.parametrize('mode',['consumer-loss','signal'])
+def test_p2_platform_worker_loss_and_signal_cleanup(fixture,monkeypatch,mode):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.PACKAGES))
+    n=names[0]; driver=_p2_register(monkeypatch,ctx,trace,
+        modes={(n,1):'consumer-loss' if mode=='consumer-loss' else 'hang'},stage_seconds=4)
+    sent=[]; before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    if mode=='signal':
+        poll=batch._ProducerWorkerWave.poll
+        def interrupt(self):
+            if not sent and (trace.parent/f'{n}-1-group.json').exists():
+                sent.append(time.monotonic());os.kill(os.getpid(),signal.SIGINT)
+            return poll(self)
+        monkeypatch.setattr(batch._ProducerWorkerWave,'poll',interrupt)
+    with _p2_owned_supervisors(driver) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert rc==(7 if mode=='signal' else 6) and m['reason_code']==('INTERRUPTED' if mode=='signal' else 'REMOTE_CLEANUP_UNCONFIRMED'),m
+    assert (mode!='signal' or sent) and m['hosts'][0]['host_state']=='ERROR' and m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    assert [n for n,_ in launches]==names[:1] and len(_p2_rows(driver,n))==2 and len(_p2_rows(driver,n,'done'))==1
+    assert _p2_rows(driver,n)[1]['supervisor'] in reaped
+    assert not bundle['document']['collections'] and not trap.exists() and _signal_state()==before
+
+
+def test_p2_platform_peer_fatal_stop_cleans_independent_group(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.PACKAGES))
+    a,b,_=names
+    def corrupt(when,binding,completion):
+        if when=='completion' and binding.target_id==a and binding.ordinal==1:
+            group=trace.parent/f'{b}-1-group.json'; _p2_wait(group)
+            assert batch._scope.group_exists(json.loads(group.read_bytes())['pgid'])
+            return completion._replace(stdout=b'{"bad":true}')
+        return completion
+    driver=_p2_register(monkeypatch,ctx,trace,modes={(b,1):'hang'},stage_seconds=6,fault=corrupt)
+    before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(driver) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert rc==6 and m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED', m
+    assert m['hosts'][0]['platform']['reason_code']=='INVALID_ADAPTER_RESULT'
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert [n for n,_ in launches]==names[:2] and all(len(_p2_rows(driver,n))==2 for n in names[:2])
+    assert _p2_rows(driver,b)[1]['supervisor'] in reaped and len(_p2_rows(driver,b,'done'))==1
+    assert not bundle['document']['collections'] and not trap.exists() and _signal_state()==before
+
+
+@pytest.mark.parametrize('in_flight',[False,True],ids=['no-new-stage','active-stage'])
+def test_p2_platform_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.PACKAGES))
+    a,b,_=names; ready=trace.parent/'a-ready'; verified=trace.parent/'b-verified'
+    marks={}; waves=[]
+    def synchronize(when,binding,completion):
+        if not in_flight and when=='prepare' and binding.target_id==a and binding.ordinal==1:
+            ready.write_text('ready'); _p2_wait(verified)
+            worker=batch._PLATFORM_WORKER.get(); end=worker.lease.limit(a)
+            (trace.parent/'child-lease.json').write_text(json.dumps(dict(end=end,now=time.monotonic())))
+        return completion
+    driver=_p2_register(monkeypatch,ctx,trace,versions={b:{'distribution':'Debian','os_family':'Debian'}},
+        modes={(a,1):'hang'} if in_flight else {},stage_seconds=6 if in_flight else 30,fault=synchronize)
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator); send=q.send_task_result
+        def hold(result):
+            if result.as_wire_task_result().host_name==b:
+                _p2_wait(trace.parent/f'{a}-1-group.json' if in_flight else ready)
+                send(result);time.sleep(15)
+            else:send(result)
+        q.send_task_result=hold;return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+    accepted=batch._ProducerWorkerWave._receipt_accepted
+    def observe(self):
+        result=accepted(self)
+        if b in self.ledger.projections and not verified.exists():
+            assert b not in self.confirmed and self.workers[b].is_alive()
+            end=self.limit(); assert end==min(self.ends[b],self.grace[b])<self.ends[a]
+            assert self.lease.limit(a)==end
+            marks.update(earliest=end,verified=time.monotonic());waves.append(self)
+            verified.write_text('verified')
+        return result
+    monkeypatch.setattr(batch._ProducerWorkerWave,'_receipt_accepted',observe)
+    before=_signal_state();launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(driver) as reaped:
+        rc,m,bundle=checked(ctx);marks['finished']=time.monotonic()
+    assert waves and marks['verified']<marks['earliest'] and [n for n,_ in launches]==names[:2],m
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    # A refused launch can return its own validated, empty failure envelope.
+    # An already active stage cannot turn a late receipt into observations.
+    assert rc==6 and set(bundle['handoff_metrics'])==set(bundle['companions'])
+    assert b in bundle['companions'] and set(bundle['companions']) <= {a,b}
+    assert not bundle['companions'].get(a)
+    assert all(not r['collection_ids'] for r in [m['hosts'][0]['platform'], *m['hosts'][0]['collectors']])
+    assert len(bundle['document']['collections'])==17 and not trap.exists() and _signal_state()==before
+    if in_flight:
+        assert set(bundle['companions'])=={b}
+        assert m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED'
+        assert len(_p2_rows(driver,a))==2 and len(_p2_rows(driver,a,'done'))==1
+        assert _p2_rows(driver,a)[1]['supervisor'] in reaped
+        assert marks['earliest']-.15<=marks['finished']<=marks['earliest']+batch._WORKER_GRACE+2
+    else:
+        child=json.loads((trace.parent/'child-lease.json').read_bytes())
+        assert child['end']==marks['earliest'] and 0<child['end']-child['now']<=batch._WORKER_GRACE
+        assert len(_p2_rows(driver,a))==1 and m['reason_code']=='CONTROLLER_TIMEOUT'
+        assert set(bundle['companions'])=={a,b} and m['hosts'][0]['platform']['reason_code']=='CONTROLLER_TIMEOUT'
+    assert all(not _p2_rows(driver,n) for n in names[2:])
+    print('P2_EARLIEST_LEASE',json.dumps(dict(in_flight=in_flight,**marks)))

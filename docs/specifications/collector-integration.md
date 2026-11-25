@@ -4,7 +4,8 @@ Scope: #57 I1a, approved R1 and capacity correction R2 (#7155598677,
 #7155636533). This is an internal Controller-only synthetic integration,
 not an acquisition adapter, public scan CLI, storage format, live grant or
 release qualification. The real registry is empty and the original SSH
-transport is never called. I1b and I2 have separate acceptance work.
+transport is never called. The I1b Platform P2 restricted extension is
+described below; other I1b acquisition and I2 have separate acceptance work.
 
 ## Entry points and frozen context
 
@@ -37,8 +38,9 @@ platform receipt cannot authorize later producers. The original per-producer
 closed snapshot validators, flags, platform status, Q/T safety gates,
 timestamps, data limits and reasons apply. Real per-tool acquisition
 eligibility and the bounded per-command acquisition of a production adapter
-are I1b responsibilities; a synthetic result is not evidence of actual
-managed execution or OL support.
+are I1b responsibilities. The fixed Platform P2 stage bridge below is
+restricted to trusted synthetic execution; a synthetic result is not
+evidence of actual managed execution or OL support.
 
 ## Typed handoff and lifecycle
 
@@ -94,7 +96,9 @@ producer uses the existing 30s command deadline plus 1s return cap; the
 existing 15s connection cap and 16 KiB combined raw command output cap are
 not expanded. This does not allow wrapping a whole real producer in a
 single command budget: I1b must establish each actual command's deadline,
-acquisition projection and cleanup. Controller typed normalization and
+acquisition projection and cleanup. Platform P2 has the separate fixed
+stage budget described below; it is not a whole-producer command timeout.
+Controller typed normalization and
 final verification run under a guard interval; the existing earliest
 worker/phase deadline is not extended during callback validation. The
 final typed normalization/assessment is separately bounded. Caught
@@ -183,3 +187,98 @@ modified. These are engineering tests; actual fixed-path OpenSSH,
 SSH/ProxyJump, OL9.x and official remote acquisition/cleanup, controller
 qualification and #28 release QA remain pending. No live execution is
 available.
+
+
+## I1b Platform P2: fixed staged native bridge (restricted)
+
+Approved #57 specification #7169477310 and dispatch #7169696850; P1
+module, mirrors, helper and original normalizer are unchanged. This is
+not a public module/driver registration API, SSH transport implementation,
+Platform support declaration, or new wire/persistence contract. Only an
+explicit private `_PlatformStageAdapter` for `pqc-platform` selects this
+path. Both real registries stay empty; the old single-call synthetic
+Platform and other producers retain their original path. Required producer
+availability is checked for the entire frozen batch before connection.
+
+The guarded native WorkerProcess owns the following exact order:
+
+1. `metadata` (the original five facts and eight stat observations).
+2. `release-rpm-oraclelinux-release`.
+3. `release-rpm-oraclelinux-release-el9`.
+
+The private trusted driver prepares only the bound fixed P1 stage and
+consumes a one-use launch gate immediately before dispatch. The Controller
+binding contains its actual run ID, frozen target, native TaskExecutor task
+UUID, stage and ordinal. The completion must return that same binding
+object, a separately trusted launch/completion/cleanup receipt, exact
+integer wrapper rc and bounded bytes. It cannot select its own identity or
+command from a report, plan, host variable, CLI or environment. This is
+not a remote signature or an authorization token. The original fixed raw
+SSH witness remains one-use and the original SSH `_run` is never called.
+Per-stage guard and deadline rules are in [batch execution](batch-execution.md).
+
+The private JSON frame cap is 32 KiB combined stdout/stderr, including
+Ansible wrapper overhead. Read/return must be bounded; reject truncation,
+extra data, unexpected frame fields, nonzero wrapper rc, stderr, duplicate
+keys, invalid numbers, wrong invocation, missing/foreign/replayed/late
+binding and malformed or contradictory receipt. The lazy fixed canonical
+P1 `validate_receipt` checks the seven-key format 1 receipt, including its
+16 KiB typed cap, outer rc, cleanup, payload and inner RPM rc. P1's own
+16 KiB combined command output, 32 RPM rows and independent bounded group
+cleanup are unchanged. Neither wrapper bytes nor raw diagnostics enter
+Evidence, handoff or the native queue. A remote receipt's cleanup bit, a
+Controller worker exit, or wrapper exit alone is not independent proof.
+Only a trusted matching completion with confirmed cleanup may yield
+`INVALID_ADAPTER_RESULT`; uncertainty remains `REMOTE_CLEANUP_UNCONFIRMED`.
+Confirmed failure before launch may be `COMMAND_START_FAILED` with null rc.
+
+After a valid metadata `COMMAND_OK` / rc0 / confirmed cleanup, reuse
+`normalize_platform(..., source_kind='SYNTHETIC')` and `normalize_tools`.
+Both release queries require `facts_state=OK`, numeric OL 9.x status
+`UNVERIFIED`, and positive rpm and timeout capabilities. 9.10 is not a
+special case or a `SUPPORTED` declaration. Otherwise preserve valid
+metadata, do not dispatch either RPM, and pass `rpms={}` (both release
+scopes become `NOT_SCANNED/NOT_ATTEMPTED`). Missing RPM capability does
+not by itself suppress other eligible producers on an UNVERIFIED platform.
+UNKNOWN/OUT_OF_SCOPE retains the original later-producer gap behavior.
+
+A confirmed ordinary metadata failure produces a failed Platform record,
+no invented ten-scope snapshot, and no later acquisition for that host.
+A confirmed ordinary RPM outer failure becomes only a narrow typed error
+with no rows (`TIMEOUT`, `OUTPUT_LIMIT`, or `COMMAND_FAILED`); the next
+eligible fixed stage may proceed. Valid inner results retain the original
+`normalize_rpm` states/reasons. In particular exact P1 absence with inner
+rc1 is not inferred from outer rc0. Interrupt, invalid command contract,
+process-control failure, guard/identity drift, invalid binding/receipt,
+controller deadline and uncertain cleanup are fatal. No subsequent stage
+or producer runs on that host; after the Controller observes a fatal stop,
+no new host is dispatched. Already in-flight peers are stopped/cleaned
+under the existing bounds; this is not instantaneous cross-process revoke.
+No partial Platform snapshot is manufactured from a fatal sequence.
+
+The existing four-key producer result and snapshot
+`{facts_state,facts,tools,rpms}` feed original record/precheck, handoff v1,
+actual normalizer, exact ten Platform scopes, Evidence 1.1.0 validation
+and assessment. Wrapper `COMMAND_OK`/rc0 denotes a safely assembled
+snapshot, not success of every RPM query. P2 keeps actual stage rc/inner rc
+for trusted validation/engineering evidence only, not additional persistent
+fields. The Platform-specific fatal ERROR reasons `GUARD_REJECTED`,
+`CONTROLLER_TIMEOUT`, `INTERRUPTED` keep the original host/run RC5/6/7
+semantics; unattempted hosts retain their existing NOT_SCANNED reasons.
+A pre-launch deadline may yield a validated empty failure envelope, never
+successful collection references. Parent retains previously validated
+observations without upgrading an unsafe worker terminal. No schema,
+Run Store, other collector or original P1/helper change is made.
+
+Focused `test_p2_platform_*` tests in `tests/integration/test_scan_collectors.py`
+exercise actual `execute_producer_batch` / native WorkerProcess, short and
+FQCN packaging, original P1 helper and validator, local Debian metadata and
+private synthetic OL inputs/RPM surrogate, exact scopes/bindings/assessment,
+ordinary/fatal failures, both-worker deadlines, observed stop, signal and
+independently reaped target groups. Synthetic copies replace only fixed
+fact/stat input, RPM literal and necessary shorter test-only stage deadline;
+no system RPM or real managed host is queried. These are restricted
+engineering results. The real registry/transport, #8/#17 qualification,
+actual Controller and OL9.7--9.9, installed tools, SSH/ProxyJump/host-key,
+permissions, load, before/after state, remote lifetime and offline release
+QA remain NOT_TESTED under #28. Other I1b adapters and I2 remain separate.
