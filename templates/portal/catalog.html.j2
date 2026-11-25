@@ -1,0 +1,50 @@
+<!-- PQC catalog generation: {{ c.generation }} -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PQC run history</title>
+<style>
+:root { color-scheme: light; font: 100%/1.5 system-ui, sans-serif; color: #152a2b; background: #f1f5f8; }
+body { margin: 0; } main { width: min(96%, 100rem); margin: 1.5rem auto; }
+h1 { margin: 0; } section { background: white; border: 1px solid #d8e1e8; border-radius: .5rem; padding: 1rem; margin-block: 1rem; }
+a { color: #075e73; text-decoration: underline; } a:focus-visible { outline: 3px solid #bc6714; }
+code { overflow-wrap: anywhere; } .scroll { overflow-x: auto; } table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { border-bottom: 1px solid #d8e1e8; padding: .5rem; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+th { background: #e5edf2; } tr:nth-child(even) { background: #f7fafb; } .muted { color: #465c6d; }
+</style>
+</head>
+<body><main>
+<h1>PQC run history</h1>
+<p>Verified publication and portal availability are separate. This is a snapshot, not a live scan or a readiness score.</p>
+<p>Generation: <code id="generation">{{ c.generation }}</code></p>
+<p><a id="catalog-json" href="catalog.generations/{{ c.generation }}/run_catalog.json">JSON for this generation</a></p>
+<section aria-labelledby="summary-heading">
+<h2 id="summary-heading">Summary</h2>
+<p>Total run candidates: <strong id="total">{{ c.summary.total }}</strong>. Ignored non-run entries: <span id="ignored">{{ c.diagnostics.ignored_entries }}</span>.</p>
+{% for axis, counts in c.summary.items() if axis != 'total' %}
+<p>{{ axis|capitalize }}: {% for key, count in counts.items() %}<span id="{{ axis }}-{{ key }}">{{ key }}: {{ count }}</span>{% if not loop.last %}; {% endif %}{% endfor %}</p>
+{% endfor %}
+</section>
+<section aria-labelledby="runs-heading">
+<h2 id="runs-heading">Runs (latest recorded first)</h2>
+{% if not c.rows %}<p>No run candidates.</p>{% endif %}
+<div class="scroll"><table id="runs">
+<thead><tr><th>Run ID</th><th>Publication</th><th>Outcome</th><th>Source / kind / recovery</th><th>Recorded / started / finished (UTC)</th><th>Hosts / states</th><th>Missing artifacts</th><th>Portal</th><th>Reason</th></tr></thead>
+<tbody>
+{% macro val(x) %}{% if x is none %}Unknown{% elif x is sameas true %}Yes{% elif x is sameas false %}No{% else %}{{ x }}{% endif %}{% endmacro %}
+{% for r in c.rows %}
+<tr id="run-{{ r.run_id }}">
+<td>{% if r.href is not none %}<a href="{{ r.href }}">{{ r.run_id }}</a>{% else %}{{ r.run_id }}{% endif %}</td>
+<td>{{ r.publication_status }}</td><td>{{ val(r.run_state) }}</td>
+<td>{{ val(r.source_kind) }}<br>{{ val(r.run_kind) }}<br>Recovery: {{ val(r.recovery) }}</td>
+<td>{{ val(r.recorded_at) }}<br>{{ val(r.started_at) }}<br>{{ val(r.finished_at) }}</td>
+<td>{{ val(r.expected_host_count) }}{% if r.host_state_counts is not none %}{% for state in host_states %}<br>{{ state }}: {{ r.host_state_counts[state] }}{% endfor %}{% endif %}</td>
+<td>{{ val(r.missing_artifact_count) }}</td><td>{{ r.portal_status }}<br>{{ val(r.portal_generation) }}</td><td>{{ r.reason_code }}</td>
+</tr>
+{% endfor %}
+</tbody></table></div>
+</section>
+<p class="muted">Regenerate explicitly to discover newly published runs. Keep this entire reports directory together when moving it.</p>
+</main></body></html>

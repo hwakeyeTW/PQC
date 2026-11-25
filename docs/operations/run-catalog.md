@@ -1,0 +1,109 @@
+# Run Catalog (V2.0, slice A)
+
+The catalog is an offline snapshot of direct children of an existing,
+Owner-approved private report root. It does not launch scans, recover runs,
+re-assess evidence, or generate/refresh individual run pages. An unavailable
+portal does not change the verified run outcome.
+
+## Operations
+
+From the trusted repository, on the Controller using the existing Python and
+Jinja2 environment:
+
+```sh
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.run_catalog --report-root /approved/private/reports --check
+python -m tools.run_catalog --report-root /approved/private/reports --recover
+```
+
+The root must already exist as a private local Linux directory (0700, owned by
+the effective user, with safe ancestors), under the same Run Store filesystem
+contract. No automatic creation/permission repair of the root, network access,
+Ansible dispatch or additional dependency installation. The default command
+rebuilds from a bounded enumeration snapshot; `--check` is read-only and checks
+only the published catalog pair and its immutable snapshot, not run freshness.
+`--recover` explicitly rebuilds after a proven catalog publication interruption.
+The two flags are mutually exclusive. Exit 0 means publication or consistency
+verified (not scan/readiness PASS); exit 1 is a fixed failure reason, including
+busy/recovery/durability failure; exit 2 denotes invalid arguments.
+
+Open `reports/index.html` locally. The table works with JavaScript disabled; no
+server, external styles, fonts, network or local JSON fetch. Move or archive and
+extract the **whole** report root, including `catalog.generations`, preserving
+private permissions for further Controller operations. Existing Portal v1/v2
+pages are not changed. Return links from individual runs and Portal v3 belong to
+slice B and are not provided by this slice.
+
+## Interpretation
+
+`run_catalog.json` is canonical catalog version 1 / render format 1, with
+SHA-256 generation of the canonical payload excluding `generation`, summary,
+fixed diagnostics and ordered rows (validated recorded time descending, then
+literal run ID; unknown times last). Only a successful actual `RunStore.open`
+provides run kind, source, recovery flag, outcome, dates, host counts, missing
+artifact count and manifest hash. No host names, Inventory, raw evidence,
+absolute paths or source references are included. Unknown fields are null, not
+zero or a guessed failed scan.
+
+| Publication | Interpretation |
+| --- | --- |
+| PUBLISHED | Verified immutable publication; COMPLETE, PARTIAL or ERROR preserved. |
+| UNPUBLISHED_OR_INCOMPLETE | Safe direct candidate without a published marker. |
+| INVALID | Unsafe/casefold collision or unverified marker, lock or core. |
+| BUSY | Could not obtain the run's shared lock. Outcome unknown. |
+
+The separate `portal_status` is AVAILABLE (exact verified v1 or v2),
+NOT_GENERATED (no derived slots), INVALID (incomplete, unsafe, unknown or
+inconsistent derived output), or NOT_VERIFIED (publication not verified).
+Only AVAILABLE has a relative `run_id/index.html` link. Unreferenced v2 staging
+is not followed when an exact v1 index and CSS are still valid. A v2 index needs
+the complete expected page set and matching receipt/manifest/CSS bytes. There
+is no historical trend or security/readiness score.
+
+Case-insensitive duplicate IDs are all rejected; reserved/temporary/non-ID
+entries are counted rather than interpreted or printed. No recursive discovery
+or archive reading. Fixed catalog/store infrastructure names are not candidates.
+The root enumeration cap is 100,000 direct entries; maximum 1,000 legal candidates
+and 4 GiB cumulative admitted indexed core, marker/journal and derived bytes
+(including admitted bytes for invalid candidates). This is an admission limit,
+not actual I/O or a performance SLA. Per-run Store/Portal limits still apply.
+Limit failure does not publish a truncated index. JSON and HTML each have a
+16 MiB cap, receipt 256 KiB. A new run finishing after enumeration is visible
+on a later rebuild; the catalog is not a globally atomic live inventory or a
+retention ledger for runs removed externally.
+
+## Publication and interruption
+
+The private `.catalog.lock` serializes catalog writers; checks use a shared
+lock, with bounded five-second acquisition. Catalog lock precedes one shared
+per-run lock at a time. `catalog.generations/<generation>/` contains an immutable
+closed set: `run_catalog.json`, `index.html.snapshot` (verification copy, not a
+navigation page), `catalog_receipt.json`. Each file is private 0600. A complete
+private stage is fsynced and published no-replace; existing generations must
+exactly match. Stable `run_catalog.json` is switched first, `index.html` last.
+The HTML always links to its own immutable generation JSON, never the potentially
+cross-generation stable JSON. This is not a multi-file atomic rename.
+
+A complete same-generation rebuild does not replace either stable inode or
+modify its timestamp. An interruption between stable switches may leave two
+legitimate different generations. The old HTML remains readable with its own
+snapshot. `--check` reports `CATALOG_RECOVERY_REQUIRED`; the normal build refuses
+an incomplete/mixed pair. `--recover` requires every present stable slot to be
+proven by the exact canonical snapshot/receipt/HTML, then rescans and completes
+in the same order. A proven single remaining slot can also be recovered.
+Unknown, corrupt, foreign, unsafe files or mismatching snapshots are never
+silently overwritten, even with recovery; leave them for the Owner to inspect.
+An fsync failure returns `DURABILITY_UNCONFIRMED`, not success; reopen and verify,
+then explicitly recover if needed. Visible consistency alone is not power-loss
+durability. No automatic rollback, deletion of old runs, snapshots or abandoned
+stages, or chmod of an existing output. Keep private root access restricted to
+trusted cooperating writers; hostile same-UID modifications are outside that
+contract.
+
+## Verification boundary
+
+The focused engineering tests use actual synthetic Run Store/legacy import and
+Portal v1/v2 output, exact HTML/JSON oracles, local locks, fault injection and
+relocation. Official Controller/local filesystem/power-loss/load qualification,
+Windows/Linux `file://` browser and network-zero verification remain #27/#28
+release QA. Do not use engineering fixture success as formal release acceptance.
