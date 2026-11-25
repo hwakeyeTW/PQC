@@ -192,3 +192,94 @@ core 2.18.3/Python 3.12.15, OL9.7/9.8/9.9, RPM package names/versions,
 fixed path usability, native OL query/timeout behavior, #8 transport
 termination, Inventory/permissions/load, and integrated offline/report
 behavior remain NOT_TESTED for #28 and the applicable later work packages.
+
+## 4. I1b Platform acquisition P1: fixed bounded module stages
+
+Contract: [approved P1 scope](https://github.com/hwakeyeTW/PQC/issues/57#issuecomment-7158400543).
+The new internal module `pqc_platform_acquire` (standalone) and
+`security.compliance_pqc_readiness.pqc_platform_acquire` (collection) have
+identical bytes and mode. This is an additive acquisition implementation;
+the original role and pure normalization contracts above remain unchanged.
+P1 does not register a scheduler adapter, dispatch a scan, or enable live
+transport. A trusted future executor must bind a receipt to the actual
+host, task, stage and observation time; use `no_log: true`, no become,
+and the existing authorization and transport guards. A receipt or direct
+module invocation is not a grant of authority.
+
+| `stage` (only module parameter) | Fixed acquisition |
+|---|---|
+| `metadata` | Five native distribution/architecture facts and all eight stat candidates in section 1 |
+| `release-rpm-oraclelinux-release` | Query exactly `oraclelinux-release` |
+| `release-rpm-oraclelinux-release-el9` | Query exactly `oraclelinux-release-el9` |
+
+The Ansible module uses the actual trusted AnsiballZ ZIP loader and fixed
+module names, not a caller-supplied script or path. The private ZIP and its
+parent must be owned by the executing user; reject links and unsafe access.
+The child imports the same bundled module with the actual target Python
+interpreter in isolated, no-site, no-bytecode mode. Both the native fact
+implementation and `pqc_bounded_execution` must come from that same ZIP.
+The target need not have Ansible installed. No fallback to host site-packages,
+arbitrary module selection, extra tools, shell or supplied argv is allowed.
+The installed interpreter, distribution fact code, system paths and RPM
+executable are trusted infrastructure, not an adversarial-code sandbox.
+
+Metadata uses the bundled native DistributionFactCollector and distro
+library in file-only mode (optional external command fallbacks disabled).
+The Linux architecture expression uses `os.uname().machine`, without the
+unrelated DNS, machine-id or hostname projection of the full platform fact
+collector. Only the five bounded scalar fields are returned; unavailable or
+unsupported facts remain null/UNKNOWN/ERROR/PERMISSION_DENIED, not guesses.
+Fixed-path `lstat` and effective-user execute access replace the eight stat
+calls, with no symlink target following for the final path component, content
+read, checksum, MIME or attributes. A changed stat identity produces UNKNOWN.
+The local Debian engineering oracle compares all five fields and eight
+projected rows against the native minimal setup/stat tasks. Actual OL and
+other Ansible versions still require qualification.
+
+Each invocation uses the existing `run_bounded` helper with an independent
+30-second process-group budget including TERM/KILL and reap. The metadata
+child shares that single budget across all fact and stat operations. Each RPM
+stage launches only the fixed `/usr/bin/rpm -q --queryformat` (NAME, VERSION,
+RELEASE, ARCH) and one package under LC_ALL=C, with closed stdin. The nested
+RPM process remains in the bounded child's group, never starts a new session,
+and has a 27-second capture deadline and a bounded direct-child kill/wait.
+Its combined stdout/stderr limit is 16 KiB and row cap is 32; the outer
+helper independently caps the combined child output at 16 KiB. Overflow,
+timeout and cleanup failure never produce truncated successful observations.
+The exact absence, malformed/partial and other RPM result semantics in
+section 1 are preserved. No raw RPM output or diagnostic is returned.
+
+The result is `changed: false` and `receipt`, or a fixed module failure.
+`receipt` has exactly `format` (integer 1), `stage`, `reason_code` (existing
+bounded-helper enum), `rc` (outer actual process status or null),
+`cleanup_confirmed` (boolean), `payload`, and `rpm_rc` (actual inner RPM
+status or null). Metadata has null `rpm_rc`. Only `COMMAND_OK` with confirmed
+cleanup and outer rc 0 may carry a payload: `{facts_state, facts, tools}` for
+metadata or `{state, reason, rows}` for a release query. RPM absence still
+requires the exact sole not-installed diagnostic and inner rc 1; outer rc 0
+alone proves neither presence nor absence. A failed outer command has null
+payload and null inner rc. An unknown stage, foreign/invalid typed shape,
+contradiction or overflow fails closed. The serialized typed receipt is
+bounded to 16 KiB, without raw paths, stderr, credentials or host identity.
+`validate_receipt(receipt, stage)` checks this local contract; the trusted
+controller must also enforce one receipt per actual bound task and reject
+missing, duplicate, late or out-of-order receipts. No unconfirmed cleanup
+can be accepted as usable observations.
+
+P2 (not implemented here) must collect metadata first, use the existing
+normalizer and eligibility gate in sections 1-2, then dispatch each eligible
+release stage separately. It must stop further dispatch if cleanup or
+transport is uncertain and preserve NOT_ATTEMPTED for unattempted scopes.
+Do not call the release stages for non-OL, non-9, unknown/contradictory
+platforms or without positively observed rpm and timeout. No host or
+cross-stage scheduling contract is qualified by this P1 module alone.
+
+Focused tests exercise actual standalone/FQCN packaging, native metadata
+and stat equivalence, both RPM stages with fixed private surrogate
+executables, the unchanged ten-scope normalizer, typed negative receipts,
+inner and outer output caps, bounded timeout and same-group descendant
+reaping, and a lost result-consumer surrogate. The private fixture copies
+may narrow a deadline or substitute a fixed test executable; the production
+module exposes no such parameters. These are SYNTHETIC development evidence,
+not actual managed OL RPM queries, SSH transport or real transport-loss proof.
+Formal qualification and the existing #8/#17 restrictions remain in force.
