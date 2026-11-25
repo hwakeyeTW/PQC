@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certificates | Run {{ p.run_id }}</title>
+<link rel="stylesheet" href="../portal.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="masthead"><div class="wrap"><p class="brand">PQC Report Portal</p>
+<nav aria-label="Breadcrumb"><a href="../../index.html">History</a> / <a href="../index.html">{{ p.run_id }}</a> / <span aria-current="page">Certificates</span></nav></div></header>
+<main id="main" class="wrap">
+{% macro value(v) -%}{{ 'Unknown / not recorded' if v is none else v }}{%- endmacro %}
+{% macro refs(ids, table) -%}{% for ref in ids %}<a href="{{ table[ref].href }}">{{ ref }}</a>{% if not loop.last %}<br>{% endif %}{% else %}None recorded{% endfor %}{%- endmacro %}
+<section class="hero"><h1>Certificates</h1><p>Recorded certificate identities and evidence. A recorded fingerprint is not independently verified certificate content. Missing details are not evidence of absence.</p>
+<nav class="jump"><a href="hosts.html">Host list</a><a href="services.html">Services</a><a href="algorithms.html">Algorithms</a></nav>
+{% if not p.assessed %}<p id="not-assessed">Assessment not present. No verdict inferred.</p>{% endif %}
+<dl class="cards">{% for key, count in index.counts.items() %}<div class="metric"><dt>{{ key }}</dt><dd id="count-{{ key }}">{{ count }}</dd></div>{% endfor %}</dl>
+<p>Unique ID counts refer only to the saved sets. A certificate can have multiple recorded source positions and host-scoped assets. Unknown identities are not merged.</p>
+<dl class="metadata">{% for category, count in index.categories.items() %}<div><dt>{{ category }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl></section>
+<section id="coverage"><h2>Certificate collection coverage</h2><div class="scroll"><table><thead><tr><th>Host / slot</th><th>Frozen request / terminal</th><th>Actual collection records</th><th>Detail availability</th></tr></thead><tbody>
+{% for r in p.coverage if r.slot in ('system_certs', 'nginx_certs') %}<tr><th><a href="{{ p.hosts[r.host_id].href }}">{{ value(p.hosts[r.host_id].target_id) }}</a><br>{{ r.slot }}<br>{{ p.hosts[r.host_id].host_state }}</th><td>Requested: {{ value(r.requested) }}<br>{{ r.state }} / {{ r.reason_code }}<br>Basis: {{ r.basis }}; rc: {{ value(r.rc) }}</td><td>{{ r.slot_state }}{% for c in r.collection_states %}<br>{{ c.collection_id }} / {{ c.state }} / {{ c.reason_code }}{% endfor %}</td><td>{{ r.detail_slot_state }}</td></tr>{% endfor %}
+</tbody></table></div><p>DETAIL_NOT_RETAINED: certificate dates, complete source locations, target identities and other companion metadata are not available in the current Store. Generic fixture diagnostics are not a certificate companion.</p></section>
+{% for g in index.groups %}<section id="{{ g.id }}">
+<h2>{{ g.kind }} &mdash; {{ value(g.fingerprint) }}</h2><p>Group ID: {{ g.id }}. Source: {{ g.source_kind }}.{% if g.source_kind == 'SYNTHETIC' %} Synthetic engineering evidence only; no native qualification.{% endif %}</p>
+<dl class="metadata"><div><dt>Not before</dt><dd>{{ value(g.not_before) }}</dd></div><div><dt>Not after</dt><dd>{{ value(g.not_after) }}</dd></div><div><dt>Validity</dt><dd>{{ g.validity_state }} / {{ g.detail_state }}</dd></div><div><dt>Issuer</dt><dd>{{ value(g.issuer) }}</dd></div><div><dt>Subject</dt><dd>{{ value(g.subject) }}</dd></div><div><dt>Public key bits</dt><dd>{{ value(g.public_key_bits) }} / {{ g.public_key_bits_state }}<br>{{ refs(g.public_key_bits_evidence_ids, p.evidence) }}</dd></div>{% for key, count in g.counts.items() %}<div><dt>{{ key }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl>
+<h3>Recorded hosts and assets</h3><ul>{% for hid in g.host_ids %}<li><a href="{{ p.hosts[hid].href }}">{{ value(p.hosts[hid].target_id) }} ({{ hid }})</a></li>{% endfor %}</ul><p>{{ refs(g.asset_ids, p.assets) }}</p>
+<h3>Public key and signature (separate recorded roles)</h3><dl class="metadata">{% for label, role in [('Public key', g.public_key), ('Signature', g.signature)] %}<div><dt>{{ label }}</dt><dd>{{ role.state }}{% for eid in role.evidence_ids %}{% set r = p.evidence[eid] %}<br>{{ value(r.algorithm.observed_name) }} / {{ value(r.algorithm.algorithm_id) }} / {{ r.algorithm.primitive }} / {{ r.algorithm.family }}: <a href="{{ r.href }}">{{ eid }}</a>{% endfor %}</dd></div>{% endfor %}</dl>
+<h3>Recorded source positions</h3><div class="scroll"><table><thead><tr><th>Recorded source / block</th><th>Host / asset</th><th>Provenance and evidence</th></tr></thead><tbody>
+{% for oid in g.recorded_occurrence_ids %}{% set r = p.occurrences[oid] %}<tr id="{{ oid }}"><th>{{ r.root }}<br>{{ r.source_id }} / block {{ r.block_index }}<br>{{ r.reason_code }}</th><td><a href="{{ p.hosts[r.host_id].href }}">{{ r.host_id }}</a><br><a href="{{ p.assets[r.asset_id].href }}">{{ r.asset_id }}</a><br>Path / vhost / target: Unknown</td><td>{{ r.detail_ref }}<br>Stored observed time: {{ value(r.observed_at) }}<br>{{ r.source.source_kind }} / {{ r.source.producer_id }} / {{ value(r.source.producer_version) }}<br>{{ refs(r.evidence_ids, p.evidence) }}</td></tr>{% else %}<tr><td colspan="3">Unknown / no recorded source positions. Zero retained positions is not zero actual uses.</td></tr>{% endfor %}</tbody></table></div>
+<h3>Independent evidence levels</h3><div class="scroll"><table><thead><tr><th>Level</th><th>Typed observations (not verdicts)</th><th>Saved claims</th></tr></thead><tbody>
+{% for level, data in g.levels.items() %}<tr><th>{{ level }} {{ data.label }}</th><td>{% for state, ids in data.observations.items() %}{{ state }} ({{ data.observation_counts[state] }}): {{ refs(ids, p.evidence) }}<br>{% else %}Unknown / no typed observation{% endfor %}</td><td>{% for state, ids in data.claims.items() %}{{ state }} ({{ data.claim_counts[state] }}): {{ refs(ids, p.claims) }}<br>{% else %}Unknown / no saved claim{% endfor %}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Evidence and provenance</h3><div class="scroll"><table><thead><tr><th>Evidence</th><th>Stored source and context</th><th>Recorded facts</th></tr></thead><tbody>
+{% for eid in g.evidence_ids %}{% set r = p.evidence[eid] %}<tr><th><a href="{{ r.href }}">{{ eid }}</a><br>{{ r.evidence_kind }}</th><td>{{ r.collector_id }} / {{ r.scope_key }}<br>{{ r.collection_state }} / {{ r.reason_code }}<br>{{ r.source.source_kind }} / {{ r.source.producer_id }} / {{ value(r.source.producer_version) }}<br>Observed: {{ value(r.observed_at) }}<br>Collection: {{ r.collection_id }}</td><td>{% if r.algorithm %}{{ value(r.algorithm.observed_name) }} / {{ value(r.algorithm.algorithm_id) }}<br>{% endif %}{% for k, v in r.facts.items() %}{{ k }}: {{ value(v) }}<br>{% endfor %}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Algorithm pivots (shared evidence only)</h3><ul>{% for link in g.algorithm_links %}<li><a href="{{ link.href }}">{{ link.group_id }}</a> via {{ refs(link.evidence_ids, p.evidence) }}</li>{% else %}<li>Unknown / no explicit relationship recorded.</li>{% endfor %}</ul>
+<h3>Service binding</h3><p>{{ g.service_binding_state }} / no explicit certificate-service binding recorded. Shared hosts, ports or algorithms do not establish a binding.</p>
+</section>{% else %}<p class="empty">No indexed certificate records. This is not a negative verdict.</p>{% endfor %}
+</main>
+<footer class="wrap footer">Private offline report. Index preview contract; publication and host backlinks are integrated separately.</footer>
+</body>
+</html>

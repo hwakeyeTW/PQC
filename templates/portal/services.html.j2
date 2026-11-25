@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Services | Run {{ p.run_id }}</title>
+<link rel="stylesheet" href="../portal.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="masthead"><div class="wrap"><p class="brand">PQC Report Portal</p>
+<nav aria-label="Breadcrumb"><a href="../../index.html">History</a> / <a href="../index.html">{{ p.run_id }}</a> / <span aria-current="page">Services</span></nav></div></header>
+<main id="main" class="wrap">
+{% macro value(v) -%}{{ 'Unknown / not recorded' if v is none else v }}{%- endmacro %}
+{% macro refs(ids, table) -%}{% for ref in ids %}<a href="{{ table[ref].href }}">{{ ref }}</a>{% if not loop.last %}<br>{% endif %}{% else %}None recorded{% endfor %}{%- endmacro %}
+<section class="hero"><h1>Services</h1><p>Only recorded service assets and explicit evidence are listed. Client capability, installed packages, host keys and configuration alone do not prove service negotiation or use. Legacy TLS tokens are historical observations, not L4 or L5 proof.</p>
+<nav class="jump"><a href="hosts.html">Host list</a><a href="certificates.html">Certificates</a><a href="algorithms.html">Algorithms</a></nav>
+{% if not p.assessed %}<p id="not-assessed">Assessment not present. No verdict inferred.</p>{% endif %}
+<dl class="cards">{% for key, count in index.counts.items() %}<div class="metric"><dt>{{ key }}</dt><dd id="count-{{ key }}">{{ count }}</dd></div>{% endfor %}</dl><p>Unique ID counts cover saved records only; no indexed endpoints does not mean no services.</p>
+<dl class="metadata">{% for category, count in index.categories.items() %}<div><dt>{{ category }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl></section>
+<section id="coverage"><h2>Service collection coverage</h2><div class="scroll"><table><thead><tr><th>Host / slot</th><th>Frozen request / terminal</th><th>Actual collection records</th><th>Detail availability</th></tr></thead><tbody>
+{% for r in p.coverage if r.slot in ('sshd', 'tls_services') %}<tr><th><a href="{{ p.hosts[r.host_id].href }}">{{ value(p.hosts[r.host_id].target_id) }}</a><br>{{ r.slot }}<br>{{ p.hosts[r.host_id].host_state }}</th><td>Requested: {{ value(r.requested) }}<br>{{ r.state }} / {{ r.reason_code }}<br>Basis: {{ r.basis }}; rc: {{ value(r.rc) }}</td><td>{{ r.slot_state }}{% for c in r.collection_states %}<br>{{ c.collection_id }} / {{ c.state }} / {{ c.reason_code }}{% endfor %}</td><td>{{ r.detail_slot_state }}</td></tr>{% endfor %}
+</tbody></table></div><p>NOT_SCANNED is not a negative result. A missing slot is not a completed scan.</p></section>
+{% for g in index.groups %}<section id="{{ g.id }}"><h2>{{ g.kind }} &mdash; {{ g.endpoint_state }}</h2><p>Group ID: {{ g.id }}.</p>
+<dl class="metadata">{% for key, count in g.counts.items() %}<div><dt>{{ key }}</dt><dd>{{ count }}</dd></div>{% endfor %}<div><dt>Legacy TLS port (historical)</dt><dd>{{ value(g.legacy_port) }}</dd></div></dl>
+<h3>Recorded hosts and assets</h3><ul>{% for hid in g.host_ids %}<li><a href="{{ p.hosts[hid].href }}">{{ value(p.hosts[hid].target_id) }} ({{ hid }})</a></li>{% endfor %}</ul><p>{{ refs(g.asset_ids, p.assets) }}</p>
+<h3>Recorded endpoint contexts</h3><div class="scroll"><table><thead><tr><th>Opaque endpoint reference / protocol</th><th>Recorded conditions</th><th>Stored outcome / acquisition</th></tr></thead><tbody>
+{% for ep in g.endpoints %}<tr><th>{{ ep.endpoint_ref }} / {{ ep.protocol }}</th><td>{{ ep.context_ref }}<br>{{ ep.authorization_ref }}</td><td>{{ ep.outcome }} / {{ ep.collection_state }}<br>Typed observation: {{ value(p.evidence[ep.evidence_id].observation_state) }}<br>{{ refs([ep.evidence_id], p.evidence) }}</td></tr>{% else %}<tr><td colspan="3">Unknown / no typed endpoint context retained.</td></tr>{% endfor %}</tbody></table></div>
+<h3>Historical TLS observations</h3><ul>{% for eid in g.legacy_evidence_ids %}{% set r = p.evidence[eid] %}<li>{{ r.facts.field }}: {{ value(r.facts.value) }} / <a href="{{ r.href }}">{{ eid }}</a> (historical only)</li>{% else %}<li>None recorded.</li>{% endfor %}</ul>
+<h3>Independent evidence levels</h3><div class="scroll"><table><thead><tr><th>Level</th><th>Typed observations (not verdicts)</th><th>Saved claims</th></tr></thead><tbody>
+{% for level, data in g.levels.items() %}<tr><th>{{ level }} {{ data.label }}</th><td>{% for state, ids in data.observations.items() %}{{ state }} ({{ data.observation_counts[state] }}): {{ refs(ids, p.evidence) }}<br>{% else %}Unknown / no typed observation{% endfor %}</td><td>{% for state, ids in data.claims.items() %}{{ state }} ({{ data.claim_counts[state] }}): {{ refs(ids, p.claims) }}<br>{% else %}Unknown / no saved claim{% endfor %}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Evidence and provenance</h3><div class="scroll"><table><thead><tr><th>Evidence</th><th>Stored source and context</th><th>Recorded facts</th></tr></thead><tbody>
+{% for eid in g.evidence_ids %}{% set r = p.evidence[eid] %}<tr><th><a href="{{ r.href }}">{{ eid }}</a><br>{{ r.evidence_kind }}</th><td>{{ r.collector_id }} / {{ r.scope_key }}<br>{{ r.collection_state }} / {{ r.reason_code }}<br>{{ r.source.source_kind }} / {{ r.source.producer_id }} / {{ value(r.source.producer_version) }}<br>Observed: {{ value(r.observed_at) }}<br>Collection: {{ r.collection_id }}</td><td>{% if r.algorithm %}{{ value(r.algorithm.observed_name) }} / {{ value(r.algorithm.algorithm_id) }}<br>{% endif %}{% for k, v in r.facts.items() %}{{ k }}: {{ value(v) }}<br>{% endfor %}{% if r.conditions %}{% for k, v in r.conditions.items() %}{{ k }}: {{ value(v) }}<br>{% endfor %}{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Algorithm pivots (shared evidence only)</h3><ul>{% for link in g.algorithm_links %}<li><a href="{{ link.href }}">{{ link.group_id }}</a> via {{ refs(link.evidence_ids, p.evidence) }}</li>{% else %}<li>Unknown / no explicit relationship recorded.</li>{% endfor %}</ul>
+<h3>Certificate binding</h3><p>{{ g.certificate_binding_state }} / no explicit certificate-service binding recorded. No relationship inferred from a shared host, port or algorithm.</p></section>{% else %}<p class="empty">No indexed service records. This is not a negative verdict.</p>{% endfor %}
+</main>
+<footer class="wrap footer">Private offline report. Index preview contract; publication and host backlinks are integrated separately.</footer>
+</body>
+</html>
