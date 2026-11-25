@@ -22,6 +22,8 @@ _MAX_CSS = 256 * 1024
 _MAX_TOTAL_HTML = 128 * 1024 * 1024
 _MAX_RECEIPT = 256 * 1024
 _GENERATION = "portal-v2"
+_HISTORY_GENERATION = "portal-v3"
+_HISTORY_MARKER = b"<!-- PQC portal-v3 -->\n"
 _RECEIPT = "portal_receipt.json"
 _LEVELS = ('Installed', 'Supported (runtime)', 'Configured',
            'Negotiable (service)', 'Observed in use')
@@ -134,12 +136,21 @@ def _render(published):
             raw = chunk.encode('utf-8')
             run_store.require(len(raw) <= _MAX_HTML - len(out), 'PORTAL_SIZE_LIMIT')
             out.extend(raw)
+        return bytes(out), _render_css()
+    except (OSError, TemplateError, UnicodeError):
+        raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
+
+
+def _render_css():
+    # CSS is common to all three versions, so v3 verification does not need
+    # to render an unrelated legacy index (or apply its HTML limits).
+    try:
         with (_TEMPLATES / 'portal.css').open('rb') as f:
             css = f.read(_MAX_CSS + 1)
         run_store.require(0 < len(css) <= _MAX_CSS, 'PORTAL_SIZE_LIMIT')
         css.decode('utf-8')
-        return bytes(out), css
-    except (OSError, TemplateError, UnicodeError):
+        return css
+    except (OSError, UnicodeError):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
 
 
@@ -287,28 +298,38 @@ def _host_views(published, overview):
 
 
 def _render_v2(published, marker, css):
-    """Bounded buffers for the entire fixed generation, before any writes."""
+    return _render_pages(published, marker, css, history=False)
+
+
+def _render_v3(published, marker, css):
+    return _render_pages(published, marker, css, history=True)
+
+
+def _render_pages(published, marker, css, *, history):
+    """Bounded buffers for one fixed generation, before any writes."""
     try:
         env = Environment(loader=FileSystemLoader(str(_TEMPLATES)), autoescape=True,
                           undefined=StrictUndefined, keep_trailing_newline=True)
         v = _view(published)
         hosts, views = _host_views(published, v)
         remaining = _MAX_TOTAL_HTML
-        def page(template, **context):
+        def page(template, *, prefix=b'', **context):
             nonlocal remaining
-            out = bytearray()
             limit = min(_MAX_HTML, remaining)
-            for chunk in env.get_template(template).generate(v=v, portal_v2=True, **context):
+            run_store.require(len(prefix) <= limit, 'PORTAL_SIZE_LIMIT')
+            out = bytearray(prefix)
+            for chunk in env.get_template(template).generate(
+                    v=v, portal_v2=True, portal_v3=history, **context):
                 raw = chunk.encode('utf-8')
                 run_store.require(len(raw) <= limit - len(out), 'PORTAL_SIZE_LIMIT')
                 out.extend(raw)
             remaining -= len(out)
             return bytes(out)
-        index = page('run_index.html.j2')
+        index = page('run_index.html.j2', prefix=_HISTORY_MARKER if history else b'')
         pages = {'hosts.html': page('hosts.html.j2', nested=True, hosts=hosts)}
         for host in views:
             pages[host['host_id'] + '.html'] = page('host.html.j2', nested=True, host=host)
-        receipt = run_store._json_bytes({'format': 2, 'run_id': v['run']['run_id'],
+        receipt = run_store._json_bytes({'format': 3 if history else 2, 'run_id': v['run']['run_id'],
             'manifest_sha256': _digest(marker), 'index_sha256': _digest(index), 'css_sha256': _digest(css),
             'pages': [{'name': name, 'size': len(raw), 'sha256': _digest(raw)}
                       for name, raw in sorted(pages.items())]}, _MAX_RECEIPT)
@@ -326,9 +347,11 @@ def _index_stat(fd, device):
     return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
 
 
-def _replace_v1_index(fd, device, old, new, signature):
-    """Only the already-proven #19 stable derived index can be replaced."""
+def _replace_v1_index(fd, device, old, new, signature, *, recheck=None):
+    """Replace only the proven v1/v2 stable index, never an arbitrary file."""
     def check():
+        if recheck is not None:
+            recheck()
         run_store.require(_index_stat(fd, device) == signature and
                           run_store._read(fd, 'index.html', device, _MAX_HTML) == old and
                           _index_stat(fd, device) == signature, 'PORTAL_OUTPUT_COLLISION')
@@ -369,7 +392,10 @@ def _generation(fd, device, pages, receipt, *, complete):
     return present
 
 
-def _publish_portal(fd, device, old, index, css, pages, receipt, refresh):
+def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
+                    generation=_GENERATION, recheck=None, previous=None):
+    run_store.require(generation in (_GENERATION, _HISTORY_GENERATION),
+                      'PORTAL_OUTPUT_COLLISION')
     # Preflight the entire fixed output set before creating anything. Receipt
     # bytes are compared with our deterministic expected value, not parsed as
     # an authority for opening paths.
@@ -387,11 +413,15 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh):
         run_store.require(_index_stat(fd, device) == signature, 'ARTIFACT_CHANGED')
         run_store.require(current == index or (refresh and current == old), 'PORTAL_OUTPUT_COLLISION')
     complete = current == index
+    if previous is not None:
+        previous()
+    if recheck is not None:
+        recheck()
     gen = None
     try:
         present = set()
-        if run_store._exists(fd, _GENERATION):
-            gen = run_store._open_dir(fd, _GENERATION, device)
+        if run_store._exists(fd, generation):
+            gen = run_store._open_dir(fd, generation, device)
             present = _generation(gen, device, pages, receipt, complete=complete)
         else:
             run_store.require(not complete, 'PORTAL_GENERATION_INCOMPLETE')
@@ -399,11 +429,17 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh):
             # Re-confirm directory durability on retry, without rewriting files.
             run_store._sync(gen)
             run_store._sync(fd)
+            run_store.require(_entry_identity(fd, generation) == _identity(gen) and
+                              _current_index(fd, device) == (current, signature) and
+                              run_store._read(fd, 'portal.css', device, _MAX_CSS) == css,
+                              'ARTIFACT_CHANGED')
+            if recheck is not None:
+                recheck()
             return
         if not css_exists:
             run_store._write(fd, 'portal.css', css, device)
         if gen is None:
-            gen = run_store._mkdir(fd, _GENERATION, device)
+            gen = run_store._mkdir(fd, generation, device)
         for name, content in sorted(pages.items()):
             if name not in present:
                 run_store._write(gen, name, content, device)
@@ -415,16 +451,30 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh):
         _generation(gen, device, pages, receipt, complete=True)
         run_store._sync(gen)
         # Ensure the generation is still the directory pinned above.
-        check = run_store._open_dir(fd, _GENERATION, device)
+        check = run_store._open_dir(fd, generation, device)
         try:
             run_store.require(_identity(check) == _identity(gen), 'ARTIFACT_CHANGED')
         finally:
             os.close(check)
         run_store.require(run_store._read(fd, 'portal.css', device, _MAX_CSS) == css,
                           'PORTAL_OUTPUT_COLLISION')
+        def before_index():
+            if previous is not None:
+                previous()
+            if recheck is not None:
+                recheck()
+            run_store.require(run_store._read(fd, 'portal.css', device, _MAX_CSS) == css,
+                              'PORTAL_OUTPUT_COLLISION')
+            # Recheck the sealed generation's identity at the stable switch.
+            check = run_store._open_dir(fd, generation, device)
+            try:
+                run_store.require(_identity(check) == _identity(gen), 'ARTIFACT_CHANGED')
+            finally:
+                os.close(check)
         if index_exists:
-            _replace_v1_index(fd, device, old, index, signature)
+            _replace_v1_index(fd, device, old, index, signature, recheck=before_index)
         else:
+            before_index()
             run_store._write(fd, 'index.html', index, device)
     finally:
         if gen is not None:
@@ -436,39 +486,127 @@ def _identity(fd):
     return s.st_dev, s.st_ino
 
 
-@run_store._public
-def render_run(report_root, run_id, *, refresh_portal=False):
-    """Render the fixed v2 generation in a private published run.
+def _current_index(fd, device):
+    if not run_store._exists(fd, 'index.html'):
+        return None
+    signature = _index_stat(fd, device)
+    raw = run_store._read(fd, 'index.html', device, _MAX_HTML)
+    run_store.require(_index_stat(fd, device) == signature, 'ARTIFACT_CHANGED')
+    return raw, signature
 
-    Default no-replace; explicit refresh allows only an exact v1 index.
-    Run Store remains a package-private peer.
+
+def _entry_identity(fd, name):
+    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    return st.st_dev, st.st_ino
+
+
+def _render_in_store(report_root, store, run_id, refresh, history, *, catalog_check=None):
+    """One run-only attempt, or a fresh attempt under a pinned catalog lock.
+
+    False requests the catalog-first path. It is returned only before any
+    publication work and after the run lock is released by the context.
     """
-    run_store.require(type(refresh_portal) is bool, 'INVALID_REFRESH_FLAG')
-    with run_store.RunStore(report_root) as store:
-        device = store._device
-        # Capture the original directory identity and canonical marker under a
-        # shared lock. Never attempt a shared-to-exclusive lock upgrade.
-        with store._locked_run(run_id, shared=True) as (fd, _):
-            identity = _identity(fd)
-            run_store.require(run_store._exists(fd, 'run_manifest.json'), 'INCOMPLETE_RUN')
-            marker = run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
-            journal_raw = run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST)
-        published = store.open(run_id)
-        run_store.require(marker == run_store._json_bytes(published.manifest), 'ARTIFACT_CHANGED')
+    device = store._device
+    with store._locked_run(run_id, shared=True) as (fd, lock):
+        current = _current_index(fd, device)
+        existing_v3 = current is not None and current[0].startswith(_HISTORY_MARKER)
+        if history and not existing_v3 and catalog_check is None:
+            return False
+        identity, lock_identity = _identity(fd), _identity(lock)
+        run_store.require(run_store._exists(fd, 'run_manifest.json'), 'INCOMPLETE_RUN')
+        marker = run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
+        journal_raw = run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST)
+    published = store.open(run_id)
+    run_store.require(marker == run_store._json_bytes(published.manifest), 'ARTIFACT_CHANGED')
+    old = None
+    previous_v2 = None
+    if existing_v3:
+        # No downgrade, and no dependency on current root catalog state.
+        css = _render_css()
+        index, pages, receipt = _render_v3(published, marker, css)
+        run_store.require(current[0] == index, 'PORTAL_OUTPUT_COLLISION')
+        generation = _HISTORY_GENERATION
+    elif history:
+        generation = _HISTORY_GENERATION
+        css = _render_css()
+        if current is not None:
+            run_store.require(refresh, 'PORTAL_OUTPUT_COLLISION')
+            old, css = _render(published)
+            if current[0] != old:
+                old, old_pages, old_receipt = _render_v2(published, marker, css)
+                run_store.require(current[0] == old, 'PORTAL_OUTPUT_COLLISION')
+                previous_v2 = old_pages, old_receipt
+        index, pages, receipt = _render_v3(published, marker, css)
+    else:
+        generation = _GENERATION
         old, css = _render(published)
         index, pages, receipt = _render_v2(published, marker, css)
-        with store._locked_run(run_id, shared=False) as (fd, _):
-            run_store.require(_identity(fd) == identity, 'ARTIFACT_CHANGED')
-            run_store.require(run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
-                              == marker, 'ARTIFACT_CHANGED')
-            run_store.require(run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST)
-                              == journal_raw, 'ARTIFACT_CHANGED')
-            journal = run_store._journal(run_store._unseal(journal_raw, run_store.MAX_MANIFEST), run_id)
-            # Recheck frozen scope and all indexed bytes against the already
-            # validated publication, without independently evaluating claims.
-            run_store._read_publication(fd, device, published.manifest, run_id,
-                                        frozen_scope=journal['scope'], verified=published)
-            _publish_portal(fd, device, old, index, css, pages, receipt, refresh_portal)
+    with store._locked_run(run_id, shared=False) as (fd, lock):
+        def recheck():
+            store._check()
+            root = run_store._root(report_root)
+            try:
+                run_store.require(_identity(root) == _identity(store._fd), 'ARTIFACT_CHANGED')
+            finally:
+                os.close(root)
+            run_store._check_dir(fd, device)
+            run_store._stat_file(lock, device)
+            run_store.require(_identity(fd) == identity == _entry_identity(store._fd, run_id) and
+                              _identity(lock) == lock_identity == _entry_identity(fd, '.writer.lock'),
+                              'ARTIFACT_CHANGED')
+            if catalog_check is not None:
+                catalog_check()
+        recheck()
+        run_store.require(_current_index(fd, device) == current, 'ARTIFACT_CHANGED')
+        run_store.require(run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
+                          == marker, 'ARTIFACT_CHANGED')
+        run_store.require(run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST)
+                          == journal_raw, 'ARTIFACT_CHANGED')
+        journal = run_store._journal(run_store._unseal(journal_raw, run_store.MAX_MANIFEST), run_id)
+        # Recheck the frozen scope and all indexed bytes with the same actual
+        # Store authority, not a second assessment or a raw marker trust path.
+        run_store._read_publication(fd, device, published.manifest, run_id,
+                                    frozen_scope=journal['scope'], verified=published)
+        previous = None
+        if previous_v2 is not None:
+            old_identity = None
+            def previous():
+                nonlocal old_identity
+                with run_store._directory(fd, (_GENERATION,), device) as gen:
+                    actual = _identity(gen)
+                    run_store.require(old_identity is None or actual == old_identity,
+                                      'ARTIFACT_CHANGED')
+                    _generation(gen, device, *previous_v2, complete=True)
+                    run_store.require(_entry_identity(fd, _GENERATION) == actual,
+                                      'ARTIFACT_CHANGED')
+                    old_identity = actual
+        _publish_portal(fd, device, old, index, css, pages, receipt, refresh,
+                        generation=generation, recheck=recheck, previous=previous)
+    return True
+
+
+@run_store._public
+def render_run(report_root, run_id, *, refresh_portal=False, with_history=False):
+    """Default v2; explicit v3 requires a coherent, shared-locked catalog.
+
+    Existing exact v3 output is validated without the catalog and never
+    downgraded. An explicit v1/v2 refresh may replace only the stable index.
+    """
+    run_store.require(type(refresh_portal) is bool, 'INVALID_REFRESH_FLAG')
+    run_store.require(type(with_history) is bool, 'INVALID_HISTORY_FLAG')
+    with run_store.RunStore(report_root) as store:
+        root_identity = _identity(store._fd)
+        done = _render_in_store(report_root, store, run_id, refresh_portal, with_history)
+    if not done:
+        # Lazy fixed import: Catalog also imports this renderer for exact proof.
+        # All run locks from the probe have been released, before taking the
+        # shared catalog lock. Use its pinned Store for the entire publication.
+        from tools import run_catalog
+        with run_catalog._history_root(report_root) as (store, check):
+            run_store.require(_identity(store._fd) == root_identity, 'ARTIFACT_CHANGED')
+            run_store.require(_render_in_store(report_root, store, run_id, refresh_portal,
+                                               with_history, catalog_check=check),
+                              'CATALOG_RECOVERY_REQUIRED')
     return Path(report_root) / run_id / 'index.html'
 
 
@@ -478,9 +616,11 @@ def main(argv=None):
     parser.add_argument('--report-root', required=True)
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--refresh-portal', action='store_true')
+    parser.add_argument('--with-history', action='store_true')
     args = parser.parse_args(argv)
     try:
-        render_run(args.report_root, args.run_id, refresh_portal=args.refresh_portal)
+        render_run(args.report_root, args.run_id, refresh_portal=args.refresh_portal,
+                   with_history=args.with_history)
     except run_store.StoreError as exc:
         print(exc.code, file=sys.stderr)
         return 1

@@ -10,7 +10,7 @@
 <a class="skip" href="#main">Skip to content</a>
 <header class="masthead">
   <div class="wrap"><p class="brand">PQC Report Portal</p>
-  <nav aria-label="Breadcrumb">Reports / {% if nested|default(false) %}<a class="pill" href="../index.html">{{ v.run.run_id }}</a> / {% if host is defined %}<a class="pill" href="hosts.html">Hosts</a> / <span aria-current="page">{{ host.host_id }}</span>{% else %}<span aria-current="page">Hosts</span>{% endif %}{% else %}<span aria-current="page">{{ v.run.run_id }}</span>{% endif %}</nav></div>
+  <nav aria-label="Breadcrumb">{% if portal_v3|default(false) %}<a class="pill" href="{% if nested|default(false) %}../../{% else %}../{% endif %}index.html">History</a> / {% else %}Reports / {% endif %}{% if nested|default(false) %}<a class="pill" href="../index.html">{{ v.run.run_id }}</a> / {% if host is defined %}<a class="pill" href="hosts.html">Hosts</a> / <span aria-current="page">{{ host.host_id }}</span>{% else %}<span aria-current="page">Hosts</span>{% endif %}{% else %}<span aria-current="page">{{ v.run.run_id }}</span>{% endif %}</nav></div>
 </header>
 <main id="main" class="wrap">
 {% block content %}{% endblock %}
