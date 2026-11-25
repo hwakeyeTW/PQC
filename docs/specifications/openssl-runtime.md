@@ -120,3 +120,44 @@ canonical mirror equality, and the unchanged validator/rules. Read-only local
 OpenSSL smoke is engineering evidence only. Actual OL9.7/9.8/9.9 RPM/provider
 behavior, production Controller Python/Ansible, load, offline deployment,
 remote cancellation and product/report integration remain #28 release QA.
+
+## I1b O1: native fixed-stage acquisition (#57)
+
+This separate internal module, `pqc_openssl_acquire` (collection FQCN
+`security.compliance_pqc_readiness.pqc_openssl_acquire`), accepts only one
+required `stage` from the seven fixed slots above. The original #15 role,
+normalizer, rules, and evidence contract remain unchanged. O1 does not select
+hosts, authorize acquisition, aggregate slots, or activate live scanning.
+A later trusted dispatcher must enforce profile/platform/scope gates and
+call without escalation and with `no_log: true`.
+
+The native module accepts check mode and always reports `changed: false`.
+Its packaged, isolated Python child runs the fixed `/usr/bin/rpm` or
+`/usr/bin/openssl` command after regular-file and executable checks. It uses
+no shell, closed stdin, fixed working directory `/`, and only PATH and C
+locale environment. The child stays in the process group owned by the
+unchanged P1 bounded helper; the outer supervisor owns termination and
+reaping. The outer stage deadline is 30 s including cleanup; the inner
+capture deadline is 27 s including its reap reserve. No active probe,
+provider override, private-key read, installation or configuration change.
+
+The native result has a `receipt` with exactly `format` (1), `stage`,
+`reason_code`, `rc`, `cleanup_confirmed`, and `payload`. `rc` is the actual
+outer child return code (or null if unavailable), not the fixed command's
+status. A confirmed `COMMAND_OK` receipt has outer rc 0 and a closed typed
+payload of exactly `state`, `reason`, `rc`, `rows` in the original #15 slot
+format, with the fixed command's actual rc or null. Other outer outcomes
+carry null payload. Missing or inconsistent receipts fail closed; cleanup
+unconfirmed, residual processes or a late completion cannot yield evidence.
+The inner 16 KiB combined raw cap, 32 RPM rows, 256 list rows and 32 aliases
+remain in force. The compact typed receipt has a separate 16 KiB cap and
+native wrapper a 32 KiB cap; typed overflow yields a fixed OUTPUT_LIMIT
+failure without truncated positive rows. The original exact named RPM
+absence, unsupported flag and malformed whole-alias-row semantics apply.
+No raw command output, paths or environment appear in the typed receipt.
+
+O1 tests use actual Ansible module packaging and local isolated children,
+including bounded command fixtures and owned-process-group negative cases.
+These are engineering checks, not evidence of managed OL9 compatibility,
+remote transport cancellation, production load or release acceptance.
+O2 integration, live enablement and formal QA are out of scope here.
