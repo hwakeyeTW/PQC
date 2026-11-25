@@ -164,9 +164,17 @@ not a claim that the scan succeeded. `PUBLISHED` and `run_state` are distinct.
 
 `store.open(run_id)` validates the marker, the exact index, fixed paths,
 permissions, actual sizes/hashes, Evidence, assessment pairing, and derived
-manifest semantics. It rejects absent/unknown/corrupt data; a directory,
-index.html, temp file, or incomplete journal is not a published run. A
-reader must not interpret a fixed error as a successful or empty run.
+manifest semantics. Under the same shared lock and pinned run directory it
+also reads the fixed `journal.json` using the existing private-file and size
+checks, verifies its seal, closed shape and run identity, and requires exact
+agreement of the reconstructed scope with the sealed frozen scope. This
+applies to all contracts, including legitimate historical null markers.
+Missing, corrupt or unsafe journals are rejected; scope disagreement is
+`FROZEN_SCOPE_MISMATCH`. A core-only copy without the journal is not a
+supported RunStore root. The seal detects corruption, not malicious rewrites
+of the entire private root by the same UID or an administrator. Reading never
+repairs or republishes data. A directory, index.html, temp file, or incomplete
+journal is not a published run; a fixed error is not a successful or empty run.
 
 ## Explicit failure recovery
 
@@ -310,8 +318,11 @@ use short flags; new historical NATIVE_SCAN fixture calls must explicitly
 select `B04_S1_CONTRACT_ONLY`. This compatibility marker is not a real scan.
 Reader and recovery retain the selected contract. A recovered run without a
 terminal batch has null batch rc/hash and BATCH_MANIFEST_UNAVAILABLE, never a
-fabricated native terminal result. Existing legacy and S1 journals remain
-readable under their original contract.
+fabricated native terminal result. Even if no host has a terminal checkpoint,
+a native recovery cannot be silently downgraded to a null marker: published
+reading binds it to the original frozen journal scope. Existing intact legacy
+and S1 runs remain readable under their original contract, including valid
+null markers. Prepared recovery retains its sealed prepare/journal checks.
 
 The trusted test orchestrator freezes the scope before execute_batch, persists
 intent before native queueing, validates separately acquired synthetic

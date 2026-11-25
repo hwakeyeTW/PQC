@@ -1129,8 +1129,12 @@ def _has_at(parent, parts, device):
         return False
 
 
-def _read_publication(fd, device, manifest, rid, stage_fd=None, verified=None):
+def _read_publication(fd, device, manifest, rid, *, frozen_scope, stage_fd=None, verified=None):
     s, attempts, entries = _manifest_header(manifest, rid)
+    # Bind even a null marker to the independent, sealed frozen scope. A
+    # native recovery with no terminal or batch cannot prove this from its
+    # core artifacts alone. Legacy/S1 scopes legitimately omit the marker.
+    require(_same(s, frozen_scope), 'FROZEN_SCOPE_MISMATCH')
     payloads = {}
     for key, entry in entries.items():
         parts, _ = _slot(*key)
@@ -1298,7 +1302,10 @@ class RunStore:
                 raw = _read(fd, 'run_manifest.json', self._device, MAX_MANIFEST)
                 manifest = _loads(raw)
                 require(raw == _json_bytes(manifest), 'NONCANONICAL_MANIFEST')
-                return _read_publication(fd, self._device, manifest, run_id)
+                journal = _journal(_unseal(_read(fd, 'journal.json', self._device, MAX_MANIFEST),
+                                           MAX_MANIFEST), run_id)
+                return _read_publication(fd, self._device, manifest, run_id,
+                                         frozen_scope=journal['scope'])
             except FileNotFoundError:
                 raise StoreError('MISSING_ARTIFACT') from None
 
@@ -1593,7 +1600,8 @@ class RunWriter:
             manifest = prepared['manifest']; s, _, entries = _manifest_header(manifest, self.run_id)
             require(_same(s, self._j['scope']), 'FROZEN_SCOPE_MISMATCH')
             with _directory(self._fd, (prepared['stage'],), self._device) as stage:
-                result = _read_publication(self._fd, self._device, manifest, self.run_id, stage, verified=verified)
+                result = _read_publication(self._fd, self._device, manifest, self.run_id,
+                                           frozen_scope=self._j['scope'], stage_fd=stage, verified=verified)
                 if verified is None:
                     # A recovered plan must still agree with the sealed journal
                     # and all terminal checkpoints. No guess from final files.
@@ -1610,7 +1618,8 @@ class RunWriter:
                 # Re-read all final bytes, including an exact index check, before
                 # publishing the single no-replace marker. A crash before this
                 # point leaves no published run, but a resumable prepared plan.
-                result = _read_publication(self._fd, self._device, manifest, self.run_id, verified=result)
+                result = _read_publication(self._fd, self._device, manifest, self.run_id,
+                                           frozen_scope=self._j['scope'], verified=result)
                 _write(self._fd, 'run_manifest.json', _json_bytes(manifest), self._device)
                 return result
         except FileNotFoundError:
