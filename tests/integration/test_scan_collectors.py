@@ -678,3 +678,142 @@ def test_v2_connection_failure_receipt_is_provisional(fixture,monkeypatch):
     assert rc==6 and row['host_state']=='ERROR' and row['platform']['state']=='ERROR'
     assert all(c['state']=='ERROR' for c in row['collectors'] if c['requested'])
     assert not b['document']['collections'] and not trap.exists()
+
+
+def test_v2_earliest_worker_deadline_interrupts_native_receipt_normalization(fixture, monkeypatch):
+    """Both workers run; B's verified receipt must not buy A a fresh guard."""
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.PACKAGES))
+    a,b,unstarted=names
+    register(monkeypatch,trace)
+    monkeypatch.setattr(batch,'_WORKER_GRACE',3)
+    a_started=trace.parent/'a-started'
+    b_verified=trace.parent/'b-verified'
+    b_sent=trace.parent/'b-sent'
+    marks={}; waves=[]; owned=[]; handoffs=[]
+
+    def wait_for(path):
+        end=time.monotonic()+10
+        while not path.exists():
+            if time.monotonic()>=end:
+                raise RuntimeError('synthetic synchronization timeout')
+            time.sleep(.01)
+
+    collect=batch._ProducerSession.collect
+    def collect_sync(self,name,flags,registry):
+        if name==a:
+            a_started.write_text(str(os.getpid()))
+        receipt=collect(self,name,flags,registry)
+        if name==a:
+            wait_for(b_verified)
+        return receipt
+    monkeypatch.setattr(batch._ProducerSession,'collect',collect_sync)
+
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator); send=q.send_task_result
+        def send_sync(result):
+            if result.as_wire_task_result().host_name==b:
+                wait_for(a_started)
+                b_sent.write_text(str(os.getpid()))
+                send(result)
+                # Keep this actual WorkerProcess alive after its synchronous
+                # receipt. No helper is still running; bounded test-only wait.
+                time.sleep(15)
+            else:
+                send(result)
+        q.send_task_result=send_sync
+        return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+
+    track=batch._WorkerWave.track
+    def track_earlier(self,name,worker,task_uuid,end):
+        now=time.monotonic()
+        if name==b:
+            end=min(end,now+8)
+        track(self,name,worker,task_uuid,end)
+        waves.append(self)
+        owned.append((name,worker,worker.pid))
+        marks[name]={'pid':worker.pid,'tracked':now,'end':end}
+    monkeypatch.setattr(batch._WorkerWave,'track',track_earlier)
+
+    accept=batch._ProducerLedger.accept
+    def accept_sync(self,message):
+        accept(self,message)
+        if message['target_id']==b:
+            assert b in self.projections and b in self.rows
+            marks['b_verified']=time.monotonic()
+            b_verified.write_text('verified')
+    monkeypatch.setattr(batch._ProducerLedger,'accept',accept_sync)
+
+    initialize=bridge.Handoff.__init__
+    def record_handoff(self,*args,**kwargs):
+        initialize(self,*args,**kwargs)
+        handoffs.append((Path(self.path),[self.dirfd,*[slot[1] for slot in self.slots.values()]]))
+    monkeypatch.setattr(bridge.Handoff,'__init__',record_handoff)
+
+    normalize=bridge._normalize
+    def slow_normalize(doc,host,producer,*args):
+        result=normalize(doc,host,producer,*args)
+        if producer==bridge.PLATFORM and host['host_id']==bridge.host_record(doc['run']['run_id'],a)['host_id']:
+            wave=waves[-1]
+            assert set(wave.workers)=={a,b} and b in wave.ledger.projections
+            assert wave.workers[b].is_alive() and b not in wave.confirmed
+            assert int(a_started.read_text())==wave.workers[a].pid
+            assert int(b_sent.read_text())==wave.workers[b].pid
+            earliest=wave.limit(); now=time.monotonic()
+            assert earliest==min(wave.ends[b],wave.grace.get(b,wave.ends[b]))<wave.ends[a]
+            assert .15<earliest-now<=8
+            marks.update(normalize_entered=now,earliest=earliest,alarm=signal.getitimer(signal.ITIMER_REAL)[0])
+            try:
+                # A real platform normalization has run inside the actual
+                # typed handoff normalization, but the host projection is not
+                # yet validated/committed. Cross B's existing deadline.
+                time.sleep(earliest-now+1.2)
+            except batch._Deadline:
+                marks['deadline_trigger']=time.monotonic()
+                raise
+            marks['slow_returned']=time.monotonic()
+        return result
+    monkeypatch.setattr(bridge,'_normalize',slow_normalize)
+
+    stop=batch._stop_workers
+    def observe_stop(workers):
+        if any(w is not None and w.pid is not None for w in workers):
+            marks.setdefault('stop_entered',time.monotonic())
+        quiet=stop(workers)
+        if 'stop_entered' in marks:
+            marks.setdefault('stop_finished',time.monotonic())
+        return quiet
+    monkeypatch.setattr(batch,'_stop_workers',observe_stop)
+    launches=_observe_native_queue(monkeypatch)
+    signals=_signal_state()
+    rc,m,bundle=checked(ctx)
+    marks['batch_finished']=time.monotonic()
+    print('I1A_EARLIEST_WORKER_DEADLINE',json.dumps(marks,sort_keys=True))
+    assert 'normalize_entered' in marks and 'deadline_trigger' in marks and 'slow_returned' not in marks
+    assert marks['b_verified']<=marks['normalize_entered']<marks['earliest']
+    assert 0<marks['alarm']<=marks['earliest']-marks['normalize_entered']+.1
+    assert marks['earliest']-.1<=marks['deadline_trigger']<=marks['earliest']+.7
+    assert marks['deadline_trigger']<=marks['stop_entered']<=marks['earliest']+.9
+    assert marks['stop_finished']-marks['stop_entered']<=batch._WORKER_GRACE+.7
+    assert rc==6 and m['reason_code']=='CONTROLLER_TIMEOUT'
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert [r['reason_code'] for r in m['hosts'][:2]]==['CONTROLLER_TIMEOUT']*2
+    assert [n for n,_ in launches]==[a,b] and [(n,pid) for n,_,pid in owned]==launches
+    assert not list(trace.parent.glob(unstarted+'.*')) and not trap.exists()
+    assert set(bundle['handoff_metrics'])==set(bundle['companions'])=={b}
+    refs=[cid for row in [m['hosts'][1]['platform'],*m['hosts'][1]['collectors']]
+          for cid in row['collection_ids']]
+    assert len(refs)==17 and set(refs)=={c['collection_id'] for c in bundle['document']['collections']}
+    assert not any(c['collection_ids'] or c['state']=='COLLECTED'
+                   for c in [m['hosts'][0]['platform'],*m['hosts'][0]['collectors']])
+    assert all(worker._closed and not Path('/proc',str(pid)).exists() and not batch._scope.group_exists(pid)
+               for _,worker,pid in owned)
+    assert len(handoffs)==1
+    for path,fds in handoffs:
+        assert not path.exists()
+        for fd in fds:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    assert _signal_state()==signals

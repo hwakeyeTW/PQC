@@ -1092,11 +1092,13 @@ def _queue_strategy(tqm):
     return FixedQueue(tqm)
 
 
-def _drain(queue, ledger):
+def _drain(queue, ledger, after_accept=None):
     while queue._reader.poll(0):
         raw = queue.get()
         require(type(raw) is bytes and len(raw) <= _QUEUE_BYTES, 3, 'INVALID_NATIVE_RESULT')
         ledger.accept(_scope.strict_json(raw))
+        if after_accept is not None:
+            after_accept()
 
 
 def _stop_workers(workers):
@@ -1172,8 +1174,14 @@ class _WorkerWave:
         self.faults.setdefault(name, reason)
         self.ledger.fail(reason)
 
-    def poll(self):
+    def _drain_receipts(self):
         _drain(self.queue, self.ledger)
+
+    def _grace_changed(self):
+        pass
+
+    def poll(self):
+        self._drain_receipts()
         for n, worker in self.workers.items():
             if n in self.confirmed or n in self.faults:
                 continue
@@ -1181,7 +1189,7 @@ class _WorkerWave:
             if not worker.is_alive():
                 # SimpleQueue sends synchronously. Drain again after exit so
                 # a last legitimate callback is not mistaken for a lost one.
-                _drain(self.queue, self.ledger)
+                self._drain_receipts()
                 _scope.reap_group(worker.pid)
                 if n not in self.ledger.rows:
                     self.fail(n, 'OUTCOME_UNKNOWN')
@@ -1195,6 +1203,7 @@ class _WorkerWave:
                 now = time.monotonic()
                 if n in self.ledger.rows:
                     self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
+                    self._grace_changed()
                 if now >= min(self.ends[n], self.grace.get(n, self.ends[n])):
                     self.fail(n, 'CONTROLLER_TIMEOUT')
 
@@ -1224,6 +1233,67 @@ class _WorkerWave:
         return quiet
 
 
+class _ProducerWorkerWave(_WorkerWave):
+    """V2 receipt work shares the scheduler's existing deadline."""
+    def __init__(self, ledger, queue, phase):
+        super().__init__(ledger, queue)
+        self.phase = phase
+
+    def _drain_receipts(self):
+        # Includes queue read, receipt validation and actual normalization.
+        # An exit drain may follow a newly established shorter grace.
+        with self.phase():
+            _drain(self.queue, self.ledger, self._receipt_accepted)
+
+    def _receipt_accepted(self):
+        # Establish grace before another queued receipt can start expensive
+        # projection work, not only after the complete queue drain.
+        now = time.monotonic()
+        for n, worker in self.workers.items():
+            if n not in self.confirmed and n not in self.faults and n in self.ledger.rows and worker.is_alive():
+                self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
+        self._grace_changed()
+
+    def _grace_changed(self):
+        with self.phase():
+            pass
+
+    def poll(self):
+        with self.phase():
+            super().poll()
+
+    def finish(self, workers):
+        # A timeout/cancellation/fatal stop is not permission for another
+        # normalization. Even a normal final poll must use the original limit.
+        try:
+            if self.ledger.stop is None:
+                self.poll()
+        except _Cancelled:
+            self.ledger.fail('INTERRUPTED')
+        except _Deadline:
+            self.ledger.fail('CONTROLLER_TIMEOUT')
+        except (Exception, SystemExit):
+            self.ledger.fail('INVALID_NATIVE_RESULT')
+        finally:
+            # The phase has unwound. This is the separate bounded termination
+            # budget, not a new worker/receipt deadline. Do not consume late
+            # receipts after forced termination; retain already validated rows.
+            try:
+                quiet = _stop_workers(workers)
+            except (Exception, SystemExit):
+                quiet = False
+        if not quiet:
+            self.ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+        for n in self.workers:
+            if not quiet or n not in self.confirmed:
+                stopped = self.ledger.stop
+                reason = ('CONTROLLER_CLEANUP_UNCONFIRMED' if not quiet else
+                          self.faults.get(n, stopped if stopped in ('CONTROLLER_TIMEOUT', 'INTERRUPTED')
+                                          else 'CONTROLLER_WORKER_FAILED'))
+                self.ledger.worker_failed(n, reason)
+        return quiet
+
+
 def execute_batch(ctx):
     """One private native batch invocation -> (rc, closed terminal manifest).
 
@@ -1249,6 +1319,7 @@ def _execute_batch(ctx, producer_session=None):
     started = time.monotonic()
     deadline = started + _GUARD_SECONDS
     interrupted = phase_active = fork_critical = False
+    active_phase_end = None
     controller_pid = os.getpid()
     handlers = {}
     if producer_session is not None:
@@ -1271,21 +1342,43 @@ def _execute_batch(ctx, producer_session=None):
 
     @contextlib.contextmanager
     def phase():
-        nonlocal phase_active
+        nonlocal phase_active, active_phase_end
         end = min(deadline, time.monotonic() + _GUARD_SECONDS,
                   wave.limit() if wave is not None else float('inf'))
-        remaining = end - time.monotonic()
         if interrupted:
             raise _Cancelled()
+        if phase_active and producer_session is not None:
+            # Polling inside the native pre-fork phase, and drain/grace checks
+            # inside a poll, borrow the outer alarm. Never restore a longer
+            # timer, renew an expired one, or install another handler.
+            end = min(end, active_phase_end)
+            remaining = end - time.monotonic()
+            timer = signal.getitimer(signal.ITIMER_REAL)[0]
+            if remaining <= 0 or timer <= 0:
+                raise _Deadline()
+            if end < active_phase_end:
+                active_phase_end = end
+                if remaining < timer:
+                    signal.setitimer(signal.ITIMER_REAL, remaining)
+            yield active_phase_end
+            if interrupted:
+                raise _Cancelled()
+            if time.monotonic() >= active_phase_end:
+                raise _Deadline()
+            return
+        remaining = end - time.monotonic()
         if remaining <= 0:
             raise _Deadline()
         with _deadline(remaining, lambda: fork_critical):
             phase_active = True
+            active_phase_end = end
             try:
                 if interrupted:
                     raise _Cancelled()
                 yield end
             finally:
+                end = active_phase_end
+                active_phase_end = None
                 phase_active = False
         if interrupted:
             raise _Cancelled()
@@ -1293,6 +1386,13 @@ def _execute_batch(ctx, producer_session=None):
             raise _Deadline()
 
     def poll():
+        if producer_session is not None:
+            if interrupted:
+                ledger.fail('INTERRUPTED')
+            if time.monotonic() >= deadline:
+                ledger.fail('CONTROLLER_TIMEOUT')
+            if ledger.stop is not None:
+                return False
         if wave is not None:
             wave.poll()
         if interrupted:
@@ -1320,7 +1420,8 @@ def _execute_batch(ctx, producer_session=None):
                     if not poll():
                         raise _Cancelled() if interrupted else Denied(3, 'INVALID_NATIVE_RESULT')
                     require(worker is tqm._workers[slot], 3, 'INVALID_NATIVE_RESULT')
-                    launch_end = min(phase_end, wave.limit())
+                    launch_end = min(phase_end, wave.limit(),
+                                     active_phase_end if producer_session is not None else phase_end)
                     remaining = launch_end - time.monotonic()
                     if remaining <= 0:
                         raise _Deadline()
@@ -1419,7 +1520,8 @@ def _execute_batch(ctx, producer_session=None):
                     with phase():
                         tqm._initialize_processes(len(selected))
                         strategy = _queue_strategy(tqm)
-                    wave = _WorkerWave(ledger, queue)
+                    wave = (_WorkerWave(ledger, queue) if producer_session is None else
+                            _ProducerWorkerWave(ledger, queue, phase))
                     try:
                         for n in selected:
                             if not poll():
@@ -1434,8 +1536,12 @@ def _execute_batch(ctx, producer_session=None):
                                     host = ctx._inventory.hosts[n]
                                     vals = ctx._variables.get_vars(play=play, host=host, task=task,
                                                                     include_hostvars=False, use_cache=False)
-                            except (Denied, _Deadline):
-                                poll()
+                            except (Denied, _Deadline) as exc:
+                                if producer_session is None:
+                                    poll()
+                                elif isinstance(exc, _Deadline) and time.monotonic() >= min(deadline, wave.limit()):
+                                    ledger.fail('CONTROLLER_TIMEOUT')
+                                    break
                                 ledger.fail('GUARD_REJECTED')
                                 break
                             if not poll():
@@ -1593,22 +1699,14 @@ class _ProducerLedger(_Ledger):
             raise Denied(3, 'INVALID_NATIVE_RESULT')
         require(n in self.started and n not in self.rows and self.started[n] == message['task_uuid']
                 and self.session.bridge.valid_receipt(receipt, n), 3, 'INVALID_NATIVE_RESULT')
-        # Receipt validation and actual normalization are bounded by the active
-        # scheduler phase, or a guard interval when polling outside a phase.
-        # Never replace an existing alarm. No callback alone proves worker exit.
-        def project():
-            envelope = self.session.handoff.read(n, receipt)
-            return self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
-                                                         self.session.started_at, self.session.rules)
+        # Only the V2 scheduler may authorize receipt work. In particular,
+        # an expired/missing alarm must not turn into a fresh guard interval.
+        if signal.getitimer(signal.ITIMER_REAL)[0] <= 0:
+            raise _Deadline()
         try:
-            if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
-                projection = project()
-            else:
-                with _deadline(_GUARD_SECONDS):
-                    projection = project()
-        except _Deadline:
-            self.fail('CONTROLLER_TIMEOUT')
-            raise Denied(3, 'CONTROLLER_TIMEOUT') from None
+            envelope = self.session.handoff.read(n, receipt)
+            projection = self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
+                                                                self.session.started_at, self.session.rules)
         except Exception:
             # Never send a raw parsing/normalizer exception or retained snapshot
             # through the queue. Known earlier valid hosts remain available.
@@ -1618,13 +1716,24 @@ class _ProducerLedger(_Ledger):
         row['platform'] = projection.outcomes[self.session.bridge.PLATFORM]
         ids = {i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']}
         require(not self.ids & ids, 3, 'INVALID_NATIVE_RESULT')
-        self.ids.update(ids)
-        self.projections[n] = projection
-        self.metrics[n] = {'typed_bytes': receipt['byte_count'],
-                           'ipc_bytes': len(json.dumps(message, separators=(',', ':'), ensure_ascii=True).encode('ascii'))}
-        self.rows[n] = row
-        if row['reason_code'] in _FATAL:
-            self.fail(row['reason_code'])
+        merged_ids = self.ids | ids
+        metrics = {'typed_bytes': receipt['byte_count'],
+                   'ipc_bytes': len(json.dumps(message, separators=(',', ':'), ensure_ascii=True).encode('ascii'))}
+        # Publish the validated observation and its terminal/metric together.
+        # Mask only these in-memory assignments, never read/normalize or stop
+        # workers. An interrupted projection must not leave partial bindings.
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGALRM, signal.SIGINT, signal.SIGTERM))
+        try:
+            if signal.getitimer(signal.ITIMER_REAL)[0] <= 0:
+                raise _Deadline()
+            self.ids = merged_ids
+            self.projections[n] = projection
+            self.metrics[n] = metrics
+            self.rows[n] = row
+            if row['reason_code'] in _FATAL:
+                self.fail(row['reason_code'])
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
     def worker_failed(self, name, reason):
         old = self.rows.get(name, {}).get('platform')
