@@ -282,3 +282,45 @@ engineering results. The real registry/transport, #8/#17 qualification,
 actual Controller and OL9.7--9.9, installed tools, SSH/ProxyJump/host-key,
 permissions, load, before/after state, remote lifetime and offline release
 QA remain NOT_TESTED under #28. Other I1b adapters and I2 remain separate.
+
+
+### I1b O2 — restricted fixed OpenSSL native bridge
+
+O2 is a private staged adapter, not a registered public collector or a live
+transport. The existing Platform staged adapter and the legacy callable
+contract remain separate. A staged OpenSSL adapter requires the same native
+worker's completed, validated Platform snapshot and independently clean
+stage lifecycle; combining staged OpenSSL with a legacy Platform callable
+is refused before connection. The numeric OL9 gate is unchanged. An
+UNKNOWN or OUT_OF_SCOPE Platform produces the original typed gap snapshot,
+with no O1 launch. Frozen flags select only the canonical indices 0–1
+(RPM packages) and/or 2–6 (version, providers, KEM, signature, TLS groups).
+No requested OpenSSL family means no OpenSSL dispatch.
+
+Every O2 stage binds the original run, target, task UUID, fixed producer,
+stage and canonical ordinal. A completion must retain the actual issued
+binding object and independent lifecycle proof. The wrapper is a closed
+32 KiB combined frame, with changed=false and exact stage invocation;
+the canonical O1 validator applies its separate 16 KiB typed limit.
+The wrapper exit status, outer supervisor receipt rc and inner slot rc
+have different meanings. Only a validated COMMAND_OK outer receipt can
+supply an inner payload. Confirmed outer TIMEOUT/OUTPUT_LIMIT/ordinary
+command failures become the original ERROR slot with null inner rc and
+empty rows. No inferred absence, truncated positive evidence, or persisted
+second rc is introduced. Valid ordinary inner gaps preserve actual inner
+rc and allow the next enabled stage. An uncertain inner reason (including
+EXECUTION_ERROR), invalid receipt, foreign/replayed binding, unconfirmed
+cleanup, guard rejection, controller timeout or interruption stops the
+producer. Confirmed cleanup with invalid acquisition is distinct from
+unconfirmed cleanup.
+
+The existing seven-slot Snapshot, precheck, normalizer, exact source,
+collection/detail references and Evidence 1.1.0 assessment are unchanged.
+Only the trusted staged session can admit the OpenSSL-specific fatal
+record extension. No partially completed seven-slot snapshot is promoted
+on fatal failure: previous finalized producer observations are retained
+when a valid host envelope is available; subsequent producers remain
+undispatched. Loss of the host's handoff cannot authenticate earlier
+in-memory snapshots. The existing 7 basic scopes, at most 256 provider
+scopes, MAX_REFS, MAX_WIRE and MAX_HOSTS remain unchanged; L1/L2
+observations do not assert L3/L4/L5. Both registries remain empty.

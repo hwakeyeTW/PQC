@@ -88,11 +88,12 @@ def _producer_adapters():
     return {}
 
 
-# I1b P2: fixed private stage bridge. Not a live transport or a public driver
+# I1b P2/O2: fixed private stage bridges. Not a live transport or a public driver
 # registry. A prepare callback may only package the bound fixed P1 stage;
 # the returned launcher must consume its one-use native launch gate before
 # dispatch. It owns independent stage completion and cleanup evidence.
 _PLATFORM_STAGES = ('metadata', *('release-rpm-' + name for name in platform.PACKAGES))
+_OPENSSL_STAGES = openssl_runtime.SLOTS
 _STAGE_FRAME_BYTES = 32 * 1024
 _STAGE_RECEIPT_BYTES = 16 * 1024
 _STAGE_RPM_FAILURES = MappingProxyType({
@@ -110,12 +111,21 @@ class _StageBinding(NamedTuple):
     ordinal: int
 
 
+class _OpenSSLStageBinding(NamedTuple):
+    run_id: str
+    target_id: str
+    task_uuid: str
+    producer_id: str
+    stage: str
+    ordinal: int
+
+
 class _StageCompletion(NamedTuple):
     # The binding is the actual controller-issued object, not fields taken
     # from remote output. clean is the trusted driver's independent lifecycle
     # receipt, never copied from an unchecked frame. started=False requires
     # proof that no stage process was launched.
-    binding: _StageBinding
+    binding: _StageBinding | _OpenSSLStageBinding
     stdout: bytes
     stderr: bytes
     wrapper_rc: int | None
@@ -147,6 +157,24 @@ def _bound_stage_validator():
     return pqc_platform_acquire.validate_receipt
 
 
+def _bound_openssl_stage_validator():
+    from ansible_collections.security.compliance_pqc_readiness.plugins.modules import pqc_openssl_acquire
+    expected = (Path(__file__).resolve().parents[1] / 'ansible_collections/security/'
+                'compliance_pqc_readiness/plugins/modules/pqc_openssl_acquire.py')
+    require(Path(pqc_openssl_acquire.__file__).resolve() == expected
+            and pqc_openssl_acquire.STAGES == _OPENSSL_STAGES
+            and pqc_openssl_acquire.OUTPUT_BYTES == _STAGE_RECEIPT_BYTES
+            and pqc_openssl_acquire.WRAPPER_BYTES == _STAGE_FRAME_BYTES,
+            'INVALID_STAGE_VALIDATOR')
+    return pqc_openssl_acquire.validate_receipt
+
+
+def _openssl_plan(flags):
+    require(all(type(flags[f]) is bool for f in (PACKAGES, SSL)))
+    return tuple((i, stage) for i, stage in enumerate(_OPENSSL_STAGES)
+                 if flags[PACKAGES if stage in openssl_runtime.PACKAGES else SSL])
+
+
 def _stage_receipt(completion, binding):
     # Do not accept a target-provided cleanup bit, a replay/foreign binding,
     # or process exit alone as an independent completion/cleanup receipt.
@@ -166,7 +194,14 @@ def _stage_receipt(completion, binding):
         shape(frame, ('changed', 'invocation', 'receipt'))
         require(frame['changed'] is False and frame['invocation'] == {
             'module_args': {'stage': binding.stage}})
-        receipt = _bound_stage_validator()(frame['receipt'], binding.stage)
+        if type(binding) is _StageBinding:
+            validator = _bound_stage_validator()
+        else:
+            require(type(binding) is _OpenSSLStageBinding and binding.producer_id == OPENSSL
+                    and type(binding.ordinal) is int and 0 <= binding.ordinal < len(_OPENSSL_STAGES)
+                    and binding.stage == _OPENSSL_STAGES[binding.ordinal])
+            validator = _bound_openssl_stage_validator()
+        receipt = validator(frame['receipt'], binding.stage)
         if not receipt['cleanup_confirmed']:
             raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED', receipt['rc'])
         return receipt
@@ -217,6 +252,47 @@ class _PlatformStageAdapter:
                 package = platform.PACKAGES[ordinal - 1]
                 validate(platform.normalize_rpm, package, value)
                 snapshot['rpms'][package] = copy.deepcopy(value)
+        return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
+
+
+class _OpenSSLStageAdapter:
+    """Fixed O1 stages; only the native session supplies its validated Platform proof."""
+    def __init__(self, prepare):
+        require(callable(prepare), 'INVALID_STAGE_DRIVER')
+        self.prepare = prepare
+
+    def collect(self, run_id, target, task_uuid, flags, platform_snapshot, invoke, validate):
+        # The session additionally requires the proof's actual staged-worker
+        # identity. A value supplied by a legacy callable cannot authorize O2.
+        require(validate(_platform_status, platform_snapshot) == 'UNVERIFIED')
+        frozen = {f: flags[f] for f in openssl_runtime.FLAGS}
+        plan = _openssl_plan(frozen)
+        require(bool(plan))
+        enabled = {stage for _, stage in plan}
+        slots = {stage: dict(state='NOT_SCANNED', reason='DISABLED_BY_USER', rc=None, rows=[])
+                 for stage in _OPENSSL_STAGES if stage not in enabled}
+        for ordinal, stage in plan:
+            binding = _OpenSSLStageBinding(run_id, target, task_uuid, OPENSSL, stage, ordinal)
+            try:
+                receipt = invoke(self.prepare, binding)
+                if receipt['reason_code'] != 'COMMAND_OK':
+                    raise _StageFailure(receipt['reason_code'], receipt['rc'], receipt['cleanup_confirmed'])
+            except _StageFailure as exc:
+                if not exc.clean or exc.reason not in _STAGE_RPM_FAILURES:
+                    return exc.value()
+                # An outer failure has no trustworthy inner command rc. A
+                # named absence is possible only in a validated inner payload.
+                value = dict(state='ERROR', reason=_STAGE_RPM_FAILURES[exc.reason], rc=None, rows=[])
+            else:
+                value = receipt['payload']
+                if _uncertain(value):
+                    # Cleanup itself was confirmed, but the acquisition is
+                    # uncertain. Discard this producer's incomplete snapshot.
+                    return _StageFailure('INVALID_ADAPTER_RESULT', receipt['rc'], True).value()
+            slots[stage] = copy.deepcopy(value)
+        snapshot = dict(flags=frozen, platform_status='UNVERIFIED',
+                        slots={stage: slots[stage] for stage in _OPENSSL_STAGES})
+        validate(openssl_runtime.validate_snapshot, snapshot)
         return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
 
 
@@ -528,8 +604,11 @@ def precheck(producer, snapshot, flags, platform_snapshot, run_id, target, obser
         raise BridgeError('INVALID_PRODUCER')
 
 
-def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False):
-    """Validate one trusted synthetic adapter return and bind its observed time."""
+def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False, staged_openssl=False):
+    """Validate one trusted adapter return and bind its observed time."""
+    require(type(staged_openssl) is bool and (not staged_openssl or producer == OPENSSL))
+    if staged_openssl and not gap:
+        require(platform_snapshot is not None and _platform_status(platform_snapshot) == 'UNVERIFIED')
     shape(value, ('reason_code', 'rc', 'cleanup_confirmed', 'snapshot'))
     now = stamp()
     reason, rc, clean, snapshot = (value[k] for k in ('reason_code', 'rc', 'cleanup_confirmed', 'snapshot'))
@@ -537,10 +616,12 @@ def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=Fal
             (rc is None or type(rc) is int and -255 <= rc <= 255))
     if reason == 'COMMAND_OK' or gap:
         require(clean and type(snapshot) is dict and (reason, rc) == (('PLATFORM_GAP', None) if gap else ('COMMAND_OK', 0)))
+        require(not staged_openssl or not _uncertain(snapshot))
         precheck(producer, snapshot, flags, platform_snapshot, run_id, target, now)
     else:
         require(reason in FAILURES and snapshot is None and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0)
-                and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED') or producer == PLATFORM)
+                and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
+                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL))
                 and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                 and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean))
     return dict(producer_id=producer, observed_at=now, **copy.deepcopy(value))
@@ -675,8 +756,13 @@ class HostProjection:
         self.special = special
 
 
-def normalize_handoff(envelope, run_id, target, flags, started_at, rules):
-    """Bind actual typed snapshots to one frozen target, in fixed producer order."""
+def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *, staged_openssl=False):
+    """Bind actual typed snapshots to one frozen target, in fixed producer order.
+
+    The optional private context comes only from the trusted staged session,
+    never the handoff itself. The legacy synthetic contract is unchanged.
+    """
+    require(type(staged_openssl) is bool)
     shape(envelope, ('handoff_version', 'run_id', 'target_id', 'connection', 'records'))
     require(type(envelope['handoff_version']) is int and envelope['handoff_version'] == WIRE_VERSION
             and envelope['run_id'] == run_id and envelope['target_id'] == target)
@@ -721,6 +807,7 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules):
                         and snapshot == _gap_snapshot(producer, flags, _platform_status(platform_snapshot)))
             else:
                 require(reason == 'COMMAND_OK' and rc == 0 and (producer == PLATFORM or _platform_status(platform_snapshot) == 'UNVERIFIED'))
+            require(not (staged_openssl and producer == OPENSSL and _uncertain(snapshot)))
             precheck(producer, snapshot, flags, platform_snapshot, run_id, target, observed_at)
             source = _source(producer, snapshot)
             doc, detail = _normalize(doc, host, producer, snapshot, source, observed_at, rules, flags, platform_snapshot)
@@ -733,8 +820,11 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules):
             for f in fset:
                 outcomes[f] = _aggregate(f, f == PLATFORM or flags[f], by_flag[f], row)
         else:
+            if staged_openssl and producer == OPENSSL:
+                require(platform_snapshot is not None and _platform_status(platform_snapshot) == 'UNVERIFIED')
             require(reason in FAILURES and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
-                    and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED') or producer == PLATFORM)
+                    and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
+                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL))
                     and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean)
                     and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0))
             for f in fset:
