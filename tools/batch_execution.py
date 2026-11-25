@@ -838,8 +838,13 @@ class _Ledger:
             old = self.rows[name]
             if old['reason_code'] == 'REMOTE_CLEANUP_UNCONFIRMED' and reason != 'CONTROLLER_CLEANUP_UNCONFIRMED':
                 reason = old['reason_code']
-            if old['host_state'] != 'UNREACHABLE':
-                self.rows[name] = _host(name, True, old['collectors'], reason)
+            # A connection failure is provisional until normal worker exit.
+            # Do not retain UNREACHABLE slots when that receipt is missing.
+            rows = [_outcome(c['collector_id'], True, 'ERROR', 'OUTCOME_UNKNOWN')
+                    if c['state'] == 'UNREACHABLE' else c for c in old['collectors']]
+            self.rows[name] = _host(name, True, rows, reason)
+        elif name in self.started:
+            self.rows[name] = _blank(name, self.flags[name], reason, True)
         self.fail(reason)
 
     def finish(self):
@@ -859,19 +864,29 @@ class _Deadline(BaseException):
     pass
 
 
+class _Cancelled(BaseException):
+    pass
+
+
 @contextlib.contextmanager
-def _deadline(seconds):
-    # Exclusive main-thread controller/worker only; no externally installed
-    # timer is silently replaced. The S1 bounded child performs its cleanup
-    # in finally if the aggregate guard deadline expires.
-    require(seconds > 0 and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0),
-            3, 'NATIVE_CONTEXT_UNVERIFIED')
+def _deadline(seconds, defer=None):
+    # No nested/external timer or blocked alarm. The parent may defer an
+    # exception only across the native fork-to-process-receipt critical section.
+    require(seconds > 0 and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+            and signal.SIGALRM not in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+            and signal.SIGALRM not in signal.sigpending(), 3, 'NATIVE_CONTEXT_UNVERIFIED')
+    expired = False
     def expire(signum, frame):
-        raise _Deadline()
+        nonlocal expired
+        expired = True
+        if defer is None or not defer():
+            raise _Deadline()
     previous = signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
         yield
+        if expired:
+            raise _Deadline()
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
@@ -1125,13 +1140,85 @@ def _guard(ctx, name):
     # S1 remains a fixed stop. Only that exact terminal reason proves the
     # retained native boundary was reached; no return value is authorization.
     try:
-        with _deadline(_GUARD_SECONDS):
-            ctx._boundary(name)
+        # The scheduler owns the bounded phase, including the earliest
+        # outstanding worker deadline; do not install a nested timer here.
+        ctx._boundary(name)
     except Denied as exc:
         if exc.code == 2 and exc.reason == 'LIVE_NOT_AVAILABLE':
             return
         raise
     raise Denied(4, 'BATCH_GUARD_DENIED')
+
+
+class _WorkerWave:
+    """Callback and process completion are separate, bounded receipts."""
+    def __init__(self, ledger, queue):
+        self.ledger, self.queue = ledger, queue
+        self.workers, self.ends, self.grace = {}, {}, {}
+        self.confirmed, self.faults = set(), {}
+
+    def track(self, name, worker, task_uuid, end):
+        self.ledger.start(name, task_uuid)
+        self.workers[name], self.ends[name] = worker, end
+
+    def limit(self):
+        return min((min(end, self.grace.get(n, end)) for n, end in self.ends.items()
+                    if n not in self.confirmed), default=float('inf'))
+
+    def fail(self, name, reason):
+        self.faults.setdefault(name, reason)
+        self.ledger.fail(reason)
+
+    def poll(self):
+        _drain(self.queue, self.ledger)
+        for n, worker in self.workers.items():
+            if n in self.confirmed or n in self.faults:
+                continue
+            worker.join(0)
+            if not worker.is_alive():
+                # SimpleQueue sends synchronously. Drain again after exit so
+                # a last legitimate callback is not mistaken for a lost one.
+                _drain(self.queue, self.ledger)
+                _scope.reap_group(worker.pid)
+                if n not in self.ledger.rows:
+                    self.fail(n, 'OUTCOME_UNKNOWN')
+                elif worker.exitcode != 0 or _scope.group_exists(worker.pid):
+                    self.fail(n, 'CONTROLLER_WORKER_FAILED')
+                elif time.monotonic() >= min(self.ends[n], self.grace.get(n, self.ends[n])):
+                    self.fail(n, 'CONTROLLER_TIMEOUT')
+                else:
+                    self.confirmed.add(n)
+            else:
+                now = time.monotonic()
+                if n in self.ledger.rows:
+                    self.grace.setdefault(n, min(self.ends[n], now + _WORKER_GRACE))
+                if now >= min(self.ends[n], self.grace.get(n, self.ends[n])):
+                    self.fail(n, 'CONTROLLER_TIMEOUT')
+
+    def finish(self, workers):
+        # Observe normal exits before forcing termination, then drain any
+        # last callback. A callback received during forced cleanup cannot
+        # itself convert an unconfirmed worker into a successful terminal.
+        try:
+            self.poll()
+        except (Exception, SystemExit):
+            self.ledger.fail('INVALID_NATIVE_RESULT')
+        try:
+            quiet = _stop_workers(workers)
+        except (Exception, SystemExit):
+            quiet = False
+        try:
+            _drain(self.queue, self.ledger)
+        except (Exception, SystemExit):
+            self.ledger.fail('INVALID_NATIVE_RESULT')
+        if not quiet:
+            self.ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+        for n in self.workers:
+            if not quiet or n not in self.confirmed:
+                reason = ('CONTROLLER_CLEANUP_UNCONFIRMED' if not quiet else
+                          self.faults.get(n, 'CONTROLLER_WORKER_FAILED'))
+                self.ledger.worker_failed(n, reason)
+        return quiet
 
 
 def execute_batch(ctx):
@@ -1144,189 +1231,260 @@ def execute_batch(ctx):
     import ctypes
     from ansible import context
     from ansible.executor.task_queue_manager import TaskQueueManager
+    from multiprocessing.process import BaseProcess
     require(type(ctx) is _Context and not ctx._batch_used and sys.platform == 'linux'
             and threading.current_thread() is threading.main_thread()
-            and threading.active_count() == 1 and not context.CLIARGS.get('extra_vars'),
-            3, 'NATIVE_CONTEXT_UNVERIFIED')
+            and threading.active_count() == 1 and not context.CLIARGS.get('extra_vars')
+            and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+            and not {signal.SIGALRM, signal.SIGINT, signal.SIGTERM}
+            & signal.pthread_sigmask(signal.SIG_BLOCK, ()), 3, 'NATIVE_CONTEXT_UNVERIFIED')
     ctx._batch_used = True
-    require(_request(ctx._request) == ctx._request and _source_identity(ctx._source) == ctx._source_id
-            and _project(ctx._inventory, ctx._variables, ctx._request)
-            == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
-    registry = _passive_adapters()
-    require(type(registry) is dict and registry.keys() <= _PASSIVE and all(callable(v) for v in registry.values()),
-            3, 'INVALID_ADAPTER_REGISTRY')
-    ledger = _Ledger(ctx, registry)
-    names = [n for n in ledger.targets if ledger.eligible[n]]
-    if not names:
-        return _manifest(ctx, ledger.finish())
-    interrupted = False
+    started = time.monotonic()
+    deadline = started + _GUARD_SECONDS
+    interrupted = phase_active = fork_critical = False
+    controller_pid = os.getpid()
     handlers = {}
-    tqm = queue = None
+    tqm = queue = ledger = None
+    wave = None
+    subreaper = scheduling = False
     libc = ctypes.CDLL(None, use_errno=True)
     old = ctypes.c_int()
-    require(libc.prctl(37, ctypes.byref(old), 0, 0, 0) == 0 and libc.prctl(36, 1, 0, 0, 0) == 0,
-            3, 'NATIVE_CONTEXT_UNVERIFIED')
+
     def interrupt(signum, frame):
         nonlocal interrupted
+        if os.getpid() != controller_pid or interrupted:
+            return
         interrupted = True
+        if phase_active and not fork_critical:
+            # Disarm before unwinding a bounded child/guard's own finally.
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            raise _Cancelled()
+
+    @contextlib.contextmanager
+    def phase():
+        nonlocal phase_active
+        end = min(deadline, time.monotonic() + _GUARD_SECONDS,
+                  wave.limit() if wave is not None else float('inf'))
+        remaining = end - time.monotonic()
+        if interrupted:
+            raise _Cancelled()
+        if remaining <= 0:
+            raise _Deadline()
+        with _deadline(remaining, lambda: fork_critical):
+            phase_active = True
+            try:
+                if interrupted:
+                    raise _Cancelled()
+                yield end
+            finally:
+                phase_active = False
+        if interrupted:
+            raise _Cancelled()
+        if time.monotonic() >= end:
+            raise _Deadline()
+
+    def poll():
+        if wave is not None:
+            wave.poll()
+        if interrupted:
+            ledger.fail('INTERRUPTED')
+        if time.monotonic() >= deadline:
+            ledger.fail('CONTROLLER_TIMEOUT')
+        return ledger.stop is None
+
+    def queue_one(strategy, host, task, vals, pc, name):
+        # Native _queue_task assigns its WorkerProcess to this empty slot
+        # before start(). Capture ownership even when queuing raises after
+        # fork. Do not interrupt multiprocessing's narrow start receipt.
+        nonlocal fork_critical
+        slot = strategy._cur_worker
+        pending = strategy._pending_results
+        require(tqm._workers[slot] is None, 3, 'INVALID_NATIVE_RESULT')
+        end = min(deadline, time.monotonic() + budgets[name])
+        original_start = BaseProcess.start
+        try:
+            with phase() as phase_end:
+                def start_worker(worker):
+                    nonlocal fork_critical
+                    # Last observable boundary inside native queueing, after
+                    # worker initialization but before the actual child fork.
+                    if not poll():
+                        raise _Cancelled() if interrupted else Denied(3, 'INVALID_NATIVE_RESULT')
+                    require(worker is tqm._workers[slot], 3, 'INVALID_NATIVE_RESULT')
+                    launch_end = min(phase_end, wave.limit())
+                    remaining = launch_end - time.monotonic()
+                    if remaining <= 0:
+                        raise _Deadline()
+                    # A newly observed callback may shorten the grace while
+                    # native queuing is in progress. Never extend the timer.
+                    timer = signal.getitimer(signal.ITIMER_REAL)[0]
+                    if timer <= 0:
+                        raise _Deadline()
+                    if remaining < timer:
+                        signal.setitimer(signal.ITIMER_REAL, remaining)
+                    fork_critical = True
+                    try:
+                        original_start(worker)
+                    finally:
+                        fork_critical = False
+                    if interrupted:
+                        raise _Cancelled()
+                    if time.monotonic() >= launch_end:
+                        raise _Deadline()
+                BaseProcess.start = start_worker
+                with _worker_boundary(ctx, name, registry):
+                    strategy._queue_task(host, task, vals, pc)
+        finally:
+            BaseProcess.start = original_start
+            # Outside the interruptible phase: register every actual start
+            # before classifying any queue exception or cancellation.
+            worker = tqm._workers[slot]
+            if worker is not None and worker.pid is not None:
+                wave.track(name, worker, task._uuid, end)
+        require(worker is not None and worker.pid is not None
+                and strategy._pending_results == pending + 1, 3, 'INVALID_NATIVE_RESULT')
+
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             handlers[sig] = signal.signal(sig, interrupt)
+        # Include the initial native VariableManager projection even when
+        # there are no eligible adapters. No provider reload.
         try:
-            with _deadline(_GUARD_SECONDS):
-                ctx._preflight()
+            with phase():
+                require(_request(ctx._request) == ctx._request and _source_identity(ctx._source) == ctx._source_id
+                        and _project(ctx._inventory, ctx._variables, ctx._request)
+                        == (ctx._targets, ctx._flags, ctx._decisions), 4, 'CONNECTION_CONTEXT_DRIFT')
+                registry = _passive_adapters()
+                require(type(registry) is dict and registry.keys() <= _PASSIVE
+                        and all(callable(v) for v in registry.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+                ledger = _Ledger(ctx, registry)
         except _Deadline:
-            raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
-        if interrupted:
-            ledger.fail('INTERRUPTED')
-        width = min(ctx._request['forks'], 2)
-        # Bound total duration independently of native scheduler waiting. No
-        # user override; preflight and all guards have finite independent caps.
-        budgets = {n: _GUARD_SECONDS + _SSH_SECONDS + (_COMMAND_SECONDS + 1) * len(ledger.eligible[n])
-                   + _WORKER_GRACE + 5 for n in names}
-        deadline = time.monotonic() + sum(2 * _GUARD_SECONDS + budgets[n] for n in names) + 5
-        # TQM installs CLI signal handlers; block signals only during its
-        # construction and install our catchable cancellation handlers before
-        # unmasking. Native workers install their own handlers after fork.
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, handlers)
-        try:
-            tqm = TaskQueueManager(ctx._inventory, ctx._variables, ctx._loader, {}, forks=width,
-                                   run_additional_callbacks=False)
-            for sig in handlers:
-                signal.signal(sig, interrupt)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        tqm._final_q.close()
-        queue = tqm._final_q = _make_queue()
-        # No general callback loader, arbitrary playbook, facts or handlers.
-        with _quiet():
-            for start in range(0, len(names), width):
-                if interrupted:
-                    ledger.fail('INTERRUPTED')
-                if ledger.stop:
-                    break
-                wave = names[start:start + width]
-                tqm._initialize_processes(len(wave))
-                strategy = _queue_strategy(tqm)
-                end_times, by_name = {}, {}
+            if not interrupted:
+                raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
+            raise _Cancelled()
+        names = [n for n in ledger.targets if ledger.eligible[n]]
+        if names:
+            width = min(ctx._request['forks'], 2)
+            budgets = {n: _GUARD_SECONDS + _SSH_SECONDS + (_COMMAND_SECONDS + 1) * len(ledger.eligible[n])
+                       + _WORKER_GRACE + 5 for n in names}
+            # Initial projection and preflight each have the existing guard
+            # cap; account for both in the single absolute invocation budget.
+            deadline = started + 2 * _GUARD_SECONDS + sum(2 * _GUARD_SECONDS + budgets[n] for n in names) + 5
+            require(libc.prctl(37, ctypes.byref(old), 0, 0, 0) == 0
+                    and libc.prctl(36, 1, 0, 0, 0) == 0, 3, 'NATIVE_CONTEXT_UNVERIFIED')
+            subreaper = True
+            try:
+                with phase():
+                    ctx._preflight()
+            except _Deadline:
+                if not interrupted:
+                    raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
+                raise _Cancelled()
+            scheduling = True
+            # Keep a reference even if native initialization partially fails.
+            # TQM installs its own CLI handlers, so restore ours before
+            # unmasking on every path; SIGALRM remains unblocked.
+            with phase():
+                mask = signal.pthread_sigmask(signal.SIG_BLOCK, handlers)
                 try:
-                    for n in wave:
-                        _drain(queue, ledger)
-                        if interrupted:
-                            ledger.fail('INTERRUPTED')
-                        if ledger.stop:
-                            break
-                        if time.monotonic() >= deadline:
-                            ledger.fail('CONTROLLER_TIMEOUT')
-                            break
-                        try:
-                            _guard(ctx, n)
-                        except (Denied, _Deadline):
-                            ledger.fail('GUARD_REJECTED')
-                            break
-                        # Recheck faults received during the guard before
-                        # starting the next native worker.
-                        _drain(queue, ledger)
-                        if interrupted:
-                            ledger.fail('INTERRUPTED')
-                        if ledger.stop:
-                            break
-                        try:
-                            with _deadline(_GUARD_SECONDS):
-                                play, task, pc = _task(ctx, wave)
-                                host = ctx._inventory.hosts[n]
-                                vals = ctx._variables.get_vars(play=play, host=host, task=task,
-                                                                include_hostvars=False, use_cache=False)
-                        except _Deadline:
-                            ledger.fail('GUARD_REJECTED')
-                            break
-                        _drain(queue, ledger)
-                        if interrupted:
-                            ledger.fail('INTERRUPTED')
-                        if ledger.stop:
-                            break
-                        if time.monotonic() >= deadline:
-                            ledger.fail('CONTROLLER_TIMEOUT')
-                            break
-                        slot = strategy._cur_worker
-                        pending = strategy._pending_results
-                        with _worker_boundary(ctx, n, registry):
-                            strategy._queue_task(host, task, vals, pc)
-                        worker = tqm._workers[slot]
-                        if worker is not None and worker.pid is not None:
-                            ledger.start(n, task._uuid)
-                            by_name[n] = worker
-                            end_times[n] = min(deadline, time.monotonic() + budgets[n])
-                        require(worker is not None and worker.pid is not None
-                                and strategy._pending_results == pending + 1, 3, 'INVALID_NATIVE_RESULT')
-                    # Drain every started result before opening another wave.
-                    while any(n not in ledger.rows for n in end_times):
-                        _drain(queue, ledger)
-                        if interrupted:
-                            ledger.fail('INTERRUPTED')
-                        if ledger.stop:
-                            break
-                        if any(time.monotonic() >= end for n, end in end_times.items() if n not in ledger.rows):
-                            ledger.fail('CONTROLLER_TIMEOUT')
-                            break
-                        if all(w is None or not w.is_alive() for w in tqm._workers):
-                            _drain(queue, ledger)
-                            if any(n not in ledger.rows for n in end_times):
-                                ledger.fail('OUTCOME_UNKNOWN')
-                            break
-                        queue._reader.poll(0.02)
-                except (Exception, SystemExit):
-                    ledger.fail('INVALID_NATIVE_RESULT')
+                    tqm = TaskQueueManager.__new__(TaskQueueManager)
+                    tqm.__init__(ctx._inventory, ctx._variables, ctx._loader, {}, forks=width,
+                                 run_additional_callbacks=False)
                 finally:
-                    # A native result is not a process-reap receipt. Wait a
-                    # short bounded interval for normal worker exit, then
-                    # terminate groups if necessary. Any uncertain cleanup
-                    # is a major stop, not remote success.
-                    if not ledger.stop and not interrupted:
-                        end = min(deadline, time.monotonic() + _WORKER_GRACE)
-                        for worker in tqm._workers:
-                            if worker is not None and worker.pid is not None:
-                                worker.join(max(0, end - time.monotonic()))
-                    # Remember which workers were not normally reaped before
-                    # forcing cleanup. A valid callback alone is insufficient.
-                    abnormal = set()
-                    for n, worker in by_name.items():
-                        worker.join(0)
-                        if not worker.is_alive():
-                            _scope.reap_group(worker.pid)
-                        if worker.is_alive() or worker.exitcode != 0 or _scope.group_exists(worker.pid):
-                            abnormal.add(n)
-                    quiet = _stop_workers(tqm._workers)
+                    for sig in handlers:
+                        signal.signal(sig, interrupt)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                tqm._final_q.close()
+                queue = tqm._final_q = _make_queue()
+            with _quiet():
+                for offset in range(0, len(names), width):
+                    if not poll():
+                        break
+                    selected = names[offset:offset + width]
+                    with phase():
+                        tqm._initialize_processes(len(selected))
+                        strategy = _queue_strategy(tqm)
+                    wave = _WorkerWave(ledger, queue)
                     try:
-                        _drain(queue, ledger)
+                        for n in selected:
+                            if not poll():
+                                break
+                            try:
+                                with phase():
+                                    _guard(ctx, n)
+                                if not poll():
+                                    break
+                                with phase():
+                                    play, task, pc = _task(ctx, selected)
+                                    host = ctx._inventory.hosts[n]
+                                    vals = ctx._variables.get_vars(play=play, host=host, task=task,
+                                                                    include_hostvars=False, use_cache=False)
+                            except (Denied, _Deadline):
+                                poll()
+                                ledger.fail('GUARD_REJECTED')
+                                break
+                            if not poll():
+                                break
+                            queue_one(strategy, host, task, vals, pc, n)
+                        while poll() and len(wave.confirmed) != len(wave.workers):
+                            queue._reader.poll(max(0, min(0.02, wave.limit() - time.monotonic(),
+                                                          deadline - time.monotonic())))
+                    except _Cancelled:
+                        ledger.fail('INTERRUPTED')
+                    except _Deadline:
+                        ledger.fail('CONTROLLER_TIMEOUT')
                     except (Exception, SystemExit):
                         ledger.fail('INVALID_NATIVE_RESULT')
-                    if not quiet:
-                        ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
-                    for n in abnormal:
-                        ledger.worker_failed(n, 'CONTROLLER_WORKER_FAILED' if quiet else 'CONTROLLER_CLEANUP_UNCONFIRMED')
-                    if quiet:
-                        for worker in tqm._workers:
-                            if worker is not None:
-                                worker.close()
-                        tqm._workers[:] = []
-                if interrupted:
-                    ledger.fail('INTERRUPTED')
-        if interrupted:
-            ledger.fail('INTERRUPTED')
+                    finally:
+                        if wave.finish(tqm._workers):
+                            for worker in tqm._workers:
+                                if worker is not None:
+                                    worker.close()
+                            tqm._workers[:] = []
+                        wave = None
+                    if interrupted:
+                        ledger.fail('INTERRUPTED')
+    except _Cancelled:
+        if ledger is None:
+            ledger = _Ledger(ctx, {})
+            ledger.rows.clear()
+        ledger.fail('INTERRUPTED')
+    except _Deadline:
+        if ledger is None:
+            raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
+        ledger.fail('CONTROLLER_TIMEOUT')
+    except (Exception, SystemExit):
+        if not scheduling:
+            raise
+        ledger.fail('INVALID_NATIVE_RESULT')
     finally:
         try:
             if tqm is not None:
-                if tqm._workers and not _stop_workers(tqm._workers):
-                    ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
-                if queue is not None:
-                    queue.close()
-                tqm._connection_lockfile.close()
+                workers = getattr(tqm, '_workers', ())
+                if workers:
+                    try:
+                        quiet = _stop_workers(workers)
+                    except (Exception, SystemExit):
+                        quiet = False
+                    if not quiet:
+                        ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
+                # Native local queue/lockfile closure is bounded separately
+                # from process-group termination. Attempt each owned resource
+                # even if partial construction or another close failed.
+                for resource in ('_final_q', '_connection_lockfile'):
+                    obj = getattr(tqm, resource, None)
+                    if obj is not None:
+                        try:
+                            with _deadline(_WORKER_GRACE):
+                                obj.close()
+                        except (Exception, SystemExit, _Deadline):
+                            ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
                 tqm.terminate()
         finally:
             for sig, previous in handlers.items():
                 signal.signal(sig, previous)
-            require(libc.prctl(36, old.value, 0, 0, 0) == 0, 3, 'NATIVE_CONTEXT_UNVERIFIED')
+            if subreaper:
+                require(libc.prctl(36, old.value, 0, 0, 0) == 0, 3, 'NATIVE_CONTEXT_UNVERIFIED')
     if interrupted:
         ledger.fail('INTERRUPTED')
     return _manifest(ctx, ledger.finish(), ledger.stop)

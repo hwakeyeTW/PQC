@@ -657,3 +657,268 @@ pathlib.Path({str(receipt)!r}).write_text(json.dumps([r.reason_code,r.rc,r.clean
             if p is not None and p.poll() is None:
                 p.terminate()
                 p.wait(timeout=5)
+
+
+# R1 lifecycle regressions: real native scheduler/worker and closed callbacks;
+# fault injection is limited to trusted tests and never exposes transport.
+def _signal_state():
+    return (tuple(signal.getsignal(s) for s in (signal.SIGALRM, signal.SIGINT, signal.SIGTERM)),
+            signal.pthread_sigmask(signal.SIG_BLOCK, ()), signal.getitimer(signal.ITIMER_REAL))
+
+
+def _observe_native_queue(monkeypatch, before=None, after=None):
+    original = batch._queue_strategy
+    launches = []
+    def strategy(tqm):
+        native = original(tqm)
+        queue = native._queue_task
+        def observed(host, task, vals, pc):
+            if before:
+                before(tqm, host.name)
+            slot = native._cur_worker
+            try:
+                return queue(host, task, vals, pc)
+            finally:
+                worker = tqm._workers[slot]
+                if worker is not None and worker.pid is not None:
+                    launches.append((host.name, worker.pid))
+                    if after:
+                        after(tqm, host.name)
+        native._queue_task = observed
+        return native
+    monkeypatch.setattr(batch, '_queue_strategy', strategy)
+    return launches
+
+
+@pytest.mark.parametrize('mode', ['missing', 'callback', 'connection'])
+def test_r1_observed_exit_stops_second_native_fork(fixture, monkeypatch, mode):
+    make, register, trace, trap, _ = fixture
+    ctx, names = make(count=3, forks=2, flags=selected_flags(PKG, SSL))
+    if mode == 'missing':
+        register(modes={names[0]: 'missing'})
+    else:
+        register(connection=(lambda n: 'CONNECTION_FAILED' if n == names[0] else 'CONNECTED')
+                 if mode == 'connection' else None)
+        original = batch._make_queue
+        def queue():
+            q = original()
+            send = q.send_task_result
+            def crash(result):
+                send(result)
+                os._exit(12)
+            q.send_task_result = crash
+            return q
+        monkeypatch.setattr(batch, '_make_queue', queue)
+    gate = trace.parent / 'r1-release-first'
+    collect = batch._collect
+    def gated_collect(name, flags, registry):
+        if name == names[0]:
+            wait_file(gate, 5)
+        return collect(name, flags, registry)
+    monkeypatch.setattr(batch, '_collect', gated_collect)
+    observed = []
+    def before(tqm, name):
+        if name == names[1]:
+            gate.write_text('release')
+            # Fault becomes observable inside native queuing, after guard and
+            # vars; this barrier forces the last pre-fork check to matter.
+            worker = tqm._workers[0]
+            worker.join(5)
+            assert worker.exitcode == 12 and not worker.is_alive()
+            observed.append(worker.pid)
+    launches = _observe_native_queue(monkeypatch, before=before)
+    signals = _signal_state()
+    rc, out = checked(ctx)
+    reason = 'OUTCOME_UNKNOWN' if mode == 'missing' else 'CONTROLLER_WORKER_FAILED'
+    assert rc == 6 and out['reason_code'] == reason
+    assert states(out) == ['ERROR', 'NOT_ATTEMPTED', 'NOT_ATTEMPTED']
+    assert len(observed) == 1 and launches == [(names[0], observed[0])]
+    assert not alive(observed[0]) and _signal_state() == signals
+    row = out['hosts'][0]
+    assert row['reason_code'] == reason and row['attempted']
+    if mode == 'connection':
+        assert all(c['state'] == 'ERROR' and c['reason_code'] == 'OUTCOME_UNKNOWN'
+                   and c['rc'] is None and not c['collection_ids']
+                   for c in row['collectors'] if c['requested'])
+    elif mode == 'callback':
+        assert any(c['state'] == 'COLLECTED' for c in row['collectors'])
+    assert all(c['state'] == 'NOT_SCANNED' and c['reason_code'] == 'DISABLED'
+               for c in row['collectors'] if not c['requested'])
+    assert not list(trace.parent.glob(names[1] + '.*.json')) and not trap.exists()
+
+
+@pytest.mark.parametrize('limit_kind', ['individual', 'exit_grace'])
+def test_r1_callback_hang_keeps_earlier_worker_limit(fixture, monkeypatch, limit_kind):
+    make, register, trace, trap, _ = fixture
+    ctx, names = make(count=4, forks=2)
+    register(delay=.05)
+    root = trace.parent
+    marker = root / 'r1-second-start'
+    receipt = root / 'r1-first-callback'
+    finished = root / 'r1-second-finished'
+    original = batch._collect
+    def collect(name, flags, registry):
+        if name == names[1]:
+            marker.write_text(str(os.getpid()))
+            time.sleep(6)
+            finished.write_text('completed')
+        return original(name, flags, registry)
+    monkeypatch.setattr(batch, '_collect', collect)
+    original_queue = batch._make_queue
+    def queue():
+        q = original_queue()
+        send = q.send_task_result
+        def hang(result):
+            # Both workers are genuinely started before the first callback.
+            if not receipt.exists():
+                wait_file(marker, 3)
+                send(result)
+                receipt.write_text(str(os.getpid()))
+                time.sleep(60)
+            else:
+                send(result)
+        q.send_task_result = hang
+        return q
+    monkeypatch.setattr(batch, '_make_queue', queue)
+    # Narrow the trusted test's per-worker absolute deadlines only. The
+    # production calculation and native scheduling remain unchanged.
+    monkeypatch.setattr(batch, '_WORKER_GRACE', 3 if limit_kind == 'individual' else .5)
+    real_track = batch._WorkerWave.track
+    limits = {}
+    def track(wave, name, worker, task_uuid, end):
+        cap = time.monotonic() + (2 if name == names[0] and limit_kind == 'individual' else 12)
+        end = min(end, cap)
+        limits[name] = (worker.pid, end)
+        return real_track(wave, name, worker, task_uuid, end)
+    monkeypatch.setattr(batch._WorkerWave, 'track', track)
+    started = time.monotonic()
+    rc, out = checked(ctx)
+    elapsed = time.monotonic() - started
+    assert rc == 6 and out['reason_code'] == 'CONTROLLER_TIMEOUT'
+    assert states(out) == ['ERROR', 'ERROR', 'NOT_ATTEMPTED', 'NOT_ATTEMPTED']
+    assert receipt.exists() and marker.exists() and not finished.exists()
+    assert set(limits) == set(names[:2]) and limits[names[0]][1] <= limits[names[1]][1]
+    assert int(receipt.read_text()) == limits[names[0]][0]
+    assert int(marker.read_text()) == limits[names[1]][0]
+    assert elapsed < 5.5 and all(not alive(pid) for pid, _ in limits.values())
+    assert out['hosts'][0]['reason_code'] == 'CONTROLLER_TIMEOUT'
+    assert any(c['state'] == 'COLLECTED' for c in out['hosts'][0]['collectors'])
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('fault', ['deadline', 'SIGINT', 'SIGTERM'])
+def test_r1_initial_native_projection_is_bounded(fixture, monkeypatch, enabled, fault):
+    make, register, trace, trap, _ = fixture
+    ctx, names = make(count=2, forks=2)
+    if enabled:
+        register()
+    original = ctx._variables.get_vars
+    calls = []
+    def get_vars(*args, **kwargs):
+        calls.append(kwargs.get('use_cache'))
+        if fault != 'deadline':
+            os.kill(os.getpid(), getattr(signal, fault))
+        time.sleep(2)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(ctx._variables, 'get_vars', get_vars)
+    monkeypatch.setattr(batch, '_GUARD_SECONDS', .15)
+    signals = _signal_state()
+    started = time.monotonic()
+    if fault == 'deadline':
+        with pytest.raises(batch.Denied) as error:
+            checked(ctx)
+        assert error.value.code == 3 and error.value.reason == 'BATCH_GUARD_TIMEOUT'
+    else:
+        rc, out = checked(ctx)
+        assert rc == 7 and out['reason_code'] == 'INTERRUPTED'
+        assert states(out) == ['NOT_ATTEMPTED'] * len(names)
+        assert all(not h['attempted'] for h in out['hosts'])
+    assert calls == [False] and time.monotonic() - started < 1.2
+    assert _signal_state() == signals and not trap.exists()
+    assert trace.read_text().splitlines().count('["--list"]') == 1
+    assert not list(trace.parent.glob('*.pqc_collect_packages.json'))
+
+
+@pytest.mark.parametrize('fault', ['setup_deadline', 'queue_deadline', 'started_deadline', 'started_cancel'])
+def test_r1_native_scheduler_bounds_and_partial_start(fixture, monkeypatch, fault):
+    from ansible.executor.task_queue_manager import TaskQueueManager
+    make, register, trace, trap, _ = fixture
+    ctx, names = make(count=3, forks=2)
+    register(delay=.05)
+    if fault.startswith('started_'):
+        # Keep the actual native worker in flight after the fork receipt.
+        def hang(*args):
+            time.sleep(60)
+        monkeypatch.setattr(batch, '_collect', hang)
+    monkeypatch.setattr(batch, '_GUARD_SECONDS', 1.5)
+    signals = _signal_state()
+    owned = []
+    original = TaskQueueManager.__init__
+    def initialize(tqm, *args, **kwargs):
+        original(tqm, *args, **kwargs)
+        owned.append((tqm._final_q, tqm._connection_lockfile))
+        if fault == 'setup_deadline':
+            time.sleep(5)
+    monkeypatch.setattr(TaskQueueManager, '__init__', initialize)
+    def before(tqm, name):
+        if fault == 'queue_deadline':
+            time.sleep(5)
+    def after(tqm, name):
+        if fault == 'started_cancel':
+            os.kill(os.getpid(), signal.SIGTERM)
+        elif fault == 'started_deadline':
+            time.sleep(5)
+    launches = _observe_native_queue(monkeypatch, before, after)
+    rc, out = checked(ctx)
+    attempted = fault.startswith('started_')
+    assert rc == (7 if fault == 'started_cancel' else 6)
+    assert out['reason_code'] == ('INTERRUPTED' if fault == 'started_cancel' else 'CONTROLLER_TIMEOUT')
+    assert [h['attempted'] for h in out['hosts']] == [attempted, False, False]
+    assert states(out)[1:] == ['NOT_ATTEMPTED', 'NOT_ATTEMPTED']
+    assert len(launches) == int(attempted) and all(not alive(pid) for _, pid in launches)
+    assert len(owned) == 1 and owned[0][0]._reader.closed and owned[0][1].closed
+    assert _signal_state() == signals and not trap.exists()
+
+
+def test_r1_external_timer_is_not_replaced(fixture):
+    make, _, _, trap, _ = fixture
+    ctx, _ = make(count=1)
+    old = signal.getsignal(signal.SIGALRM)
+    signal.setitimer(signal.ITIMER_REAL, 20)
+    try:
+        with pytest.raises(batch.Denied) as error:
+            checked(ctx)
+        assert error.value.code == 3 and error.value.reason == 'NATIVE_CONTEXT_UNVERIFIED'
+        assert signal.getitimer(signal.ITIMER_REAL)[0] > 10
+        assert signal.getsignal(signal.SIGALRM) == old and not trap.exists()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def test_r1_unconfirmed_cleanup_downgrades_connection_callback(fixture, monkeypatch):
+    make, register, trace, trap, _ = fixture
+    ctx, names = make(count=2, forks=1, flags=selected_flags(PKG, SSL))
+    register(connection=lambda name: 'CONNECTION_FAILED' if name == names[0] else 'CONNECTED')
+    original = batch._stop_workers
+    pids = []
+    def uncertain(workers):
+        owned = [w.pid for w in workers if w is not None and w.pid is not None]
+        assert original(workers)
+        if owned and not pids:
+            pids.extend(owned)
+            # Inject uncertainty only AFTER real cleanup so no leaked child.
+            return False
+        return True
+    monkeypatch.setattr(batch, '_stop_workers', uncertain)
+    rc, out = checked(ctx)
+    assert rc == 6 and out['reason_code'] == 'CONTROLLER_CLEANUP_UNCONFIRMED'
+    assert states(out) == ['ERROR', 'NOT_ATTEMPTED']
+    row = out['hosts'][0]
+    assert row['reason_code'] == 'CONTROLLER_CLEANUP_UNCONFIRMED' and row['attempted']
+    for c in row['collectors']:
+        assert (c['state'], c['reason_code'], c['rc'], c['collection_ids']) == (
+            ('ERROR', 'OUTCOME_UNKNOWN', None, []) if c['requested'] else
+            ('NOT_SCANNED', 'DISABLED', None, []))
+    assert len(pids) == 1 and not alive(pids[0]) and not trap.exists()
+    assert not list(trace.parent.glob('*.pqc_collect_packages.json'))

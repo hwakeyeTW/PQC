@@ -176,9 +176,13 @@ well as the actual command argv; the only successful restricted witness
 returns a typed host result from the synthetic adapter bridge.
 
 - At most 10 targets, forks 1 or 2, serial 2. Provider cap: 30 s, original
-  bounded S1 output and cleanup. Whole-context preflight: 30 s. Parent
-  guard and native task variable construction each have a 30 s cap per
-  dispatch. Actual child guard: 30 s.
+  bounded S1 output and cleanup. The initial native projection (including
+  no-adapter/all-disabled cases) and whole-context preflight each have a
+  30 s cap. Parent guard, task variable construction, native scheduler
+  setup and queueing each use a bounded phase capped by the remaining
+  aggregate and outstanding worker deadlines. Actual child guard: 30 s.
+  Before-dispatch projection/preflight expiry is a Denied(3) rejection;
+  caught cancellation produces rc 7 without inventing a host attempt.
 - One restricted connection phase per attempted host, 15 s aggregate,
   not 15 s per stage or jump. A timeout reported by a trusted synthetic
   connection with confirmed cleanup is CONNECTION_TIMEOUT; a controller
@@ -188,19 +192,36 @@ returns a typed host result from the synthetic adapter bridge.
   trusted adapter must use the bounded runner; controller return is
   additionally limited to 31 s. A missing return is not remote proof.
 - Per-worker budget is `30 + 15 + 31 * eligible_slots + 2 + 5` seconds.
-  Total batch scheduling budget after preflight is the sum over eligible
-  hosts of `60 + worker_budget`, plus 5 s. The deliberately conservative
-  sum is independent of observed parallelism. Final local cleanup reserves
-  a bounded 2 s TERM/KILL/join interval. These are engineering limits for
-  the trusted supported runtime, not hard real-time OS guarantees.
+  The absolute invocation budget is anchored before initial projection:
+  60 s plus the sum over eligible hosts of `60 + worker_budget`, plus 5 s.
+  Each scheduler phase and poll is also constrained by the earliest
+  outstanding worker deadline. A callback never cancels that deadline;
+  the exit grace is at most 2 s and cannot extend it. The deliberately
+  conservative aggregate sum is independent of observed parallelism.
+  Local TERM/KILL/join is bounded to 2 s per cleanup attempt; a final
+  cleanup attempt may follow an uncertain receipt. Owned queue/lockfile
+  closure is separately bounded. Native fork receipt publication is a
+  narrow trusted critical section: cancel/expiry is latched until the
+  receipt can be recorded, then no more work is dispatched. These are
+  engineering limits for the trusted runtime, not hard real-time OS
+  guarantees or proof of remote termination.
 - Native worker result IPC is closed and limited to 3500 bytes per
   message, including the target/task identity. Only the fixed typed result
   may cross it; arbitrary callback diagnostics, prompts, raw stdout/stderr,
   hostvars and task objects are not serialized as batch results. Queue
   input is checked again on receipt. Foreign, duplicate, out-of-order,
   malformed, missing or inconsistent results stop new dispatch. A valid
-  callback is provisional until its worker exits normally and is reaped.
+  callback is provisional until normal exit, join/reap and absence of
+  residual process groups are observed within its limits. One lifecycle
+  check drains callbacks and checks worker exits, grace and deadlines
+  before new dispatch, after guard/vars and at the actual native fork
+  boundary, and while waiting. Already observable faults prevent further
+  forks. Native queue errors after a real fork retain ownership and the
+  actual attempted host; a queue failure before fork is not an attempt.
 - SIGINT/SIGTERM stop new dispatch and trigger bounded controller cleanup.
+  Install cancellation before the first projection; restore signal
+  handlers, timer, mask and subreaper state on exit. Do not replace an
+  externally installed interval timer.
   Major guard, unknown remote cleanup, invalid result and controller
   worker/deadline/cleanup faults also stop new dispatch. Ordinary confirmed
   per-host collection or connection failure does not stop remaining hosts.
@@ -275,7 +296,12 @@ started host and task UUID. A started worker with no acceptable terminal
 result is ERROR/OUTCOME_UNKNOWN (or a more specific fixed stop reason),
 never inferred UNREACHABLE or COMPLETE. If a worker reports then exits
 abnormally, validated slot observations may be retained but not its
-provisional successful host state. No raw collector data, stderr, transport
+provisional successful host state. In particular, a provisional connection
+failure becomes an attempted ERROR with the controller fault reason if
+normal worker exit or cleanup is unconfirmed. Its requested UNREACHABLE
+rows become ERROR/OUTCOME_UNKNOWN with null rc and no references; disabled
+rows and genuine other observations retain their typed semantics. No raw
+collector data, stderr, transport
 addresses, credentials or exceptions are part of this manifest.
 
 | rc | Result |
@@ -305,7 +331,14 @@ fork overlap and waves, 10/11 host limit, confirmed synthetic connection
 failure, all-disabled/unavailable adapters, callback/worker failures, caught
 signals, and a separate remote surrogate whose command survives transport
 loss until its own 30-second deadline and reaps child/grandchild processes.
-The two-stage connection surrogate exercises the full 15-second budget.
+The R1 lifecycle regressions retain all original tests and exercise native
+fork barriers, abnormal exit with/without a callback, callback followed by
+an earlier individual deadline or exit grace, initial native projection
+timeout/cancellation with or without eligible adapters, scheduler setup
+and partial-start failure, timer/handler restoration, and uncertain cleanup
+of a connection-failure callback. Faults are injected only in trusted
+synthetic tests, including reported cleanup uncertainty after actual safe
+reaping. The two-stage connection surrogate exercises the full 15-second budget.
 Both are synthetic proof, not real OpenSSH qualification. Actual fixed-path
 `ssh -G` evidence and implicit/Include/multiplexing compatibility remain
 HOLD; real SSH transport and live execution remain hard closed. Actual
