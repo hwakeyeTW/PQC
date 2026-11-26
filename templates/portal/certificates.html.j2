@@ -14,13 +14,13 @@
 {% macro value(v) -%}{{ 'Unknown / not recorded' if v is none else v }}{%- endmacro %}
 {% macro refs(ids, table) -%}{% for ref in ids %}<a href="{{ table[ref].href }}">{{ ref }}</a>{% if not loop.last %}<br>{% endif %}{% else %}None recorded{% endfor %}{%- endmacro %}
 <section class="hero"><h1>Certificates</h1><p>Recorded certificate identities and evidence. A recorded fingerprint is not independently verified certificate content. Missing details are not evidence of absence.</p>
-<nav class="jump"><a href="hosts.html">Host list</a><a href="services.html">Services</a><a href="algorithms.html">Algorithms</a></nav>
+{% if portal_v5 %}<nav class="jump" aria-label="Run sections"><a href="hosts.html">Hosts</a><a href="algorithms.html">Algorithms</a><a href="libraries.html">Libraries</a><span aria-current="page">Certificates</span><a href="services.html">Services</a><a href="findings.html">Findings</a><a href="coverage.html">Coverage</a></nav>{% else %}<nav class="jump"><a href="hosts.html">Host list</a><a href="services.html">Services</a><a href="algorithms.html">Algorithms</a></nav>{% endif %}
 {% if not p.assessed %}<p id="not-assessed">Assessment not present. No verdict inferred.</p>{% endif %}
 <dl class="cards">{% for key, count in index.counts.items() %}<div class="metric"><dt>{{ key }}</dt><dd id="count-{{ key }}">{{ count }}</dd></div>{% endfor %}</dl>
 <p>Unique ID counts refer only to the saved sets. A certificate can have multiple recorded source positions and host-scoped assets. Unknown identities are not merged.</p>
 <dl class="metadata">{% for category, count in index.categories.items() %}<div><dt>{{ category }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl></section>
 <section id="coverage"><h2>Certificate collection coverage</h2><div class="scroll"><table><thead><tr><th>Host / slot</th><th>Frozen request / terminal</th><th>Actual collection records</th><th>Detail availability</th></tr></thead><tbody>
-{% for r in p.coverage if r.slot in ('system_certs', 'nginx_certs') %}<tr><th><a href="{{ p.hosts[r.host_id].href }}">{{ value(p.hosts[r.host_id].target_id) }}</a><br>{{ r.slot }}<br>{{ p.hosts[r.host_id].host_state }}</th><td>Requested: {{ value(r.requested) }}<br>{{ r.state }} / {{ r.reason_code }}<br>Basis: {{ r.basis }}; rc: {{ value(r.rc) }}</td><td>{{ r.slot_state }}{% for c in r.collection_states %}<br>{{ c.collection_id }} / {{ c.state }} / {{ c.reason_code }}{% endfor %}</td><td>{{ r.detail_slot_state }}</td></tr>{% endfor %}
+{% for r in p.coverage if r.slot in ('system_certs', 'nginx_certs') %}<tr><th><a href="{{ p.hosts[r.host_id].href }}">{{ value(p.hosts[r.host_id].target_id) }}</a><br>{{ r.slot }}<br>{{ p.hosts[r.host_id].host_state }}{% if portal_v5 %}<br><a href="coverage.html#{{ p.hosts[r.host_id].host_id }}">Host coverage</a>{% endif %}</th><td>Requested: {{ value(r.requested) }}<br>{{ r.state }} / {{ r.reason_code }}<br>Basis: {{ r.basis }}; rc: {{ value(r.rc) }}</td><td>{{ r.slot_state }}{% for c in r.collection_states %}<br>{{ c.collection_id }} / {{ c.state }} / {{ c.reason_code }}{% endfor %}</td><td>{{ r.detail_slot_state }}</td></tr>{% endfor %}
 </tbody></table></div><p>VERIFIED_COMPANION: retained C1 synthetic metadata and exact evidence references, not a native certificate acquisition or security verdict. DETAIL_NOT_RETAINED: no verified companion available for that record. Generic fixture diagnostics are not a certificate companion. Opaque source and target IDs are not paths or vhosts.</p></section>
 {% for g in index.groups %}<section id="{{ g.id }}">
 <h2>{{ g.kind }} &mdash; {{ value(g.fingerprint) }}</h2><p>Group ID: {{ g.id }}. Source: {{ g.source_kind }}.{% if g.source_kind == 'SYNTHETIC' %} Synthetic engineering evidence only; no native qualification.{% endif %}</p>
@@ -40,6 +40,6 @@
 <h3>Service binding</h3><p>{{ g.service_binding_state }} / no explicit certificate-service binding recorded. Shared hosts, ports or algorithms do not establish a binding.</p>
 </section>{% else %}<p class="empty">No indexed certificate records. This is not a negative verdict.</p>{% endfor %}
 </main>
-<footer class="wrap footer">Private offline report. Index preview contract; publication and host backlinks are integrated separately.</footer>
+<footer class="wrap footer">{% if portal_v5 %}Saved verified offline report. No new assessment or security score. Publication is integrated separately.{% else %}Private offline report. Index preview contract; publication and host backlinks are integrated separately.{% endif %}</footer>
 </body>
 </html>
