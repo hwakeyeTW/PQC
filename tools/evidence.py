@@ -10,6 +10,7 @@ import math
 import re
 import unicodedata
 from datetime import datetime
+from enum import Enum
 from typing import NamedTuple
 
 SCHEMA_VERSION = "1.0.0"  # Stable default for existing producers.
@@ -33,11 +34,60 @@ REGISTRIES = {"hosts": "host_id", "collections": "collection_id", "assets": "ass
               "evidence": "evidence_id", "claims": "claim_id", "findings": "finding_id"}
 
 
+# Private, versioned aggregate policy. Public entry points always use MAX_BYTES.
+# These are fixed code-level selectors, never values read from a document.
+V3_CAPACITY_PROFILE = "B04_V3_CAPACITY_R2"
+_V3_RAW_BYTES = 64 * 1024 * 1024
+_V3_ASSESSED_BYTES = 96 * 1024 * 1024
+_V3_HOST_BYTES = 32 * 1024 * 1024
+_V3_HOSTS = 10
+_V3_HOST_ROWS = 20000
+_V3_RUN_ROWS = 200000
+
+
+class _V3Stage(Enum):
+    RAW = "RAW_EVIDENCE"
+    ASSESSED = "ASSESSED_EVIDENCE"
+    CFF = "CFF"
+
+
 class EvidenceError(ValueError):
     """Stable code and model location; never interpolates input values or keys."""
     def __init__(self, code, location="$?"):
         self.code, self.location = code, location
         super().__init__(f"{code} at {location}")
+
+
+class V3CapacityError(EvidenceError):
+    """A fixed capacity failure; no payload values in the diagnostic."""
+    def __init__(self, stage):
+        if type(stage) is not _V3Stage:
+            raise ValueError("INVALID_CAPACITY_STAGE")
+        self.stage = stage.value
+        super().__init__("V3_CAPACITY_LIMIT", stage.value)
+
+
+def _v3_require(condition, stage):
+    if not condition:
+        raise V3CapacityError(stage)
+
+
+def _byte_limit(stage, single_host=False):
+    if stage is None:
+        return MAX_BYTES
+    if stage is _V3Stage.RAW:
+        return _V3_HOST_BYTES if single_host else _V3_RAW_BYTES
+    if stage is _V3Stage.ASSESSED:
+        return _V3_HOST_BYTES if single_host else _V3_ASSESSED_BYTES
+    raise ValueError("INVALID_CAPACITY_STAGE")
+
+
+def _check_bytes(size, stage=None, single_host=False):
+    limit = _byte_limit(stage, single_host)
+    if stage is None:
+        _require(size <= limit, "SIZE_LIMIT", "$")
+    else:
+        _v3_require(size <= limit, stage)
 
 
 def _require(condition, code, location):
@@ -46,7 +96,10 @@ def _require(condition, code, location):
 
 
 def _plain(s):
-    return not any(unicodedata.category(c) in ("Cc", "Cf", "Cs") for c in s)
+    # Printable ASCII has none of the forbidden Unicode categories. Keep the
+    # original Unicode check for every other string, including ASCII controls.
+    return not s or (s.isascii() and s.isprintable()) or not any(
+        unicodedata.category(c) in ("Cc", "Cf", "Cs") for c in s)
 
 
 _PATH_PREFIX = r"^(?:[A-Za-z]:|[Ff][Ii][Ll][Ee]:|[Hh][Tt][Tt][Pp][Ss]?:|[Ff][Tt][Pp]:|[Ss][Ss][Hh]:|[Ss][Mm][Bb]:|[Dd][Aa][Tt][Aa]:)"
@@ -80,13 +133,13 @@ def _json_guard(value, depth=1):
         _require(value is None or t is bool, "TYPE", "$")
 
 
-def _encode(value):
+def _encode(value, *, stage=None, single_host=False):
     encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                                allow_nan=False)
     output = bytearray()
     for chunk in encoder.iterencode(value):
         part = chunk.encode("utf-8")
-        _require(len(output) + len(part) <= MAX_BYTES, "SIZE_LIMIT", "$")
+        _check_bytes(len(output) + len(part), stage, single_host)
         output.extend(part)
     return bytes(output)
 
@@ -130,8 +183,12 @@ def _nonfinite(_):
 
 def parse_evidence_bytes(raw: bytes):
     """Parse strict UTF-8 JSON, validate it, and return a fresh document."""
+    return _parse_bytes(raw)
+
+
+def _parse_bytes(raw, stage=None):
     _require(type(raw) is bytes, "TYPE", "$")
-    _require(len(raw) <= MAX_BYTES, "SIZE_LIMIT", "$")
+    _check_bytes(len(raw), stage)
     _nesting(raw)
     try:
         doc = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
@@ -140,7 +197,7 @@ def parse_evidence_bytes(raw: bytes):
         raise
     except (UnicodeError, ValueError, RecursionError, OverflowError):
         raise EvidenceError("INVALID_JSON", "$") from None
-    validate_document(doc)
+    _validate_document(doc, stage)
     return doc
 
 
@@ -692,13 +749,54 @@ def _validate_extended_data(row, p):
 
 def validate_document(document):
     """Validate shape and semantic invariants without mutation; return None."""
+    _validate_document(document)
+
+
+def _v3_groups(document, stage):
+    """Bound registries by their real host ownership, not guessed ID prefixes.
+
+    Called only after the shared semantic validator has verified references.
+    The host view is a size calculation, never a second run or digest.
+    """
+    _v3_require(1 <= len(document["hosts"]) <= _V3_HOSTS, stage)
+    groups = {h["host_id"]: {k: [] for k in REGISTRIES if k != "hosts"}
+              for h in document["hosts"]}
+    for name in REGISTRIES:
+        _v3_require(len(document[name]) <= _V3_RUN_ROWS, stage)
+        if name == "hosts":
+            continue
+        for row in document[name]:
+            hid = row["subject"]["host_id"] if name in ("claims", "findings") else row["host_id"]
+            rows = groups[hid][name]
+            _v3_require(len(rows) < _V3_HOST_ROWS, stage)
+            rows.append(row)
+    return groups
+
+
+def _v3_host_sizes(document, stage):
+    groups = _v3_groups(document, stage)
+    for host in document["hosts"]:
+        hid = host["host_id"]
+        view = {"schema_version": document["schema_version"],
+                "run": {**document["run"], "expected_host_ids": [hid]},
+                "hosts": [host], **groups[hid]}
+        _encode(view, stage=stage, single_host=True)
+
+
+def _validate_document(document, stage=None):
     _json_guard(document)
-    _encode(document)  # enforce the same byte budget for in-memory callers
+    _encode(document, stage=stage)  # same byte budget for in-memory callers
     version = document.get("schema_version", SCHEMA_VERSION) if type(document) is dict else SCHEMA_VERSION
     shape, data_shapes, _ = _model(version)
     shape.check(document, "$")
     run = document["run"]
     rid, run_source = run["run_id"], run["source"]
+    if stage is not None:
+        _require(version == LATEST_SCHEMA_VERSION and run_source["source_kind"] == "SYNTHETIC",
+                 "INVALID_CAPACITY_PROFILE", "$.run")
+        _v3_require(1 <= len(document["hosts"]) <= _V3_HOSTS, stage)
+        for name in REGISTRIES:
+            _v3_require(len(document[name]) <= _V3_RUN_ROWS, stage)
     if run["started_at"] is not None and run["finished_at"] is not None:
         _require(_timestamp_key(run["started_at"]) <= _timestamp_key(run["finished_at"]), "TIME_ORDER", "$.run")
     hosts, collections, assets, evidence, claims, findings = (_index(document, k) for k in REGISTRIES)
@@ -856,11 +954,17 @@ def validate_document(document):
             _require(matching or any(_na_usable(e, collections) for e in rows), "APPLICABILITY_EVIDENCE_REQUIRED", p)
         elif state == "NOT_SCANNED":
             _require(not rows and all(cl["assessment_state"] == state for cl in links), "UNATTEMPTED_EVIDENCE", p)
+    if stage is not None:
+        _v3_host_sizes(document, stage)
 
 
 def canonical_bytes(document):
     """Validate then sort registry/set fields; no I/O or mutation of input."""
-    validate_document(document)
+    return _canonical_bytes(document)
+
+
+def _canonical_bytes(document, stage=None):
+    _validate_document(document, stage)
     clone = {**document, "run": {**document["run"],
                                  "expected_host_ids": sorted(document["run"]["expected_host_ids"])}}
     for registry, key in REGISTRIES.items():
@@ -868,4 +972,29 @@ def canonical_bytes(document):
         for row in sorted(document[registry], key=lambda r: r[key]):
             rows.append({k: sorted(v) if k in ("evidence_ids", "claim_ids") else v for k, v in row.items()})
         clone[registry] = rows
-    return _encode(clone)
+    return _encode(clone, stage=stage)
+
+
+# Fixed private entry points. No optional profile/cap on any legacy API.
+def _parse_v3_raw(raw):
+    return _parse_bytes(raw, _V3Stage.RAW)
+
+
+def _parse_v3_assessed(raw):
+    return _parse_bytes(raw, _V3Stage.ASSESSED)
+
+
+def _validate_v3_raw(document):
+    _validate_document(document, _V3Stage.RAW)
+
+
+def _validate_v3_assessed(document):
+    _validate_document(document, _V3Stage.ASSESSED)
+
+
+def _canonical_v3_raw(document):
+    return _canonical_bytes(document, _V3Stage.RAW)
+
+
+def _canonical_v3_assessed(document):
+    return _canonical_bytes(document, _V3Stage.ASSESSED)

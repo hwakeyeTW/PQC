@@ -24,6 +24,11 @@ IMPACT_SEMANTICS = 'NOT_ASSESSED'
 MAX_BYTES = 32 * 1024 * 1024
 MAX_HOSTS = 1000
 MAX_ROWS = 20000
+_V3_ENTRY_BYTES = 32 * 1024 * 1024
+_V3_WRAPPER_BYTES = 128 * 1024 * 1024
+_V3_ENTRY_NODES = 2000000
+_V3_WRAPPER_NODES = 8000000
+_V3_STAGE = evidence._V3Stage.CFF
 ERROR_STATES = frozenset(('ERROR', 'PERMISSION_DENIED', 'UNREACHABLE'))
 HOST_ERRORS = frozenset(('ERROR', 'UNREACHABLE'))
 SAFE_LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,511}\Z')
@@ -61,23 +66,39 @@ def _label(value):
 
 
 def _bounded_json(value):
-    """Bound the wire bytes; accept only ordinary JSON data, not object hooks."""
+    """Legacy wire limit; accept only ordinary JSON data, not object hooks."""
+    return _json_metrics(value)[0]
+
+
+def _json_metrics(value, *, v3_entry=False, _row=False):
+    # Same scalar/depth/array grammar. V3 entry is nested in a full wrapper,
+    # so count its depth from the actual root (entry starts at depth 3).
     nodes = 0
+    byte_limit = _V3_ENTRY_BYTES if v3_entry else MAX_BYTES
+    row_limit = evidence._V3_HOST_ROWS if v3_entry else MAX_ROWS
+    node_limit = _V3_ENTRY_NODES if v3_entry else 2000000
+
+    def capacity(ok):
+        if v3_entry:
+            evidence._v3_require(ok, _V3_STAGE)
+        else:
+            _require(ok, 'PROJECTION_LIMIT')
     def plain_text(v):
         return (type(v) is str and len(v) <= 512 and
-                not any(unicodedata.category(c) in ('Cc', 'Cf', 'Cs') for c in v))
+                (not v or (v.isascii() and v.isprintable()) or
+                 not any(unicodedata.category(c) in ('Cc', 'Cf', 'Cs') for c in v)))
 
     def visit(v, depth):
         nonlocal nodes
         nodes += 1
-        _require(depth <= 64 and nodes <= 2000000, 'PROJECTION_LIMIT')
+        capacity(depth <= 64 and nodes <= node_limit)
         t = type(v)
         if t is dict:
             for k, item in v.items():
                 _require(plain_text(k), 'PROJECTION_TYPE')
                 visit(item, depth + 1)
         elif t is list:
-            _require(len(v) <= MAX_ROWS, 'PROJECTION_LIMIT')
+            capacity(len(v) <= row_limit)
             for item in v:
                 visit(item, depth + 1)
         elif t is str:
@@ -88,14 +109,91 @@ def _bounded_json(value):
             _require(math.isfinite(v), 'PROJECTION_TYPE')
         else:
             _require(v is None or t is bool, 'PROJECTION_TYPE')
-    visit(value, 1)
+    visit(value, 6 if _row else (3 if v3_entry else 1))
     out = bytearray()
     encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
                                separators=(',', ':'), allow_nan=False)
     for chunk in encoder.iterencode(value):
         raw = chunk.encode('utf-8')
-        _require(len(out) + len(raw) <= MAX_BYTES, 'PROJECTION_LIMIT')
+        capacity(len(out) + len(raw) <= byte_limit)
         out.extend(raw)
+    return bytes(out), nodes
+
+
+class _V3Wrapper:
+    """Account exact canonical wrapper overhead before accepting each pair.
+
+    Count JSON values (including objects/arrays), as the original guard does;
+    keys are validated strings but are not separate nodes. The closed wrapper
+    contributes four nodes: object, per_host array, digest, version.
+    """
+    def __init__(self, digest, version):
+        _require(type(digest) is str and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
+                 and type(version) is str and version == VERSION, 'PROJECTION_TYPE')
+        self.prefix = b'{"evidence_document_sha256":"' + digest.encode('ascii') + b'","per_host":['
+        self.suffix = b'],"projection_version":"1.0.0"}'
+        self.size = len(self.prefix) + len(self.suffix)
+        self.nodes = 4
+        self.count = 0
+
+    def add(self, entry):
+        raw, nodes = _json_metrics(entry, v3_entry=True)
+        size = self.size + len(raw) + int(self.count != 0)
+        total_nodes = self.nodes + nodes
+        evidence._v3_require(self.count < evidence._V3_HOSTS and size <= _V3_WRAPPER_BYTES
+                             and total_nodes <= _V3_WRAPPER_NODES, _V3_STAGE)
+        self.size, self.nodes = size, total_nodes
+        self.count += 1
+        return raw
+
+
+class _V3Rows:
+    """Limit projected row materialization before append, not just final encoding.
+
+    The sum of canonical row bytes and nodes is a lower bound on the complete
+    pair; the wrapper performs the exact check including all envelope fields.
+    Both duplicated findings representations consume their own budget.
+    """
+    def __init__(self, wrapper):
+        self.wrapper = wrapper
+        self.size = self.nodes = 0
+
+    def map(self, items, project):
+        evidence._v3_require(len(items) <= evidence._V3_HOST_ROWS, _V3_STAGE)
+        rows = []
+        for item in items:
+            row = project(item)
+            raw, nodes = _json_metrics(row, v3_entry=True, _row=True)
+            size = self.size + len(raw)
+            total_nodes = self.nodes + nodes
+            evidence._v3_require(size <= _V3_ENTRY_BYTES and total_nodes <= _V3_ENTRY_NODES
+                                 and self.wrapper.size + size <= _V3_WRAPPER_BYTES
+                                 and self.wrapper.nodes + total_nodes <= _V3_WRAPPER_NODES,
+                                 _V3_STAGE)
+            self.size, self.nodes = size, total_nodes
+            rows.append(row)
+        return rows
+
+
+def _map_rows(budget, items, project):
+    return [project(item) for item in items] if budget is None else budget.map(items, project)
+
+
+def _v3_wrapper_bytes(projection):
+    _require(type(projection) is dict and projection.keys() == {
+        'projection_version', 'per_host', 'evidence_document_sha256'}, 'PROJECTION_TYPE')
+    entries = projection['per_host']
+    _require(type(entries) is list, 'PROJECTION_TYPE')
+    evidence._v3_require(1 <= len(entries) <= evidence._V3_HOSTS, _V3_STAGE)
+    budget = _V3Wrapper(projection['evidence_document_sha256'], projection['projection_version'])
+    out = bytearray(budget.prefix)
+    for entry in entries:
+        raw = budget.add(entry)
+        if budget.count > 1:
+            out.extend(b',')
+        out.extend(raw)
+    out.extend(budget.suffix)
+    _require(len(out) == budget.size)
     return bytes(out)
 
 
@@ -372,17 +470,37 @@ def project_cff(document, rules):
     raise the original assessment error; foreign findings are retained but
     excluded. Save the canonical assessed Evidence separately with this pair.
     """
-    evidence.validate_document(document)
-    _limits(document)
-    assessed = assessment.evaluate_document(document, rules)
-    _limits(assessed)
-    digest = _digest(evidence.canonical_bytes(assessed))
+    return _project_cff(document, rules)
+
+
+def _project_v3_raw(document, rules):
+    return _project_cff(document, rules, evidence._V3Stage.RAW)
+
+
+def _project_v3_assessed(document, rules):
+    return _project_cff(document, rules, evidence._V3Stage.ASSESSED)
+
+
+def _project_cff(document, rules, stage=None):
+    if stage is None:
+        evidence.validate_document(document)
+        _limits(document)
+        assessed = assessment.evaluate_document(document, rules)
+        _limits(assessed)
+        digest = _digest(evidence.canonical_bytes(assessed))
+        groups = _group(assessed)
+    else:
+        # The same evaluator validates its input and recomputes owned results.
+        # Its V3 raw/assessed validators enforce real host/registry budgets.
+        assessed = assessment._evaluate_document(document, rules, stage)
+        digest = _digest(evidence._canonical_v3_assessed(assessed))
+        groups = evidence._v3_groups(assessed, _V3_STAGE)
     run = assessed['run']
     owned_levels = _owned_rule_levels(rules)
-    groups = _group(assessed)
     cache = {}
     result = {'projection_version': VERSION, 'per_host': [], 'evidence_document_sha256': digest}
     budget = 0
+    wrapper = _V3Wrapper(digest, VERSION) if stage is not None else None
     for host in assessed['hosts']:
         hid = host['host_id']
         group = groups[hid]
@@ -390,9 +508,10 @@ def project_cff(document, rules):
         indexes = {k: {r[evidence.REGISTRIES[k]]: r for r in group[k]}
                    for k in ('claims', 'collections', 'evidence')}
         empty = _empty_coverage_ids(hid, group['collections'])
-        rows = [_finding_row(f, owned_levels, indexes, empty, host, bool(group['collections']))
-                for f in group['findings']]
-        wire = [_cff_finding(f, display, owned_levels) for f in rows]
+        row_budget = _V3Rows(wrapper) if wrapper is not None else None
+        rows = _map_rows(row_budget, group['findings'], lambda f: _finding_row(
+            f, owned_levels, indexes, empty, host, bool(group['collections'])))
+        wire = _map_rows(row_budget, rows, lambda f: _cff_finding(f, display, owned_levels))
         summary = _summary(wire)
         comp = {'version': VERSION, 'evidence_schema_version': assessed['schema_version'],
                 'evidence_document_sha256': digest, 'run': _run_row(run),
@@ -400,18 +519,22 @@ def project_cff(document, rules):
                 'taxonomy_version': rules['taxonomy_version'], 'score': _score(summary),
                 'severity_semantics': SEVERITY_SEMANTICS, 'disruption_semantics': DISRUPTION_SEMANTICS,
                 'aap_impact_semantics': IMPACT_SEMANTICS,
-                'collections': [_collection_row(c) for c in group['collections']],
-                'assets': [_asset_row(a) for a in group['assets']],
-                'evidence': [_evidence_row(e, rules, cache) for e in group['evidence']],
-                'claims': [_claim_row(c) for c in group['claims']], 'findings': rows}
+                'collections': _map_rows(row_budget, group['collections'], _collection_row),
+                'assets': _map_rows(row_budget, group['assets'], _asset_row),
+                'evidence': _map_rows(row_budget, group['evidence'], lambda e: _evidence_row(e, rules, cache)),
+                'claims': _map_rows(row_budget, group['claims'], _claim_row), 'findings': rows}
         entry = {'host_id': hid, 'cff': {'version': VERSION, 'scan_metadata': _metadata(run, host, display),
                                         'findings': wire, 'summary': summary}, 'companion': comp}
         _verify_host(entry, host, group, assessed, digest, owned_levels)
-        budget += len(_bounded_json(entry))
-        _require(budget <= MAX_BYTES, 'PROJECTION_LIMIT')
+        if wrapper is None:
+            budget += len(_bounded_json(entry))
+            _require(budget <= MAX_BYTES, 'PROJECTION_LIMIT')
+        else:
+            wrapper.add(entry)  # actual entry and cumulative wrapper limits, before append
         result['per_host'].append(entry)
     _require([h['host_id'] for h in result['per_host']] == sorted(run['expected_host_ids']))
-    _bounded_json(result)
+    if wrapper is None:
+        _bounded_json(result)
     # The wire payload has no reference to any caller-owned mutable object.
     # The evaluated input is already a fresh canonical JSON copy.
     return result
@@ -434,3 +557,29 @@ def canonical_projection_bytes(projection, document, rules):
     """Return canonical UTF-8 wire bytes only after exact semantic validation."""
     validate_projection(projection, document, rules)
     return _bounded_json(projection)
+
+
+def _canonical_v3_projection(projection, document, rules, stage):
+    # Explicit internal raw/assessed input path; no caller-controlled caps.
+    if stage not in (evidence._V3Stage.RAW, evidence._V3Stage.ASSESSED):
+        raise ValueError('INVALID_CAPACITY_STAGE')
+    actual = _v3_wrapper_bytes(projection)
+    expected = _v3_wrapper_bytes(_project_cff(document, rules, stage))
+    _require(actual == expected, 'PROJECTION_MISMATCH')
+    return actual
+
+
+def _canonical_v3_raw_projection(projection, document, rules):
+    return _canonical_v3_projection(projection, document, rules, evidence._V3Stage.RAW)
+
+
+def _canonical_v3_assessed_projection(projection, document, rules):
+    return _canonical_v3_projection(projection, document, rules, evidence._V3Stage.ASSESSED)
+
+
+def _validate_v3_raw_projection(projection, document, rules):
+    _canonical_v3_raw_projection(projection, document, rules)
+
+
+def _validate_v3_assessed_projection(projection, document, rules):
+    _canonical_v3_assessed_projection(projection, document, rules)
