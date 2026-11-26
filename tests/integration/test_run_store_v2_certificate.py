@@ -538,3 +538,249 @@ def test_actual_foreign_owner_v2_artifact(root):
             reject('UNSAFE_FILE',s.open,RID)
         finally:
             path.rename(foreign)
+
+
+# C2: actual verified C1 publications, not manufactured PublishedRun positives.
+def _c2_open(root, modes, *, assessed=False, recovery=False):
+    args, doc, terminal, rc, ds = fixture(modes)
+    if assessed:
+        args['requirements'] = {'assessment': True, 'cff': False, 'details': [
+            dict(host_id=hid, slot=slot) for hid in doc['run']['expected_host_ids']
+            if args['requested_flags'][row_for(doc, terminal, hid)['target_id']][bridge.CERT_FLAG]
+            for slot in sorted(v2.SLOTS)]}
+    with store.RunStore(root) as s:
+        with s.begin(**args) as w:
+            if recovery:
+                ids = doc['run']['expected_host_ids']
+                record(w, doc, terminal, ds, ids=ids[:1]); w.dispatch_intent(ids[1])
+            else:
+                record(w, doc, terminal, ds)
+                finalize(w, doc, terminal, rc, **(dict(assessed=assessment.evaluate_document(doc, RULES),
+                    rules_raw=RULES_RAW) if assessed else {}))
+        if recovery:
+            s.recover(RID)
+        return s.open(RID)
+
+
+def _c2_tree(root):
+    return {str(p.relative_to(root)): (p.stat().st_ino, p.stat().st_mode, p.stat().st_mtime_ns,
+            p.read_bytes() if p.is_file() else None) for p in root.rglob('*')}
+
+
+def _c2_html(raw):
+    from html.parser import HTMLParser
+    from urllib.parse import urlsplit
+
+    class Page(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.ids = set(); self.links = []
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            assert tag not in {'script', 'iframe', 'object', 'embed', 'base', 'form'}
+            assert not any(k.startswith('on') or k in ('src', 'srcset', 'action', 'style') for k in attrs)
+            if 'id' in attrs:
+                assert attrs['id'] not in self.ids
+                self.ids.add(attrs['id'])
+            if 'href' in attrs:
+                href = attrs['href']; u = urlsplit(href)
+                assert not u.scheme and not u.netloc and not u.query and not u.path.startswith('/')
+                assert '\\' not in href and '%' not in href
+                self.links.append(href)
+    p = Page(); p.feed(raw.decode('utf-8'))
+    assert all(h[1:] in p.ids for h in p.links if h.startswith('#'))
+    return p
+
+
+@pytest.mark.parametrize('assessed', [False, True])
+def test_c2_actual_multihost_exact_joins_and_html(root, assessed, monkeypatch):
+    from tools import portal_asset_indexes as ai, portal_indexes as crypto
+    pub = _c2_open(root, ('complete', 'complete'), assessed=assessed)
+    before = _c2_tree(root); original = deepcopy(pub)
+    # The Store has already verified the retained handoff and rules. C2 must
+    # not replay them or create a second algorithm classification/assessment.
+    def forbidden(*a, **kw):
+        raise AssertionError('C2 replayed the producer or assessment')
+    monkeypatch.setattr(ca, 'validate_cert_details', forbidden)
+    monkeypatch.setattr(assessment, 'evaluate_document', forbidden)
+    p, pages = ai.render_asset_indexes(pub)
+    assert (p, pages) == ai.render_asset_indexes(pub)
+    assert pub == original and _c2_tree(root) == before
+    assert set(pages) == {'certificates.html', 'services.html'}
+    html = _c2_html(pages['certificates.html']); _c2_html(pages['services.html'])
+    assert p['assessed'] is assessed
+    ix = p['certificates']; groups = ix['groups']
+    assert len(groups) == 2 and len(ix['asset_ids']) == 4
+    assert len(ix['recorded_occurrence_ids']) == len(ix['verified_occurrence_ids']) == 8
+    assert ix['recorded_occurrence_ids'] == ix['verified_occurrence_ids']
+    assert ix['counts']['verified_occurrence_ids'] == 8
+    oracle = {}
+    for h in pub.manifest['hosts']:
+        hid = h['host_id']; d = json.loads(pub.artifacts[f'details/{hid}/{v2.CERTIFICATE}.json'])
+        for item in d['occurrences']:
+            src = next(s for s in d['snapshot'][item['root']]['sources'] if s['source_id'] == item['source_id'])
+            block = src['blocks'][item['block_index'] - 1]; cert = block['certificate']
+            raw = json.dumps(dict(record={k: v for k, v in item.items() if k not in ('detail_ref', 'detail_sha256')},
+                block=block, format=src['format']), sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+            assert hashlib.sha256(raw).hexdigest() == item['detail_sha256']
+            key = (hid, item['root'], item['source_id'], item['block_index'])
+            assert key not in oracle; oracle[key] = (item, cert, src)
+    assert len(oracle) == 8
+    for oid, r in p['occurrences'].items():
+        item, cert, src = oracle.pop((r['host_id'], r['root'], r['source_id'], r['block_index']))
+        assert {k: r[k] for k in item if k != 'run_id'} == {k: v for k, v in item.items() if k != 'run_id'}
+        expected_id = 'occ-' + hashlib.sha256(json.dumps([r['host_id'], r['collection_id'], r['asset_id'],
+            r['source_id'], r['block_index'], r['detail_sha256']], separators=(',', ':')).encode()).hexdigest()
+        assert oid == expected_id and oid in html.ids
+        assert r['detail_state'] == 'VERIFIED_COMPANION' and r['target_id'] == src['target_id']
+        assert r['path'] is r['vhost'] is None
+        assert r['certificate_metadata'] == {k: v for k, v in cert.items() if k not in ('fingerprint', 'gaps')}
+        assert r['metadata_gaps'] == cert['gaps']
+        assert set(r['role_evidence_ids']) == {'certificate', 'public-key', 'signature'}
+        assert sorted(r['role_evidence_ids'].values()) == r['evidence_ids']
+        for eid in r['evidence_ids']:
+            assert p['evidence'][eid]['href'] in html.links
+        assert r['target_id'].encode() in pages['certificates.html']
+    assert not oracle
+    ci, cpages = crypto.render_crypto_indexes(pub)
+    alg_ids = _c2_html(cpages['algorithms.html']).ids
+    by_algorithm = {g['id']: set(g['evidence_ids']) for g in ci['algorithms']['groups']}
+    for g in groups:
+        assert g['id'] in html.ids and g['service_group_ids'] == []
+        assert g['verified_occurrence_count'] == len(g['recorded_occurrence_ids'])
+        assert g['detail_state'] == 'VERIFIED_COMPANION' and g['validity_state'] == 'RECORDED'
+        assert g['public_key_bits'] == 2048 and g['public_key_bits_evidence_ids'] == []
+        assert g['issuer'] == 'CN=Fixture issuer' and g['subject'] == 'CN=Fixture certificate'
+        assert g['validity_occurrence_ids'] == g['verified_occurrence_ids']
+        assert {k: len(g[k]) for k in ('host_ids', 'asset_ids', 'evidence_ids', 'claim_ids')} == {
+            k: g['counts'][k] for k in ('host_ids', 'asset_ids', 'evidence_ids', 'claim_ids')}
+        expected = {k: ids & set(g['evidence_ids']) for k, ids in by_algorithm.items() if ids & set(g['evidence_ids'])}
+        assert {link['group_id']: set(link['evidence_ids']) for link in g['algorithm_links']} == expected
+        assert all(link['href'] in html.links and link['group_id'] in alg_ids for link in g['algorithm_links'])
+        assert all(p[t][ref]['href'] in html.links for k, t in [('host_ids', 'hosts'), ('asset_ids', 'assets'),
+                    ('evidence_ids', 'evidence'), ('claim_ids', 'claims')] for ref in g[k])
+        if not assessed:
+            assert not g['claim_ids']
+    assert _c2_tree(root) == before
+
+
+@pytest.mark.parametrize('mode', ['partial', 'disabled', 'connection', 'error', 'stopped', 'worker'])
+def test_c2_actual_coverage_and_missing(root, mode):
+    from tools import portal_asset_indexes as ai
+    pub = _c2_open(root, ('complete', mode)); before = _c2_tree(root)
+    p, pages = ai.render_asset_indexes(pub)
+    assert _c2_tree(root) == before
+    host = next(h for h in pub.manifest['hosts'] if h['target_id'] == TARGETS[1])
+    row = next(r for r in p['coverage'] if r['host_id'] == host['host_id'] and r['slot'] == 'system_certs')
+    if mode == 'partial':
+        assert row['detail_slot_state'] == 'VERIFIED_COMPANION'
+        g = next(g for g in p['certificates']['groups'] if g['fingerprint'] == digest('public-fixture-1'))
+        assert g['metadata_fields']['not_after']['state'] == 'PARTIAL'
+        assert len(g['validity_occurrence_ids']) == 1 and g['validity_state'] == 'PARTIAL'
+        assert 'NOT_AFTER_UNKNOWN' in g['metadata_gaps']
+        assert p['certificates']['counts']['verified_occurrence_ids'] == 8
+    else:
+        assert row['detail_slot_state'] == ('NOT_REQUIRED' if mode == 'disabled' else 'REQUIRED_DETAIL_MISSING')
+        assert p['certificates']['counts']['verified_occurrence_ids'] == 4
+        assert not any(r['host_id'] == host['host_id'] for r in p['occurrences'].values())
+    assert row['detail_slot_state'].encode() in pages['certificates.html']
+
+
+def test_c2_actual_recovery(root):
+    from tools import portal_asset_indexes as ai
+    pub = _c2_open(root, ('complete', 'complete', 'complete'), recovery=True)
+    p, pages = ai.render_asset_indexes(pub)
+    rows = [r for r in p['coverage'] if r['slot'] == 'system_certs']
+    assert sorted(r['detail_slot_state'] for r in rows) == ['REQUIRED_DETAIL_MISSING'] * 2 + ['VERIFIED_COMPANION']
+    assert p['certificates']['counts']['verified_occurrence_ids'] == 4
+    assert b'REQUIRED_DETAIL_MISSING' in pages['certificates.html']
+
+
+@pytest.mark.parametrize('variant', ['conflict', 'disjoint-dates'])
+def test_c2_actual_conflicts_and_escape(root, monkeypatch, variant):
+    from tools import portal_asset_indexes as ai
+    original = envelope
+    def varied(target, mode='complete', *, large=False):
+        env = original(target, mode, large=large)
+        for value in env['records'][1]['snapshot']['roots'].values():
+            for src in value['sources']:
+                for block in src['blocks']:
+                    cert = block['certificate']
+                    if variant == 'conflict':
+                        if target == TARGETS[1]:
+                            cert.update(issuer='CN=<img src=x onerror=alert(1)> & issuer',
+                                subject='CN=Other fixture', public_key_bits=4096,
+                                signature_outer='sha384WithRSAEncryption',
+                                not_before='2028-01-01T00:00:00Z')
+                    elif target == TARGETS[0]:
+                        cert['not_after'] = None
+                    else:
+                        cert['not_before'] = None
+                    cert['gaps'] = ca.metadata_gaps(cert)
+                    block['reason'] = 'METADATA_GAP' if cert['gaps'] else 'OK'
+        return env
+    monkeypatch.setattr(sys.modules[__name__], 'envelope', varied)
+    pub = _c2_open(root, ('complete', 'complete'))
+    p, pages = ai.render_asset_indexes(pub); _c2_html(pages['certificates.html'])
+    assert len(p['certificates']['verified_occurrence_ids']) == 8
+    for g in p['certificates']['groups']:
+        fields = g['metadata_fields']
+        assert g['validity_occurrence_ids'] == []
+        if variant == 'conflict':
+            assert g['validity_state'] == g['signature_metadata_state'] == 'CONFLICT'
+            assert {'VALIDITY_CONFLICT', 'SIGNATURE_CONFLICT'} <= set(g['metadata_gaps'])
+            assert all(fields[k]['state'] == 'CONFLICT' and fields[k]['value'] is None
+                       for k in ('issuer', 'subject', 'public_key_bits', 'not_before', 'signature_outer'))
+            assert all('signature' not in r['role_evidence_ids'] for r in p['occurrences'].values()
+                       if 'SIGNATURE_CONFLICT' in r['metadata_gaps'])
+        else:
+            assert g['validity_state'] == 'PARTIAL'
+            assert fields['not_before']['state'] == fields['not_after']['state'] == 'PARTIAL'
+            assert g['not_before'] is None and g['not_after'] is None
+            assert fields['not_before']['value'] and fields['not_after']['value']
+            assert not (set(fields['not_before']['occurrence_ids']) & set(fields['not_after']['occurrence_ids']))
+    if variant == 'conflict':
+        html = pages['certificates.html']
+        assert b'&lt;img src=x onerror=alert(1)&gt; &amp; issuer' in html and b'<img' not in html
+
+
+@pytest.mark.parametrize('defect', ['marker', 'slot', 'bytes', 'foreign-host', 'omit', 'repeat',
+                                    'ref', 'role', 'hash', 'root', 'terminal', 'wrong-version'])
+def test_c2_reject_changed_verified_input(root, defect):
+    from tools import portal_asset_indexes as ai
+    pub = deepcopy(_c2_open(root, ('complete', 'complete')))
+    hid = pub.manifest['expected_host_ids'][0]
+    path = f'details/{hid}/{v2.CERTIFICATE}.json'
+    entry = next(a for a in pub.manifest['artifacts'] if a['path'] == path)
+    if defect == 'marker':
+        pub.manifest['batch_contract'] = store.NATIVE_BATCH_CONTRACT
+    elif defect == 'slot':
+        entry['slot'] = 'certificate-inventory'
+    elif defect == 'bytes':
+        pub.artifacts[path] += b' '
+    elif defect == 'ref':
+        entry['evidence_ids'].pop()
+    elif defect == 'terminal':
+        h = next(h for h in pub.manifest['hosts'] if h['host_id'] == hid)
+        next(c for c in h['terminal']['collectors'] if c['collector_id'] == bridge.CERT_FLAG)['collection_ids'].pop()
+    elif defect == 'wrong-version':
+        entry['format_version'] = '1.1.0'
+    else:
+        value = json.loads(pub.artifacts[path]); item = value['occurrences'][0]
+        if defect == 'foreign-host': item['host_id'] = pub.manifest['expected_host_ids'][1]
+        elif defect == 'omit': value['occurrences'].pop()
+        elif defect == 'repeat': value['occurrences'].append(deepcopy(item))
+        elif defect == 'role': item['evidence_ids'].pop()
+        elif defect == 'hash': item['detail_sha256'] = '0' * 64
+        elif defect == 'root': value['roots'][0]['detail_sha256'] = '0' * 64
+        raw = ca.canonical(value); pub.artifacts[path] = raw
+        entry.update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+    reject('INVALID_ASSET_INDEX_COMPANION', ai.render_asset_indexes, pub)
+
+
+@pytest.mark.parametrize('cap', ['_MAX_JSON', '_MAX_HTML', '_MAX_MEMBERSHIPS'])
+def test_c2_bounds_fail_closed(root, monkeypatch, cap):
+    from tools import portal_asset_indexes as ai
+    pub = _c2_open(root, ('complete',)); before = _c2_tree(root)
+    monkeypatch.setattr(ai, cap, 1)
+    reject('ASSET_INDEX_SIZE_LIMIT', ai.render_asset_indexes, pub)
+    assert _c2_tree(root) == before
