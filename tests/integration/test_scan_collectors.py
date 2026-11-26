@@ -823,9 +823,10 @@ def test_v2_earliest_worker_deadline_interrupts_native_receipt_normalization(fix
 # executes the single stage named by its actual native worker binding. No
 # prepared receipt replay, public transport, real RPM, or network access.
 class _P2Driver:
-    def __init__(self, tmp, ctx, *, ol=True, versions=None, modes=None, stage_seconds=30, fault=None):
+    def __init__(self, tmp, ctx, *, ol=True, versions=None, modes=None, stage_seconds=30, fault=None, tool_rows=None):
         self.tmp, self.ctx = tmp, ctx
         self.ol, self.versions, self.modes = ol, versions or {}, modes or {}
+        self.tool_rows = tool_rows or {}
         self.stage_seconds, self.fault = stage_seconds, fault
         self.p1 = ROOT / 'ansible_collections/security/compliance_pqc_readiness/plugins/modules/pqc_platform_acquire.py'
         self.python = os.path.abspath(sys._base_executable)
@@ -859,6 +860,7 @@ class _P2Driver:
             data = platform_snapshot()
             data['facts'].update(self.versions.get(name, {}))
             tools = data['tools']
+            tools.update(copy.deepcopy(self.tool_rows.get(name, {})))
             if mode == 'missing-rpm':
                 tools['rpm'][0] = dict(state='OK', exists=False, isreg=None, islnk=None, executable=None)
             rpm = private / 'rpm-fixture'
@@ -1773,3 +1775,486 @@ def test_o2_fatal_context_is_not_legacy_authority():
     assert set(result.companions)=={bridge.PLATFORM}
     assert result.outcomes[bridge.PACKAGES]['reason_code']=='GUARD_REJECTED'
     assert not result.outcomes[bridge.PACKAGES]['collection_ids']
+
+
+
+# CP2 uses the existing CP1 private fixture and native packaging API. The
+# canonical controller validator is never replaced by a fixture validator.
+def _cp2_fixture_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        '_cp2_acquisition_fixture', ROOT / 'tests/unit/test_policy_acquisition.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _CP2Driver(_P2Driver):
+    def __init__(self, tmp, ctx, *, fqcn=False, large=False, modes=None,
+                 stage_seconds=30, fault=None):
+        super().__init__(tmp, ctx, modes=modes, stage_seconds=stage_seconds, fault=fault)
+        self.cp1 = _cp2_fixture_module()
+        self.fqcn, self.large = fqcn, large
+        self.parent_pid = os.getpid()
+        self.validator = bridge._bound_policy_stage_validator()
+
+    def prepare(self, binding):
+        import selectors
+        import subprocess
+        assert type(binding) is bridge._PolicyStageBinding and binding.producer_id == bridge.POLICY
+        name, stage, ordinal = binding.target_id, binding.stage, binding.ordinal
+        assert binding.run_id and binding.task_uuid and name in self.ctx._targets
+        assert os.getpid() != self.parent_pid and stage == bridge._POLICY_STAGES[ordinal]
+        stem = f'{name}-{ordinal}'
+        private = self.tmp / stem
+        private.mkdir(mode=0o700)
+        mode = self.modes.get((name, ordinal), 'ok')
+        cp1 = self.cp1
+        root = cp1._root(private)
+        cp1._write(root, cp1.acq.PATHS['kernel-fips'], b'1\n')
+        group = self.tmp / (stem + '-group.json')
+        if self.large:
+            # Each file and aggregate stay within the CP1 input bounds, but
+            # the typed reader projection exceeds the original 16 KiB cap.
+            values = ['A'+str(i)+'x'*89 for i in range(64)]
+            cp1._write(root, cp1.acq.PATHS['current-policy'],
+                       ('cipher = '+' '.join(values)+'\n').encode())
+            for scope in ('backend-openssh', 'backend-opensshserver'):
+                cp1._write(root, cp1.acq.PATHS[scope],
+                           ('Ciphers '+','.join(values)+'\n').encode())
+            suites = ['TLS_'+str(i)+'A'*88 for i in range(64)]
+            for scope in ('backend-openssl', 'backend-opensslcnf'):
+                cp1._write(root, cp1.acq.PATHS[scope],
+                           ('Ciphersuites = '+':'.join(suites)+'\n').encode())
+        if mode == 'total-limit':
+            for scope in ('current-policy', 'backend-openssh', 'backend-opensshserver',
+                          'backend-openssl', 'backend-opensslcnf'):
+                cp1._write(root, cp1.acq.PATHS[scope], b'#'+b'x'*16383)
+        if stage != 'reader':
+            # The other fixed show path exists too; it must never be a retry.
+            other = 'show-sbin' if stage == 'show-bin' else 'show-bin'
+            cp1._script(root, other, 'raise AssertionError("unexpected fallback")')
+            if mode != 'missing-show':
+                cp1._reply(root, stage, b'FIPS\n' if stage == 'show-bin' else b'DEFAULT\n',
+                           rc=7 if mode == 'show-failure' else 0)
+        fixture = cp1._fixture(private, root, fqcn=self.fqcn, outer=self.stage_seconds)
+        if mode in ('outer-timeout', 'consumer-loss'):
+            # The private native acquisition child, not the outer supervisor,
+            # hangs. The original bounded CP1 supervisor must reap its group.
+            source = fixture[0]
+            raw = source.read_text()
+            anchor = 'def _acquire(stage):\n'
+            assert raw.count(anchor) == 1
+            raw = raw.replace(anchor, anchor +
+                '    import json, time, signal, os\n'
+                '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                f'    with open({str(group)!r}, "x") as marker:\n'
+                '        json.dump(dict(pids=[os.getpid()], pgid=os.getpgrp()), marker)\n'
+                '    time.sleep(60)\n')
+            source.write_text(raw)
+        wrapper, env = cp1._package(private / 'native', stage, fixture)
+        if self.fault is not None:
+            self.fault('prepare', binding, None)
+
+        def launch(begin):
+            if mode == 'no-begin':
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            end = begin()
+            if mode == 'no-start':
+                (self.tmp / (stem + '-no-start.json')).write_text('{}')
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            if mode == 'untrusted-clean-failure':
+                raise bridge._StageFailure('COMMAND_TIMEOUT', -9, True)
+            proc = subprocess.Popen([self.python, '-I', '-B', str(wrapper)], cwd=wrapper.parent,
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            (self.tmp / (stem + '-launch.json')).write_text(json.dumps(dict(
+                stage=stage, ordinal=ordinal, task=binding.task_uuid, run=binding.run_id,
+                worker=os.getpid(), supervisor=proc.pid, began=time.monotonic(), end=end)))
+            buffers = [bytearray(), bytearray()]
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for i, stream in enumerate((proc.stdout, proc.stderr)):
+                        sel.register(stream, selectors.EVENT_READ, i)
+                    while sel.get_map() or proc.poll() is None:
+                        if mode == 'consumer-loss' and group.exists():
+                            os._exit(17)
+                        left = end-time.monotonic()
+                        assert left > 0
+                        if not sel.get_map():
+                            time.sleep(min(.01, left))
+                            continue
+                        for key, _ in sel.select(min(.02, left)):
+                            room = bridge._POLICY_FRAME_BYTES-sum(map(len, buffers))
+                            data = os.read(key.fd, min(4096, room+1))
+                            assert len(data) <= room
+                            if data:
+                                buffers[key.data].extend(data)
+                            else:
+                                sel.unregister(key.fileobj)
+                proc.wait(timeout=max(.01, end-time.monotonic()))
+            finally:
+                proc.stdout.close()
+                proc.stderr.close()
+                if proc.poll() is None:
+                    proc.wait(timeout=self.stage_seconds+1)
+            assert proc.returncode == 0 and not buffers[1]
+            assert not batch._scope.group_exists(proc.pid)
+            if group.exists():
+                witness = json.loads(group.read_bytes())
+                assert witness['pgid'] != proc.pid
+                assert not batch._scope.group_exists(witness['pgid'])
+                assert all(not Path('/proc', str(pid)).exists() for pid in witness['pids'])
+            raw = bytes(buffers[0])
+            receipt = json.loads(raw)['receipt']
+            self.validator(receipt, stage)
+            assert receipt['cleanup_confirmed'] is True
+            (self.tmp / (stem + '-done.json')).write_text(json.dumps(dict(
+                reason=receipt['reason_code'], outer_rc=receipt['rc'], wrapper_rc=proc.returncode,
+                payload=receipt['payload'], cleanup=True, ended=time.monotonic(), frame_bytes=len(raw))))
+            completion = bridge._StageCompletion(binding, raw, bytes(buffers[1]), proc.returncode, True, True)
+            return self.fault('completion', binding, completion) if self.fault is not None else completion
+        return launch
+
+
+def _cp2_register(monkeypatch, ctx, trace, *, platform_kwargs=None, o2_kwargs=None, **kwargs):
+    if o2_kwargs is None:
+        p2 = _p2_register(monkeypatch, ctx, trace, **(platform_kwargs or {}))
+        o2 = None
+    else:
+        p2, o2 = _o2_register(monkeypatch, ctx, trace, platform_kwargs=platform_kwargs, **o2_kwargs)
+    directory = trace.parent / 'cp2'
+    directory.mkdir(mode=0o700)
+    cp2 = _CP2Driver(directory, ctx, **kwargs)
+    registry = bridge._producer_adapters()
+    registry[bridge.POLICY] = bridge._PolicyStageAdapter(cp2.prepare)
+    monkeypatch.setattr(bridge, '_producer_adapters', lambda: registry)
+    return p2, o2, cp2
+
+
+def _cp2_tool(state):
+    if state == 'ok':
+        return dict(state='OK', exists=True, isreg=True, islnk=False, executable=True)
+    if state == 'link':
+        return dict(state='OK', exists=True, isreg=True, islnk=True, executable=True)
+    if state == 'unknown':
+        return dict(state='UNKNOWN', exists=None, isreg=None, islnk=None, executable=None)
+    assert state == 'absent'
+    return dict(state='OK', exists=False, isreg=None, islnk=None, executable=None)
+
+
+def test_cp2_fixed_budgets_and_caps():
+    session = batch._ProducerSession(RULES)
+    assert session.budget(bridge.PRODUCERS) == 155
+    session.staged = session.openssl_staged = True
+    assert session.budget(bridge.PRODUCERS) == 913
+    session.policy_staged = True
+    assert batch._policy_budget() == 182 and session.budget(bridge.PRODUCERS) == 1064
+    host = batch._GUARD_SECONDS+batch._SSH_SECONDS+session.budget(bridge.PRODUCERS)+batch._WORKER_GRACE+5
+    assert host == 1116 and 2*batch._GUARD_SECONDS+10*(2*batch._GUARD_SECONDS+host)+5 == 11825
+    assert (bridge._POLICY_FRAME_BYTES, bridge._POLICY_RECEIPT_BYTES,
+            bridge._POLICY_PAYLOAD_BYTES) == (131072, 67584, 65536)
+    assert (bridge._STAGE_FRAME_BYTES, bridge._STAGE_RECEIPT_BYTES,
+            bridge.MAX_WIRE, bridge.MAX_REFS, bridge.MAX_HOSTS) == (32768, 16384, 1048576, 294, 10)
+    assert not bridge._producer_adapters() and not batch._passive_adapters()
+    with pytest.raises(batch.Denied, match='LIVE_NOT_AVAILABLE'):
+        batch._restricted_connection(HOST)
+
+
+@pytest.mark.parametrize('kind,paths,timeout,expected,fqcn', [
+    ('eligible', ('ok','ok'), 'ok', [0,1], False),
+    ('eligible', ('absent','ok'), 'ok', [0,2], True),
+    ('eligible', ('link','ok'), 'ok', [0,2], False),
+    ('eligible', ('unknown','absent'), 'ok', [0], False),
+    ('eligible', ('ok','ok'), 'unknown', [], False),
+    ('eligible', ('ok','ok'), 'absent', [], False),
+    ('unknown', ('ok','ok'), 'ok', [], False),
+    ('out-of-scope', ('ok','ok'), 'ok', [], False),
+    ('disabled', ('ok','ok'), 'ok', [], False),
+])
+def test_cp2_actual_native_plans(fixture, monkeypatch, kind, paths, timeout, expected, fqcn):
+    make,_,trace,trap,_ = fixture
+    flags = selected_flags(bridge.POLICY_FLAG) if kind != 'disabled' else selected_flags()
+    ctx,names = make(count=1, flags=flags)
+    n = names[0]
+    versions = ({'distribution_version':'unknown','distribution_major_version':None} if kind == 'unknown'
+                else {'distribution':'Debian','os_family':'Debian'} if kind == 'out-of-scope' else {})
+    tools = {'update-crypto-policies': [_cp2_tool(x) for x in paths], 'timeout': [_cp2_tool(timeout)]}
+    p2,_,cp2 = _cp2_register(monkeypatch,ctx,trace,fqcn=fqcn,
+                             platform_kwargs=dict(versions={n:versions},tool_rows={n:tools}))
+    rc,m,bundle = checked(ctx)
+    stages, done = _p2_rows(cp2,n), _p2_rows(cp2,n,'done')
+    assert [x['ordinal'] for x in stages] == expected and len(done) == len(expected)
+    assert all(x['cleanup'] and x['wrapper_rc'] == x['outer_rc'] == 0 for x in done)
+    if expected:
+        previous = _p2_rows(p2,n)
+        assert len({x['task'] for x in previous+stages}) == 1
+        assert len({x['worker'] for x in previous+stages}) == 1
+        assert _p2_rows(p2,n,'done')[-1]['ended'] <= stages[0]['began']
+        assert all(a['ended'] <= b['began'] for a,b in zip(done, stages[1:]))
+    if kind == 'disabled':
+        assert not _p2_rows(p2,n) and not bundle['companions']
+    else:
+        rows = [c for c in bundle['document']['collections'] if c['collector_id'] == bridge.POLICY]
+        assert len(rows) == 9
+        detail = bundle['companions'][n][bridge.POLICY]
+        if not expected:
+            assert all(x['state'] == 'NOT_SCANNED' for x in detail['diagnostics'])
+        elif expected == [0]:
+            assert any(x['scope'] == 'profile-show' and x['reason'] == 'SHOW_TOOL_UNAVAILABLE'
+                       for x in detail['diagnostics'])
+    assert not trap.exists()
+
+
+def test_cp2_actual_o2_order_and_large_reader(fixture, monkeypatch):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=1,flags=selected_flags(bridge.PACKAGES,bridge.POLICY_FLAG))
+    n = names[0]
+    p2,o2,cp2 = _cp2_register(monkeypatch,ctx,trace,o2_kwargs={},large=True)
+    rc,m,bundle = checked(ctx)
+    a,b,c = [_p2_rows(d,n) for d in (p2,o2,cp2)]
+    assert [x['ordinal'] for x in c] == [0,1]
+    assert [x['ordinal'] for x in b] == [0,1]
+    assert len({x['worker'] for x in a+b+c}) == len({x['task'] for x in a+b+c}) == 1
+    assert _p2_rows(p2,n,'done')[-1]['ended'] <= b[0]['began']
+    assert _p2_rows(o2,n,'done')[-1]['ended'] <= c[0]['began']
+    done = _p2_rows(cp2,n,'done')
+    assert 16384 < len(json.dumps(done[0]['payload']).encode('ascii')) <= bridge._POLICY_PAYLOAD_BYTES
+    assert done[0]['frame_bytes'] <= bridge._POLICY_FRAME_BYTES
+    snap = dict(done[0]['payload'], **done[1]['payload'])
+    policy.normalize_snapshot(snap)
+    doc = bundle['document']
+    rows = [x for x in doc['collections'] if x['collector_id'] == bridge.POLICY]
+    assert len(rows) == 9
+    original = {**doc,'collections':[], 'assets':[], 'evidence':[], 'claims':[], 'findings':[]}
+    expected = policy.build_crypto_policy_evidence(
+        original, doc['hosts'][0]['host_id'], source=bridge._source(bridge.POLICY,snap),
+        observed_at=rows[0]['observed_at'], snapshot=snap,rules=RULES,
+        platform_snapshot=platform_snapshot(),requested=True)
+    assert {x['collection_id']:x for x in rows} == {x['collection_id']:x for x in expected['collections']}
+    assert {x['evidence_id']:x for x in doc['evidence'] if x['collection_id'] in {r['collection_id'] for r in rows}} == {x['evidence_id']:x for x in expected['evidence']}
+    assert bundle['companions'][n][bridge.POLICY] == {
+        'metadata':expected['metadata'], 'diagnostics':expected['diagnostics']}
+    assert not any(x['level'] in ('L3','L4','L5') and x['assessment_state'] == 'PASS'
+                   for x in bundle['assessed']['claims'])
+    assert expected['metadata']['kernel_fips_enabled'] is True
+    assert expected['metadata']['profile_consistency'] == 'CONFLICT'
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('mode,ordinal,reason,inner', [
+    ('outer-timeout',0,'TIMEOUT',None), ('total-limit',0,'TOTAL_LIMIT',None),
+    ('no-start',0,'COMMAND_FAILED',None), ('show-failure',1,'COMMAND_FAILED',7),
+    ('missing-show',1,'TOOL_UNAVAILABLE',None),
+])
+def test_cp2_actual_failure_layers(fixture,monkeypatch,mode,ordinal,reason,inner):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=1,flags=selected_flags(bridge.POLICY_FLAG))
+    n = names[0]
+    _,_,cp2 = _cp2_register(monkeypatch,ctx,trace,modes={(n,ordinal):mode},
+                            stage_seconds=6 if mode == 'outer-timeout' else 30)
+    rc,m,bundle = checked(ctx)
+    done = _p2_rows(cp2,n,'done')
+    assert len(done) == (1 if mode == 'no-start' else 2)
+    if mode == 'no-start':
+        assert cp2.markers(n,'no-start')
+    if mode == 'outer-timeout':
+        assert done[0]['reason'] == 'COMMAND_TIMEOUT' and done[0]['outer_rc'] != 0
+    detail = bundle['companions'][n][bridge.POLICY]['diagnostics']
+    selected = [x for x in detail if (x['scope'] == 'profile-show') == (ordinal == 1)]
+    assert len(selected) == (1 if ordinal == 1 else 8)
+    assert all(x['reason'] == reason and x['rc'] == inner for x in selected)
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('fault,reason', [
+    ('guard','GUARD_REJECTED'),('foreign','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('replay','REMOTE_CLEANUP_UNCONFIRMED'),('ordinal','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('cleanup','REMOTE_CLEANUP_UNCONFIRMED'),('duplicate','INVALID_ADAPTER_RESULT'),
+    ('nan','INVALID_ADAPTER_RESULT'),('extra','INVALID_ADAPTER_RESULT'),
+    ('wrong-stage','INVALID_ADAPTER_RESULT'),('no-begin','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('inner-cleanup','REMOTE_CLEANUP_UNCONFIRMED'),('interrupt','INTERRUPTED'),
+    ('untrusted-clean-failure','REMOTE_CLEANUP_UNCONFIRMED'),
+])
+def test_cp2_fatal_no_following_stage_or_host(fixture,monkeypatch,fault,reason):
+    make,_,trace,trap,cfg = fixture
+    ctx,names = make(count=2,forks=1,flags=selected_flags(bridge.POLICY_FLAG,bridge.SSHD))
+    n = names[0]
+    def corrupt(when,binding,completion):
+        if binding.ordinal != 0:
+            return completion
+        if fault == 'guard' and when == 'prepare':
+            with cfg.open('a') as f:
+                f.write('\n# anonymous CP2 guard drift\n')
+        if when != 'completion':
+            return completion
+        if fault == 'foreign':
+            return completion._replace(binding=binding._replace(target_id=names[1]))
+        if fault == 'replay':
+            return completion._replace(binding=binding._replace(ordinal=binding.ordinal))
+        if fault == 'ordinal':
+            return completion._replace(binding=binding._replace(ordinal=2))
+        if fault == 'cleanup':
+            return completion._replace(clean=False)
+        if fault == 'duplicate':
+            return completion._replace(stdout=b'{"duplicate":1,"duplicate":2}')
+        frame = json.loads(completion.stdout)
+        if fault == 'nan':
+            frame['receipt']['rc'] = float('nan')
+        elif fault == 'extra':
+            frame['receipt']['payload']['extra'] = {}
+        elif fault == 'wrong-stage':
+            frame['invocation']['module_args']['stage'] = 'show-bin'
+        elif fault == 'inner-cleanup':
+            frame['receipt']['payload']['kernel-fips'] = policy.result('ERROR','CLEANUP_FAILED')
+        elif fault == 'interrupt':
+            frame['receipt'].update(reason_code='INTERRUPTED',rc=-15,payload=None)
+        return completion._replace(stdout=json.dumps(frame).encode('ascii'))
+    modes = {(n,0):fault} if fault in ('no-begin','untrusted-clean-failure') else {}
+    p2,_,cp2 = _cp2_register(monkeypatch,ctx,trace,fault=corrupt,modes=modes)
+    rc,m,bundle = checked(ctx)
+    assert rc == (7 if fault == 'interrupt' else 6) and m['reason_code'] == reason
+    assert m['hosts'][1]['host_state'] == 'NOT_ATTEMPTED'
+    assert not _p2_rows(cp2,names[1]) and not _p2_rows(cp2,names[0])[1:]
+    assert not any(x['collector_id'] == bridge.POLICY for x in bundle['document']['collections'])
+    assert not trap.exists()
+
+
+def test_cp2_actual_consumer_loss(fixture,monkeypatch):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=2,forks=1,flags=selected_flags(bridge.POLICY_FLAG))
+    n = names[0]
+    _,_,cp2 = _cp2_register(monkeypatch,ctx,trace,modes={(n,0):'consumer-loss'},stage_seconds=4)
+    with _p2_owned_supervisors(cp2) as reaped:
+        rc,m,bundle = checked(ctx)
+    assert rc == 6 and m['reason_code'] == 'REMOTE_CLEANUP_UNCONFIRMED'
+    assert m['hosts'][1]['host_state'] == 'NOT_ATTEMPTED'
+    stages = _p2_rows(cp2,n)
+    assert len(stages) == 1 and stages[0]['supervisor'] in reaped
+    assert not bundle['document']['collections'] and not trap.exists()
+
+
+@pytest.mark.parametrize('mixed',['platform','openssl'])
+def test_cp2_mixed_registry_refused_before_connect(fixture,monkeypatch,mixed):
+    make,_,trace,trap,_ = fixture
+    flags = selected_flags(bridge.POLICY_FLAG,bridge.PACKAGES) if mixed == 'openssl' else selected_flags(bridge.POLICY_FLAG)
+    ctx,names = make(count=1,flags=flags)
+    if mixed == 'platform':
+        register(monkeypatch,trace)
+    else:
+        _p2_register(monkeypatch,ctx,trace)
+    registry = bridge._producer_adapters()
+    def forbidden(*args):
+        raise AssertionError('stage prepare must not be reached')
+    registry[bridge.POLICY] = bridge._PolicyStageAdapter(forbidden)
+    monkeypatch.setattr(bridge,'_producer_adapters',lambda:registry)
+    launches = _observe_native_queue(monkeypatch)
+    with pytest.raises(batch.Denied,match='INVALID_ADAPTER_REGISTRY'):
+        checked(ctx)
+    assert not launches and not trap.exists()
+
+
+
+def test_cp2_closed_receipt_frame_boundary_and_context(fixture):
+    make,_,_,_,_ = fixture
+    make(count=1)
+    binding = bridge._PolicyStageBinding(RUN,HOST,'fixture-task',bridge.POLICY,'reader',0)
+    snapshot = policy_snapshot()
+    payload = {s:v for s,v in snapshot.items() if s != 'profile-show'}
+    receipt = dict(format=1,stage='reader',reason_code='COMMAND_OK',rc=0,
+                   cleanup_confirmed=True,payload=payload)
+    frame = dict(changed=False,invocation={'module_args':{'stage':'reader'}},receipt=receipt)
+    raw = json.dumps(frame).encode('ascii')
+    completion = bridge._StageCompletion(binding,raw,b'',0,True,True)
+    assert bridge._stage_receipt(completion,binding) == receipt
+    padded = raw+b' '*(bridge._POLICY_FRAME_BYTES-len(raw))
+    assert bridge._stage_receipt(completion._replace(stdout=padded),binding) == receipt
+    for bad in (completion._replace(stdout=padded+b' '),
+                completion._replace(stdout=padded,stderr=b'x'),
+                completion._replace(wrapper_rc=True),
+                completion._replace(started=False),
+                completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": 0.0',1)),
+                completion._replace(stdout=b'{"changed":false,"changed":false}'),
+                completion._replace(binding=binding._replace(task_uuid='other-task'))):
+        with pytest.raises(bridge._StageFailure):
+            bridge._stage_receipt(bad,binding)
+    # The staged context is opt-in and does not change the legacy default.
+    flags = selected_flags(bridge.POLICY_FLAG)
+    value = envelope(flags=flags)
+    a = bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES)
+    b = bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,staged_policy=True)
+    assert a.document == b.document and a.companions == b.companions
+    fatal = copy.deepcopy(value)
+    fatal['records'][1].update(reason_code='GUARD_REJECTED',rc=None,cleanup_confirmed=True,snapshot=None)
+    with pytest.raises(bridge.BridgeError):
+        bridge.normalize_handoff(fatal,RUN,HOST,flags,TIME,RULES)
+    result = bridge.normalize_handoff(fatal,RUN,HOST,flags,TIME,RULES,staged_policy=True)
+    assert result.special == 'GUARD_REJECTED' and set(result.companions) == {bridge.PLATFORM}
+    value['records'][0]['snapshot']['tools']['timeout'] = [_cp2_tool('unknown')]
+    with pytest.raises(bridge.BridgeError):
+        bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,staged_policy=True)
+    value['records'][1]['snapshot'] = bridge._policy_timeout_gap()
+    result = bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,staged_policy=True)
+    assert all(x['state'] == 'NOT_SCANNED' for x in result.companions[bridge.POLICY]['diagnostics'])
+
+
+@pytest.mark.parametrize('in_flight',[False,True],ids=['no-new-stage','active-stage'])
+def test_cp2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.POLICY_FLAG))
+    a,b,_=names; ready=trace.parent/'cp2-a-ready'; verified=trace.parent/'cp2-b-verified'
+    marks={}
+    def synchronize(when,binding,completion):
+        if not in_flight and when=='prepare' and binding.target_id==a and binding.ordinal==0:
+            ready.write_text('ready'); _p2_wait(verified)
+            worker=batch._PLATFORM_WORKER.get()
+            end=worker.lease.limit(a)
+            (trace.parent/'cp2-child-lease.json').write_text(json.dumps(dict(end=end,now=time.monotonic())))
+        return completion
+    p2,_,cp2=_cp2_register(monkeypatch,ctx,trace,
+        platform_kwargs={'versions':{b:{'distribution':'Debian','os_family':'Debian'}}},
+        modes={(a,0):'outer-timeout'} if in_flight else {},
+        stage_seconds=6 if in_flight else 30,fault=synchronize)
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator); send=q.send_task_result
+        def hold(result):
+            if result.as_wire_task_result().host_name==b:
+                _p2_wait(cp2.tmp/f'{a}-0-group.json' if in_flight else ready)
+                send(result);time.sleep(15)
+            else:send(result)
+        q.send_task_result=hold;return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+    accepted=batch._ProducerWorkerWave._receipt_accepted
+    def observe(self):
+        result=accepted(self)
+        if b in self.ledger.projections and not verified.exists():
+            assert b not in self.confirmed and self.workers[b].is_alive()
+            end=self.limit()
+            assert end==min(self.ends[b],self.grace[b])<self.ends[a]
+            assert self.lease.limit(a)==end
+            marks.update(earliest=end,verified=time.monotonic())
+            verified.write_text('verified')
+        return result
+    monkeypatch.setattr(batch._ProducerWorkerWave,'_receipt_accepted',observe)
+    before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(cp2) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert marks['verified']<marks['earliest'] and [n for n,_ in launches]==names[:2]
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert rc==6 and b in bundle['companions'] and not _p2_rows(cp2,b)
+    assert not any(_p2_rows(cp2,n) or _p2_rows(p2,n) for n in names[2:])
+    if in_flight:
+        assert len(_p2_rows(cp2,a))==1 and not _p2_rows(cp2,a,'done')
+        assert _p2_rows(cp2,a)[0]['supervisor'] in reaped
+        assert m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED'
+        assert a not in bundle['companions']
+    else:
+        child=json.loads((trace.parent/'cp2-child-lease.json').read_bytes())
+        assert child['end']==marks['earliest'] and 0<child['end']-child['now']<=batch._WORKER_GRACE
+        assert not _p2_rows(cp2,a) and m['reason_code']=='CONTROLLER_TIMEOUT'
+        assert set(bundle['companions'][a])=={bridge.PLATFORM}
+        row=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.POLICY_FLAG)
+        assert row['reason_code']=='CONTROLLER_TIMEOUT' and not row['collection_ids']
+    assert not trap.exists() and _signal_state()==before
+

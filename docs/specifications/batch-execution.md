@@ -624,3 +624,54 @@ interchangeable. V2 accepts the new guarded staged OpenSSL fatal outcome
 only with no OpenSSL collection references; legacy producer records and
 V1 shape stay closed. Real transport and OL9 release verification remain
 outside this slice.
+
+
+
+### I1b CP2 — private native Policy stage lifecycle and bounds
+
+CP2 is an exact private staged producer, not a public adapter or a live
+transport. It requires the actual native P1 worker, original run/target/task
+UUID, same validated and independently clean Platform snapshot object, and
+frozen Policy flag. If OpenSSL is selected on that eligible host, the actual
+staged O2 lifecycle must have completed cleanly (including a legal confirmed
+ordinary failure) before Policy. A generic Platform or mixed generic OpenSSL
+cannot authorize CP2. Disabled Policy, fatal earlier producer, wrong binding,
+replay or incorrect ordinal cannot start an additional stage. The validated
+Platform/tool evidence determines the fixed reader/show plan; no caller can
+supply a path, argv or alternative plan.
+
+The existing guard and ownership protocol is retained. The 30 s guard
+includes packaging and both guard checks, the independent connection
+witness is at most 15 s, and the independent CP1 stage including cleanup is
+at most 30 s plus 1 s return reserve. Each stage has a 76 s upper bound.
+The worker admits at most reader and one mutually exclusive show stage;
+the Policy producer budget is 2*76+30=182 s including one cumulative
+30 s validation allowance. Only explicitly staged Policy substitutes
+182 s for its original single-call 31 s budget. P1 remains 258 s,
+O2 562 s, SSH and Cert 31 s each. With all five staged/legacy producers,
+the producer total is 1064 s, the host bound is 30+15+1064+2+5=1116 s,
+and the ten-host invocation bound is 60+10*(60+1116)+5=11825 s.
+These are conservative internal bounds, not expected execution time or a
+new per-command allowance. Original V1 and legacy callable budgets remain.
+
+The existing host, wave-earliest and absolute invocation limits only
+shorten a begun phase. Check room for the full 31 s before the one-use
+begin, recheck the actual native binding and remaining deadlines, and
+retain the pending marker until matching independent completion/cleanup
+is verified. A launcher exception cannot assert clean completion; an
+uncertain inner cleanup does not clear pending even with a clean outer
+receipt. A confirmed ordinary failure also checks its command deadline
+before permitting the next fixed stage. Any observed fatal stops further
+stage/producer and new-host dispatch; existing worker/supervisor cleanup
+and signal/RC semantics remain. Completed producer data is retained only
+through a valid handoff; worker loss does not authenticate partial memory.
+The closed Policy-specific frame limit is not a larger native queue or
+handoff. V2 accepts its private staged fatal context with no Policy refs;
+the default offline/legacy normalizer and C1 contract remain unchanged.
+See [collector integration](collector-integration.md).
+
+The proposed focused tests use private synthetic fixtures, not real managed
+hosts or SSH transport. Engineering acceptance requires actual native
+worker/AnsiballZ/guard/cleanup evidence; source implementation alone is not
+a PASS. Formal Controller/OL9.x qualification remains separate under #28.
+Both registries remain empty and LIVE_NOT_AVAILABLE is unchanged.
