@@ -1,9 +1,9 @@
 """Read-only certificate/service index previews of a trusted Store.open result.
 
-No discovery, assessment, companion loading, report publication or inference
-from paths, names, hashes or host co-location. Recorded certificate positions
-are not verified companion details. Publication and actual backlinks are later
-work; the caller must supply the unmodified validated PublishedRun.
+No discovery, assessment, report publication or inference from paths, names,
+hashes or host co-location. Only C1 verified certificate companion bytes may
+enrich recorded positions. Publication and actual backlinks are later work;
+the caller must supply the unmodified validated PublishedRun.
 """
 from collections import Counter, defaultdict
 import hashlib
@@ -147,6 +147,218 @@ def _certificate_occurrences(document, budget):
             role_evidence_ids={role: r['evidence_id'] for role, r in sorted(roles.items())},
             path=None, vhost=None, reason_code='DETAIL_NOT_RETAINED')
     return result
+
+
+_METADATA_FIELDS = ('public_key_algorithm', 'public_key_bits', 'signature_inner',
+                    'signature_outer', 'issuer', 'subject', 'not_before', 'not_after')
+
+
+def _companion_require(ok):
+    _require(ok, 'INVALID_ASSET_INDEX_COMPANION')
+
+
+def _certificate_companions(published, occurrences, budget):
+    """Join only the fixed, Store-verified C1 slot, never an external source.
+
+    Store.open owns the handoff and frozen-rule replay. The index checks the
+    retained bytes, exact references and location/role joins; it neither
+    replays the producer nor classifies an algorithm from certificate text.
+    """
+    from tools import run_store_v2 as v2
+    m, doc, _, artifacts = published
+    try:
+        if m.get('batch_contract') != v2.CONTRACT:
+            _companion_require(not any(a.get('slot') in v2.SLOTS or a.get('kind') == v2.RULES_KIND
+                                      for a in m['artifacts']) and
+                not any(k.endswith('/' + slot + '.json') for k in artifacts for slot in v2.SLOTS) and
+                not any(a['path'].endswith('/' + slot + '.json')
+                        for a in m['missing_artifacts'] for slot in v2.SLOTS))
+            return {}
+        scope, _, entries = run_store._manifest_header(m, m['run_id'])
+        _companion_require(m['run_kind'] == 'SYNTHETIC' and m['source'] == v2.SOURCE and
+            doc['schema_version'] == m['evidence_schema_version'] == '1.1.0' and
+            doc['run']['source'] == v2.SOURCE and
+            set(artifacts) == {a['path'] for a in entries.values()})
+        rid = m['run_id']
+        cert_collections = defaultdict(dict)
+        for c in doc['collections']:
+            if c['collector_id'] == cert_assets.COLLECTOR:
+                bucket = cert_collections[c['host_id']]
+                _companion_require(c['scope_key'] in cert_assets.ROOTS and c['scope_key'] not in bucket)
+                budget.charge()
+                bucket[c['scope_key']] = c
+        rows = defaultdict(dict)
+        for r in doc['evidence']:
+            if r['collection_id'] in {c['collection_id'] for c in cert_collections[r['host_id']].values()}:
+                budget.charge()
+                _companion_require(r['evidence_id'] not in rows[r['collection_id']])
+                rows[r['collection_id']][r['evidence_id']] = r
+        by_host = defaultdict(dict)
+        for oid, occurrence in occurrences.items():
+            key = (occurrence['root'], occurrence['source_id'], occurrence['block_index'])
+            bucket = by_host[occurrence['host_id']]
+            _companion_require(key not in bucket)
+            budget.charge(2)
+            bucket[key] = oid
+        missing = {}
+        for a in m['missing_artifacts']:
+            if a['path'].endswith('/' + v2.CERTIFICATE + '.json'):
+                _companion_require(a['path'] not in missing and set(a) == {'path', 'reason_code'} and
+                                   a['reason_code'] == 'REQUIRED_DETAIL_MISSING')
+                budget.charge()
+                missing[a['path']] = a['reason_code']
+        status = {}
+        for h in m['hosts']:
+            hid = _id(h['host_id'], 'h-')
+            path = 'details/' + hid + '/' + v2.CERTIFICATE + '.json'
+            entry = entries.get(('detail', hid, v2.CERTIFICATE))
+            required = scope['flags'][hid]['system_certs']
+            terminal = h['terminal']
+            outcomes = [] if terminal is None else [c for c in terminal['collectors']
+                                                    if c['collector_id'] == 'pqc_collect_system_certs']
+            _companion_require(terminal is None or (len(outcomes) == 1 and
+                outcomes[0]['requested'] is required and terminal['target_id'] == h['target_id'] and
+                terminal['attempted'] is h['attempted']))
+            coll = cert_collections[hid]
+            ids = sorted(c['collection_id'] for c in coll.values())
+            _companion_require((outcomes[0]['collection_ids'] if outcomes else []) == ids)
+            if entry is None:
+                _companion_require(not ids and not by_host[hid] and path not in artifacts and
+                                   (path in missing) == required and
+                                   (not required or h['host_state'] != 'COMPLETE'))
+                status[hid] = missing.pop(path) if required else 'NOT_REQUIRED'
+                continue
+            _companion_require(required and h['attempted'] is True and path not in missing and
+                entry['path'] == path and entry['required'] is True and
+                entry['format_version'] == cert_assets.VERSION and set(coll) == set(cert_assets.ROOTS))
+            es = {eid: r for cid in ids for eid, r in rows[cid].items()}
+            _companion_require(entry['collection_ids'] == ids and entry['evidence_ids'] == sorted(es) and
+                entry['asset_ids'] == sorted({r['asset_id'] for r in es.values() if r['asset_id'] is not None}))
+            raw = artifacts[path]
+            _companion_require(type(raw) is bytes and len(raw) == entry['size'] and
+                0 < len(raw) <= v2.SLOTS[v2.CERTIFICATE] and hashlib.sha256(raw).hexdigest() == entry['sha256'])
+            details = v2.parse_detail(hid, v2.CERTIFICATE, raw)['value']
+            _companion_require(set(details) == {'detail_format', 'detail_version', 'run_id', 'host_id',
+                'source', 'observed_at', 'snapshot', 'roots', 'occurrences'} and
+                details['detail_format'] == cert_assets.FORMAT and details['detail_version'] == cert_assets.VERSION and
+                details['host_id'] == hid and details['run_id'] == rid and details['source']['source_kind'] == 'SYNTHETIC')
+            cert_assets.source_record(details['source'])
+            common = {k: details[k] for k in ('run_id', 'host_id', 'source', 'observed_at')}
+            snapshot = details['snapshot']
+            cert_assets.validate_snapshot(snapshot)
+            roots = details['roots']
+            _companion_require(type(roots) is list and [r['root'] for r in roots] == list(cert_assets.ROOTS))
+            blocks = {}
+            for rr in roots:
+                root = rr['root']; c = coll[root]; cid = c['collection_id']
+                root_record = {**common, 'root': root, 'collection_id': cid, 'evidence_ids': sorted(rows[cid])}
+                _companion_require(cert_assets.strict_equal(rr, {**root_record,
+                    'detail_sha256': cert_assets.digest(dict(record=root_record, result=snapshot[root]))}) and
+                    c['source'] == common['source'] and c['observed_at'] == common['observed_at'] and
+                    c['evidence_ids'] == root_record['evidence_ids'] and
+                    (c['collection_state'], c['reason_code']) == cert_assets.root_status(snapshot[root])[:2])
+                for src in snapshot[root]['sources']:
+                    for index, block in enumerate(src['blocks'], 1):
+                        if block['certificate'] is not None:
+                            budget.charge(2)
+                            blocks[(root, src['source_id'], index)] = (src, block)
+            _companion_require(type(details['occurrences']) is list and
+                len(details['occurrences']) == len(blocks) == len(by_host[hid]))
+            seen = set()
+            for item in details['occurrences']:
+                key = (item['root'], item['source_id'], item['block_index'])
+                _companion_require(type(item['block_index']) is int and key in blocks and key not in seen and
+                                   key in by_host[hid])
+                seen.add(key)
+                src, block = blocks[key]; cert = block['certificate']
+                old = occurrences[by_host[hid][key]]
+                cid = coll[key[0]]['collection_id']; aid = old['asset_id']
+                prefix = src['source_id'] + '-' + str(key[2]) + '-'
+                roles = {'certificate': None}
+                if cert['public_key_algorithm'] is not None:
+                    roles['public-key'] = cert['public_key_algorithm']
+                if cert['signature_inner'] is not None and cert['signature_inner'] == cert['signature_outer']:
+                    roles['signature'] = cert['signature_inner']
+                role_ids = {role: evidence.evidence_id(rid, hid, cid, prefix + role) for role in roles}
+                record = dict(**common, collection_id=cid, asset_id=aid, root=key[0], source_id=key[1],
+                    target_id=src['target_id'], block_index=key[2], fingerprint=cert['fingerprint'],
+                    evidence_ids=sorted(role_ids.values()))
+                dh = cert_assets.digest(dict(record=record, block=block, format=src['format']))
+                expected = {**record, 'detail_ref': 'cert-' + dh, 'detail_sha256': dh}
+                _companion_require(cert_assets.strict_equal(item, expected) and
+                    all(cert_assets.strict_equal(old[k], expected[k]) for k in expected if k not in ('run_id', 'target_id')) and
+                    old['role_evidence_ids'] == role_ids)
+                for role, eid in role_ids.items():
+                    r = es[eid]
+                    _companion_require(r['host_id'] == hid and r['asset_id'] == aid and r['collection_id'] == cid and
+                        r['source'] == common['source'] and r['observed_at'] == common['observed_at'] and
+                        r['observation_key'] == prefix + role and r['evidence_ref'] == expected['detail_ref'] and
+                        r['raw_sha256'] == dh and _role_algorithm(r, role) and
+                        (roles[role] is None or r['algorithm']['observed_name'] == roles[role]))
+                metadata = {k: cert[k] for k in _METADATA_FIELDS}
+                # Charge the new memberships, fields and escaped string bytes
+                # before retaining them; the final canonical byte cap still applies.
+                budget.charge(4 + len(metadata) + len(cert['gaps']) + sum(
+                    (len(_serial(x)) + 65) // 66 for x in (*metadata.values(), *cert['gaps'])))
+                old.update(detail_state='VERIFIED_COMPANION', target_id=src['target_id'],
+                           certificate_metadata=metadata, metadata_gaps=list(cert['gaps']), reason_code=block['reason'])
+            _companion_require(seen == blocks.keys() == by_host[hid].keys())
+            status[hid] = 'VERIFIED_COMPANION'
+        _companion_require(not missing and set(cert_collections) <= set(m['expected_host_ids']) and
+                           set(by_host) <= set(m['expected_host_ids']))
+        return status
+    except run_store.StoreError as exc:
+        if exc.code == 'ASSET_INDEX_SIZE_LIMIT':
+            raise
+        raise run_store.StoreError('INVALID_ASSET_INDEX_COMPANION') from None
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError, RecursionError):
+        raise run_store.StoreError('INVALID_ASSET_INDEX_COMPANION') from None
+
+
+def _certificate_metadata(certs, occurrences, budget):
+    """Summarize actual retained public metadata without first-value wins."""
+    for occurrence in occurrences.values():
+        if 'detail_state' not in occurrence:
+            budget.charge(3)
+            occurrence.update(detail_state='DETAIL_NOT_RETAINED', certificate_metadata=None, metadata_gaps=[])
+    for g in certs.values():
+        ids = sorted(g['recorded_occurrence_ids'])
+        verified = [oid for oid in ids if occurrences[oid]['detail_state'] == 'VERIFIED_COMPANION']
+        budget.charge(4 + len(verified))
+        g.update(verified_occurrence_ids=verified, verified_occurrence_count=len(verified),
+                 detail_state=('VERIFIED_COMPANION' if verified and len(verified) == len(ids) else
+                               'PARTIAL_COMPANION' if verified else 'DETAIL_NOT_RETAINED'))
+        fields = {}
+        for field in _METADATA_FIELDS:
+            values = {oid: occurrences[oid]['certificate_metadata'][field] for oid in verified
+                      if occurrences[oid]['certificate_metadata'][field] is not None}
+            distinct = set(values.values())
+            budget.charge(3 + len(values) + sum((len(_serial(v)) + 65) // 66 for v in distinct))
+            fields[field] = dict(value=next(iter(distinct)) if len(distinct) == 1 else None,
+                state='CONFLICT' if len(distinct) > 1 else 'UNKNOWN' if not distinct else
+                      'RECORDED' if len(values) == len(ids) else 'PARTIAL', occurrence_ids=sorted(values))
+        gaps = sorted({gap for oid in verified for gap in occurrences[oid]['metadata_gaps']})
+        budget.charge(3 + len(gaps))
+        g['metadata_fields'] = fields; g['metadata_gaps'] = gaps
+        for k in ('not_before', 'not_after', 'issuer', 'subject'):
+            g[k] = fields[k]['value']
+        before, after = fields['not_before'], fields['not_after']
+        pairs = sorted(set(before['occurrence_ids']) & set(after['occurrence_ids']))
+        budget.charge(len(pairs))
+        g['validity_state'] = ('CONFLICT' if 'VALIDITY_CONFLICT' in gaps or 'CONFLICT' in (before['state'], after['state']) else
+            'UNKNOWN' if before['state'] == after['state'] == 'UNKNOWN' else
+            'RECORDED' if before['state'] == after['state'] == 'RECORDED' else 'PARTIAL')
+        # A shared interval is not a pair of independently aggregated ends.
+        g['validity_occurrence_ids'] = pairs if g['validity_state'] != 'CONFLICT' else []
+        if not g['validity_occurrence_ids'] and g['not_before'] is not None and g['not_after'] is not None:
+            g['not_before'] = g['not_after'] = None
+        g['signature_metadata_state'] = ('CONFLICT' if 'SIGNATURE_CONFLICT' in gaps or
+            any(fields[k]['state'] == 'CONFLICT' for k in ('signature_inner', 'signature_outer')) else
+            'RECORDED' if all(fields[k]['state'] == 'RECORDED' for k in ('signature_inner', 'signature_outer')) else
+            'UNKNOWN' if all(fields[k]['state'] == 'UNKNOWN' for k in ('signature_inner', 'signature_outer')) else 'PARTIAL')
+        if verified:
+            g['public_key_bits'] = fields['public_key_bits']['value']
+            g['public_key_bits_state'] = fields['public_key_bits']['state']
 
 
 def _new_group(prefix, identity, kind):
@@ -362,7 +574,7 @@ def _finish_index(name, groups, rows, claims, budget):
 
 
 def project_asset_indexes(published):
-    """Project recorded sets; never re-evaluate or open unretained companions."""
+    """Project recorded sets and verified C1 details without re-evaluation or I/O."""
     _require(type(published) is run_store.PublishedRun)
     m, doc, assessed, artifacts = published
     _require(m['publication_state'] == 'PUBLISHED' and m['run_id'] == doc['run']['run_id'] and
@@ -375,6 +587,8 @@ def project_asset_indexes(published):
     budget = _Budget()
     occurrences = _certificate_occurrences(doc, budget)
     certs, cert_members = _certificate_groups(doc, occurrences, budget)
+    companion_status = _certificate_companions(published, occurrences, budget)
+    _certificate_metadata(certs, occurrences, budget)
     services, service_members = _service_groups(doc, budget)
     groups = certs | services; membership = cert_members | service_members
     collections = {c['collection_id']: c for c in doc['collections']}
@@ -449,6 +663,15 @@ def project_asset_indexes(published):
         services=_finish_index('services', services, rows, claims, budget),
         hosts=hosts, assets=assets, evidence=rows, claims=claims, occurrences=occurrences,
         coverage=_coverage(m, collections, budget))
+    verified = sorted(oid for oid, r in occurrences.items() if r['detail_state'] == 'VERIFIED_COMPANION')
+    budget.charge(len(verified))
+    result['certificates']['verified_occurrence_ids'] = verified
+    result['certificates']['counts']['verified_occurrence_ids'] = len(verified)
+    for g in result['certificates']['groups']:
+        g['counts']['verified_occurrence_ids'] = g['verified_occurrence_count']
+    for row in result['coverage']:
+        if row['slot'] == 'system_certs' and row['host_id'] in companion_status:
+            row['detail_slot_state'] = companion_status[row['host_id']]
     _bounded_bytes(result)
     return result
 
