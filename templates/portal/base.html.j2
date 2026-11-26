@@ -1,4 +1,6 @@
-<!doctype html>
+{% macro download_rows(rows, prefix) -%}
+{% for row in rows %}<tr><th scope="row"><a href="{{ prefix }}{{ row.name }}">{{ row.name }}</a></th><td>{{ row.run_id }}</td><td>{{ row.host_id if row.host_id is not none else 'Batch-wide' }}</td><td>{{ row.size }}</td><td><small>{{ row.sha256 }}</small></td></tr>{% endfor %}
+{%- endmacro %}<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -11,7 +13,8 @@
 <header class="masthead">
   <div class="wrap"><p class="brand">PQC Report Portal</p>
   <nav aria-label="Breadcrumb">{% if portal_v3|default(false) %}<a class="pill" href="{% if nested|default(false) %}../../{% else %}../{% endif %}index.html">History</a> / {% else %}Reports / {% endif %}{% if nested|default(false) %}<a class="pill" href="../index.html">{{ v.run.run_id }}</a> / {% if host is defined %}<a class="pill" href="hosts.html">Hosts</a> / <span aria-current="page">{{ host.host_id }}</span>{% else %}<span aria-current="page">Hosts</span>{% endif %}{% else %}<span aria-current="page">{{ v.run.run_id }}</span>{% endif %}</nav></div>
-</header>
+{% if private_navigation|default(false) %}  <nav class="wrap jump" aria-label="Run sections">{% for name, label in [('hosts.html', 'Hosts'), ('algorithms.html', 'Algorithms'), ('libraries.html', 'Libraries'), ('certificates.html', 'Certificates'), ('services.html', 'Services'), ('findings.html', 'Findings'), ('coverage.html', 'Coverage')] %}<a href="{% if not nested|default(false) %}portal-v5/{% endif %}{{ name }}"{% if nested|default(false) and name == 'hosts.html' %} aria-current="{% if host is defined %}location{% else %}page{% endif %}"{% endif %}>{{ label }}</a>{% endfor %}</nav>
+{% endif %}</header>
 <main id="main" class="wrap">
 {% block content %}{% endblock %}
 </main>

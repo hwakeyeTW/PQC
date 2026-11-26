@@ -175,3 +175,36 @@ Old public rendering, CSS, receipts, errors and publication are not extended
 to Producer V2 or V5 by this private branch. C-C owns formal marker/receipt,
 lock/recheck, catalog admission and atomic publication. Formal environment,
 full capacity and browser acceptance remain #28.
+
+## C-B2b-1 private navigation and verified downloads
+
+Only `_assemble_v5_render_payload(published, navigation=True)` opts in to
+this intermediate private view. The flag must be an exact bool. Omission or
+False keeps all C-B2a buffers and error contracts; public V1 through V4 and
+B1 payload modes are unchanged. Root, Hosts and Host Detail share the seven
+fixed Run sections (Hosts, Algorithms, Libraries, Certificates, Services,
+Findings, Coverage); existing breadcrumbs, History entrance, local anchors,
+host previous/next, and explicit crypto backlinks remain. The current Hosts
+section stays linkable. Crypto-page navigation and reverse pivots remain
+C-B2b-2; publication, receipt and catalog admission remain C-C.
+
+Metadata is derived from the same bounded actual B1/B2 buffers, not paths or
+external metadata. Each expected host's strict BOM/provenance pair is checked
+against its fixed name, host ID, run ID, actual BOM SHA-256 and the existing
+batch Evidence SHA-256. Host state and B2 coverage remain bound; the original
+schema and typed-reference validator is not rerun. The sixth batch-wide
+export is the actual canonical crypto JSON buffer. Each row records the fixed
+name, run ID, host owner (none for batch-wide), size and SHA-256. The root
+lists all six batch exports and all expected-host pairs; a host page lists
+only its pair and the same six explicitly batch-wide exports. Missing core
+artifacts remain text only; generated downloads are not published artifacts,
+and empty/unattempted BOMs do not imply complete inventory. No new files,
+public mode, Store.open, projection, raw log, secret or receipt is introduced.
+
+Private metadata is bounded by the existing host count; one host pair is
+decoded at a time. All original buffer membership, per-category and aggregate
+limits remain, with new HTML charged before each UTF-8 chunk extension.
+Fixed invalid/size-limit errors return no partial result. Focused engineering
+uses real Store publications, an independent fixed M byte oracle, actual
+links/fragments/metadata, pair binding faults and exact/+1 streaming caps.
+Formal file://, full-load and production environment QA remain #28.
