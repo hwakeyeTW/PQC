@@ -853,8 +853,10 @@ def test_b2_actual_standalone_ssh_and_unqualified_metadata(root):
         s = w.scope; h = s['hosts'][0]; h.update(host_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION')
         doc = rs._doc(s, [h], 'PARTIAL', finished_at=END, coverage_reason='INCOMPLETE_COLLECTION')
         original, detail = ssh.normalize_ssh(doc, h['host_id'], snapshot, source, STAMP, RULES)
+        ssh.validate_details(original, detail, RULES)
         original_keys = {a['asset_id']: a for a in original['assets']}
         assert len(original_keys) == 1
+        assert next(iter(original_keys.values()))['identity_key'] == 'sha256-' + fp
         key_scope = next(c for c in original['collections'] if c['scope_key'] == 'ssh-keys')
         records = []
         for r in original['evidence']:
@@ -884,19 +886,109 @@ def test_b2_actual_standalone_ssh_and_unqualified_metadata(root):
             limits=LIMITS, profile='baseline', run_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION',
             hosts=[terminal]))
         w.finalize(doc, batch_raw=batch, batch_rc=5)
+    with rs.RunStore(root) as store:
+        reopened = store.open(rid)
+        assert reopened.document == doc
+        assert not any(x['kind'] == 'detail' for x in reopened.manifest['artifacts'])
     b, p = _b2_build(root, h['host_id'], rid)
-    assert len(nodes(p, 'PUBLIC_KEY')) == 1 and not nodes(p, 'CERTIFICATE')
-    ref, n = next(iter(nodes(p, 'PUBLIC_KEY').items()))
-    assert n['identity_basis'] == 'SYNTHETIC_S1_RECORDED_PUBLIC_KEY_FINGERPRINT'
-    assert n['key_fingerprint_sha256'] == fp
-    assert n['algorithm_state'] == n['size_state'] == 'UNKNOWN'
-    assert _b2_component(b, ref, 'related-crypto-material', 'relatedCryptoMaterialProperties') == {'type': 'public-key'}
+    # Owner-approved restricted B2: the normalizer's validated mandatory
+    # detail is not retained by this S1 publication. Generic Store validity
+    # must not be promoted into proof of its producer-normalized identity.
+    assert not nodes(p, 'PUBLIC_KEY') and not nodes(p, 'CERTIFICATE')
+    assert all(c.get('cryptoProperties', {}).get('assetType') != 'related-crypto-material'
+               for c in b['components'])
+    assert all(value not in raw(b) + raw(p) for value in (fp.encode(), b'9' * 64, b'7' * 64))
+    aid = next(iter(original_keys))
+    assert [o for o in p['omitted'] if o['reason'] == 'STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED'] == [
+        dict(reason='STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED', asset_ids=[aid],
+             evidence_ids=sorted(next(a['evidence_ids'] for a in doc['assets'] if a['asset_id'] == aid)), portal_group_id=None)]
     assert not p['relationships'] and not b['dependencies']
     assert {aid for o in p['omitted'] if o['reason'] == 'STANDALONE_PUBLIC_KEY_UNAVAILABLE'
             for aid in o['asset_ids']} == {fake['asset_id'], generic['asset_id']}
     with rs.RunStore(root) as store:
         _, old = generation.build_cbom(store, rid, h['host_id'])
     assert not nodes(old, 'PUBLIC_KEY') and len(old['coverage']['deferred_asset_ids']) == 3
+
+
+@pytest.mark.parametrize('variant', ['schema-1.0', 'null-taxonomy', 'unsupported-taxonomy',
+                                     'different-observed-time', 'opaque-no-proof', 'fingerprint-conflict'])
+def test_b2_r1_actual_generic_ssh_metadata_without_normalizer_proof(root, variant):
+    """All inputs pass the real generic S1 Store, not the #17 typed companion contract."""
+    from tools import ssh_posture as ssh
+    rid, target = 'b2-r1-generic-ssh', TARGETS[0]
+    version = '1.0.0' if variant == 'schema-1.0' else '1.1.0'
+    source = dict(source_kind='SYNTHETIC', producer_id=ssh.PRODUCER, producer_version=ssh.VERSION,
+                  origin_ref='fixture', input_sha256=None)
+    flags = {f: f == 'ssh_host_keys' for f in rs.COLLECTORS}
+    # These intentionally arbitrary digests have the same superficial shape
+    # as normalized identities, but no source_ref/row/grammar/mandatory detail.
+    fp = hashlib.sha256(b'generic-not-normalized-key').hexdigest()
+    with rs.RunStore(root) as store, store.begin(run_id=rid, run_kind='SYNTHETIC',
+            evidence_schema_version=version, source=source, started_at=STAMP, recorded_at=END,
+            expected_hosts=[dict(target_id=target, inventory_authority_id=None, identity_key=target)],
+            limits=LIMITS, profile='baseline', requested_flags={target: flags},
+            requirements=dict(assessment=False, cff=False, details=[])) as w:
+        h = w.scope['hosts'][0]
+        h.update(host_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION')
+        doc = rs._doc(w.scope, [h], 'PARTIAL', finished_at=END, coverage_reason='INCOMPLETE_COLLECTION')
+        a = asset(doc, h, 'public_key', 'sha256-' + fp)
+        names = ['ssh-ed25519', 'ssh-rsa'] if variant == 'fingerprint-conflict' else ['ssh-ed25519']
+        records = []
+        for i, name in enumerate(names):
+            alg = ssh.unknown_algorithm(name, RULES)
+            if variant == 'null-taxonomy':
+                alg['taxonomy_version'] = None
+            elif variant == 'unsupported-taxonomy':
+                alg['taxonomy_version'] = '9.9.9'
+            records.append(('public-' + hashlib.sha256(('generic-row-' + str(i)).encode()).hexdigest(),
+                            'ASSET_METADATA', dict(name=a['identity_key'], version=None), alg, a))
+        scope(doc, h, 'ssh_host_keys', 'ssh-keys', records, 'PARTIAL')
+        if variant == 'different-observed-time':
+            doc['evidence'][0]['observed_at'] = '2026-01-01T00:00:01Z'
+        doc = json.loads(e.canonical_bytes(doc))
+        terminal = dict(target_id=target, host_state='PARTIAL', attempted=True,
+            reason_code='INCOMPLETE_COLLECTION', collectors=[dict(collector_id=f,
+                requested=flags[f], state='PARTIAL' if flags[f] else 'NOT_SCANNED',
+                reason_code='INCOMPLETE_COLLECTION' if flags[f] else 'DISABLED',
+                rc=0 if flags[f] else None, collection_ids=sorted(c['collection_id']
+                    for c in doc['collections'] if c['collector_id'] == f)) for f in sorted(flags)])
+        w.dispatch_intent(h['host_id'])
+        w.record_host(rs.host_fragment(doc, h['host_id']), attempted=True, terminal=terminal)
+        batch = raw(dict(batch_manifest_version=1, target_ids=[target], target_count=1,
+            limits=LIMITS, profile='baseline', run_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION',
+            hosts=[terminal]))
+        w.finalize(doc, batch_raw=batch, batch_rc=5)
+    with rs.RunStore(root) as store:
+        pub = store.open(rid)
+        assert pub.document == doc and pub.manifest['batch_contract'] == rs.S1_BATCH_CONTRACT
+        assert pub.document['schema_version'] == version
+        assert not any(x['kind'] == 'detail' for x in pub.manifest['artifacts'])
+        c = pub.document['collections'][0]
+        assert c['scope_key'] == 'ssh-keys' and c['collection_state'] == 'PARTIAL'
+        assert c['collector_id'] == c['source']['producer_id'] == 'ssh_host_keys'
+        rows = pub.document['evidence']
+        assert all(r['source'] == c['source'] and r['asset_id'] == a['asset_id'] for r in rows)
+        assert {r['algorithm']['observed_name'] for r in rows} == set(names)
+        assert {r['algorithm']['taxonomy_version'] for r in rows} == {
+            None if variant == 'null-taxonomy' else '9.9.9' if variant == 'unsupported-taxonomy'
+            else RULES['taxonomy_version']}
+        assert all((r['observed_at'] != c['observed_at']) == (variant == 'different-observed-time')
+                   for r in rows)
+    b, p = _b2_build(root, h['host_id'], rid)
+    assert not nodes(p, 'PUBLIC_KEY'), 'unproved standalone key node emitted'
+    assert all(c.get('cryptoProperties', {}).get('assetType') != 'related-crypto-material'
+               for c in b['components'])
+    assert fp.encode() not in raw(b) + raw(p)
+    assert not p['relationships'] and not b['dependencies']
+    assert [o for o in p['omitted'] if o['reason'] == 'STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED'] == [
+        dict(reason='STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED', asset_ids=[a['asset_id']],
+             evidence_ids=sorted(r['evidence_id'] for r in rows), portal_group_id=None)]
+    assert set(p['observations']) == {r['evidence_id'] for r in rows}
+    with rs.RunStore(root) as store:
+        old = generation.build_cbom_bytes(store, rid, h['host_id'])
+        assert generation.build_cbom_bytes(store, rid, h['host_id'], include_certificates=False) == old
+        assert json.loads(old[1])['coverage']['certificate_key_scope'] == 'DEFERRED_B2'
+        assert json.loads(old[1])['coverage']['deferred_asset_ids'] == [a['asset_id']]
 
 
 def test_b2_actual_legacy_certificate_unknown_and_cff(root):

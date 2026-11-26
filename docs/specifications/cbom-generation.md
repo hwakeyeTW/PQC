@@ -165,17 +165,21 @@ in coverage and the BOM scope property. Non-bool values fail closed.
   identity basis is `CERTIFICATE_BOUND_SUBJECT_KEY`; its independent key
   fingerprint is null. It is not merged with a standalone key on the basis
   of name, size, fingerprint of a certificate, or host co-location.
-  The original #17 `public_key` asset and matching `ssh-keys` ASSET_METADATA
-  may qualify an independent SSH recorded public-key fingerprint only with
-  its own usable collection, original producer/version and typed identity
-  and observation grammar. The fixed R Store's V2 contract is cert-only;
-  its S1 synthetic short `ssh_host_keys` source may represent the same
-  legal typed #17 asset/metadata only under the explicit SYNTHETIC S1
-  contract, with separate `SYNTHETIC_S1_RECORDED_PUBLIC_KEY_FINGERPRINT`
-  identity basis. This is a synthetic positive control, not native #17
-  Store integration or proof of a configured host key. Unknown/unqualified
-  standalone assets are omitted; the #17 unknown algorithm remains unknown.
-  No standalone size or algorithmRef is inferred from a key label.
+  Restricted B2 fails closed for every standalone `public_key` or
+  `public-key` asset: the current Store retains no verified mandatory #17
+  normalized-source companion. A schema-valid generic row, short S1
+  collector alias, name, version, or opaque digest cannot substitute for
+  source_ref, key-type/bits/grammar and fingerprint proof. Even matching
+  usable metadata, Evidence 1.1.0, supported taxonomy and aligned timestamps
+  are insufficient without that proof. No standalone node or fingerprint
+  is emitted, including conflicting same-host/fingerprint records; no
+  winner is chosen. Own usable `ssh-keys` metadata for a `public_key` asset
+  receives `STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED`; otherwise the fixed
+  omission is `STANDALONE_PUBLIC_KEY_UNAVAILABLE`. These are omission
+  reasons only, with existing asset/evidence IDs, not source qualification.
+  B1 algorithm observations remain unchanged; no standalone size or
+  algorithmRef is inferred. Full standalone support remains OPEN pending
+  #57's verified typed producer-to-Store integration and separate approval.
 * `signatureAlgorithmRef` uses the actual signature-role EID mapped to an
   already built and verified signature algorithm node. `subjectPublicKeyRef`
   and the key's `algorithmRef` use the actual same-host public-key role EIDs
@@ -221,12 +225,18 @@ A directly related official-validator regression is run without changing
 original tests. B2 focused tests reuse fixed C1/C2 actual Store fixtures (including the
 multi-host same-fingerprint and multi-occurrence case), S1 and legacy Store
 fixtures, explicit default/opt-in mode, actual role references, host-local
-verified dates/bits and gaps, conflicts, disjoint ends, typed SSH synthetic
-metadata, tampering, deterministic read-only output and combined caps. The
+verified dates/bits and gaps, conflicts, disjoint ends, the original #17 normalization followed by actual S1 Store
+publication without retained proof, generic usable exact-scope metadata
+(including schema 1.0, missing/unsupported taxonomy, time mismatch, arbitrary
+identity and conflicting key types), fail-closed omission, tampering,
+deterministic read-only output and combined caps. The
 original A schema and typed reference validator also rejects corrupted
 B2 output. C publication/legacy CLI compatibility remains separate;
 the original importer CLI is not executed by the minimal legacy Store test.
 Native #17 producer-to-Store integration is not available under the fixed R
-certificate-only V2 contract. Actual production Controller and OL9.7-9.9,
+certificate-only V2 contract; standalone generation remains disabled in this
+restricted B2 scope. The original normalized synthetic fixture still checks
+actual normalization and mandatory detail validation before publishing only
+its generic S1 rows. Actual production Controller and OL9.7-9.9,
 Windows/Linux file:// and operational load/scale acceptance remain
 NOT_TESTED or out of scope for #27/#28. No Ansible runtime is needed.

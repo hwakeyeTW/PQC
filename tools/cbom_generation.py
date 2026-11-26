@@ -554,55 +554,22 @@ class _Projection:
                     'slot_state', 'detail_slot_state', 'collection_ids')})
 
     def standalone_keys(self):
-        from tools import ssh_posture
-        # The original #17 typed metadata is intentionally not a classified
-        # signature/public-key algorithm or proof of a configured host key.
-        names = {'ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384',
-                 'ecdsa-sha2-nistp521', 'ssh-rsa', 'ssh-dss'}
-        # R's S1 Store admits short synthetic collector IDs only. Recognize
-        # that explicit fixture contract separately from a #17 producer row.
-        # Never accept the short alias as native acquisition evidence.
-        synthetic_s1 = (self.pub.manifest['run_kind'] == 'SYNTHETIC'
-                        and self.pub.manifest['batch_contract'] == run_store.S1_BATCH_CONTRACT)
+        # The current Store has no verified mandatory #17 companion contract.
+        # A generic valid row, including the S1 short alias, cannot establish
+        # the producer's source_ref, fingerprint, key type, bits or grammar.
+        # Fail closed for every standalone asset until that contract exists.
+        # Usable metadata distinguishes the omission reason only; it never
+        # authorizes a node, a fingerprint or a winner among conflicting rows.
         for aid, a in self.assets.items():
             if a['asset_kind'] not in ('public_key', 'public-key'):
                 continue
-            seeds = []
-            identity = a['identity_key']
-            if a['asset_kind'] == 'public_key' and re.fullmatch(r'sha256-[0-9a-f]{64}', identity):
-                for eid in a['evidence_ids']:
-                    r = self.rows[eid]; c = self.collections[r['collection_id']]; alg = r['algorithm']
-                    if (self._usable(eid) and r['source'] == c['source']
-                            and c['source']['source_kind'] in ('SYNTHETIC', 'NATIVE_COLLECTOR')
-                            and c['collector_id'] == c['source']['producer_id']
-                            and (c['collector_id'] == ssh_posture.PRODUCER or
-                                 (synthetic_s1 and c['source']['source_kind'] == 'SYNTHETIC'
-                                  and c['collector_id'] == 'ssh_host_keys'))
-                            and c['collector_version'] == c['source']['producer_version'] == ssh_posture.VERSION
-                            and c['scope_key'] == 'ssh-keys' and r['evidence_kind'] == 'ASSET_METADATA'
-                            and r['data'] == {'name': identity, 'version': None}
-                            and re.fullmatch(r'public-[0-9a-f]{64}', r['observation_key'])
-                            and alg is not None and alg['algorithm_id'] is None
-                            and alg['primitive'] == alg['family'] == 'UNKNOWN' and alg['observed_name'] in names):
-                        self.charge(); seeds.append(eid)
-            if not seeds:
-                self.omit('STANDALONE_PUBLIC_KEY_UNAVAILABLE', a['evidence_ids'], [aid])
-                continue
-            state = ('CONFLICT' if len({self.rows[eid]['algorithm']['observed_name'] for eid in seeds}) > 1
-                     else 'UNKNOWN')
-            basis = ('SYNTHETIC_S1_RECORDED_PUBLIC_KEY_FINGERPRINT' if all(
-                self.collections[self.rows[eid]['collection_id']]['collector_id'] == 'ssh_host_keys'
-                for eid in seeds) else 'SSH_RECORDED_PUBLIC_KEY_FINGERPRINT')
-            ref = self.ref('standalone-public-key', aid)
-            self.provenance(ref, 'PUBLIC_KEY', a['evidence_ids'], aids=[aid], cids=self.asset_claims.get(aid, ()),
-                identity_basis=basis, key_fingerprint_sha256=identity[7:],
-                seed_evidence_ids=sorted(seeds), algorithm_state=state, algorithm_evidence_ids=[],
-                size_state='UNKNOWN', size_occurrence_ids=[])
-            self.components[ref] = {'type': 'cryptographic-asset', 'name': ref, 'bom-ref': ref,
-                'cryptoProperties': {'assetType': 'related-crypto-material',
-                    'relatedCryptoMaterialProperties': {'type': 'public-key'}},
-                'properties': _properties(identity_basis=basis)}
-            self.omit('STANDALONE_PUBLIC_KEY_ALGORITHM_' + state, seeds, [aid])
+            has_metadata = a['asset_kind'] == 'public_key' and any(
+                self._usable(eid) and self.rows[eid]['evidence_kind'] == 'ASSET_METADATA'
+                and self.collections[self.rows[eid]['collection_id']]['scope_key'] == 'ssh-keys'
+                for eid in a['evidence_ids'])
+            reason = ('STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED' if has_metadata
+                      else 'STANDALONE_PUBLIC_KEY_UNAVAILABLE')
+            self.omit(reason, a['evidence_ids'], [aid])
 
     def cff_consistency(self, raw, observations, claims):
         # Actual Store.open already verified the saved pair. Compare the
