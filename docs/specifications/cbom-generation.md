@@ -1,12 +1,14 @@
-# Evidence-based CBOM generation core (M5-08 B1)
+# Evidence-based CBOM generation core (M5-08 B1/B2)
 
 Contract: Issue #26, approved AC-B1-1 through AC-B1-3 (7178753285,
 7178897845). This is an internal, offline, Controller-side generation
 core. It does not scan, reassess, publish, modify Store, or replace the
 upstream legacy CBOM generator. Certificate/public-key nodes, dates,
 certificate signature/public-key references and their verified asset
-relationships are **DEFERRED_B2**. Portal downloads, immutable generations,
-receipts and catalog integration are C, not B1.
+relationships are **DEFERRED_B2** in the unchanged default B1 mode. B2 is
+explicit opt-in per approved AC-B2-1 through AC-B2-3 (7181942477,
+7182100614). Portal downloads, immutable generations, receipts, legacy CLI
+compatibility and catalog integration are C, not B1/B2.
 
 ## Public input and result
 
@@ -19,6 +21,8 @@ from tools.run_store import RunStore
 with RunStore(approved_root) as store:
     bom_bytes, provenance_bytes = build_cbom_bytes(store, run_id, host_id)
     bom, provenance = build_cbom(store, run_id, host_id)
+    # Explicit B2 in-memory projection, never an implicit change to B1.
+    b2_bom, b2_provenance = build_cbom(store, run_id, host_id, include_certificates=True)
 ```
 
 The actual `RunStore.open` is invoked internally for each call, under its
@@ -139,6 +143,75 @@ the pinned CycloneDX root/SPDX/JSF bytes and uses Draft7Validator with the
 closed offline registry, format checker and product reference integrity
 profile. No external retrieval is permitted by B1.
 
+## B2 opt-in certificate and public-key projection
+
+Both APIs accept the keyword-only exact bool `include_certificates=False`.
+False (including omission of the keyword) preserves the B1 wire shape, scope
+and deferred-asset semantics. True adds B2 and reports `B2_CERTIFICATE_KEY`
+in coverage and the BOM scope property. Non-bool values fail closed.
+
+* Reuse C2 `project_asset_indexes` on the very same verified publication;
+  no alternate companion parser, new source read, classification or
+  assessment. Only actual local asset and occurrence membership qualifies
+  the node. A C2 recorded-fingerprint group yields one certificate per host
+  and run, regardless of repeated sources or positions. A legacy/unverified
+  certificate requires its own usable ASSET_METADATA seed and has an opaque
+  group identity, no guessed fingerprint. Unavailable acquisition is an
+  explicit omission. A certificate's recorded fingerprint is only a
+  certificate fingerprint, never an SPKI or independent key identifier.
+* The certificate is a `cryptographic-asset` with `assetType=certificate`.
+  A subject key is `assetType=related-crypto-material`, `type=public-key`,
+  and is created only from actual same-host public-key role evidence. Its
+  identity basis is `CERTIFICATE_BOUND_SUBJECT_KEY`; its independent key
+  fingerprint is null. It is not merged with a standalone key on the basis
+  of name, size, fingerprint of a certificate, or host co-location.
+  Restricted B2 fails closed for every standalone `public_key` or
+  `public-key` asset: the current Store retains no verified mandatory #17
+  normalized-source companion. A schema-valid generic row, short S1
+  collector alias, name, version, or opaque digest cannot substitute for
+  source_ref, key-type/bits/grammar and fingerprint proof. Even matching
+  usable metadata, Evidence 1.1.0, supported taxonomy and aligned timestamps
+  are insufficient without that proof. No standalone node or fingerprint
+  is emitted, including conflicting same-host/fingerprint records; no
+  winner is chosen. Own usable `ssh-keys` metadata for a `public_key` asset
+  receives `STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED`; otherwise the fixed
+  omission is `STANDALONE_PUBLIC_KEY_UNAVAILABLE`. These are omission
+  reasons only, with existing asset/evidence IDs, not source qualification.
+  B1 algorithm observations remain unchanged; no standalone size or
+  algorithmRef is inferred. Full standalone support remains OPEN pending
+  #57's verified typed producer-to-Store integration and separate approval.
+* `signatureAlgorithmRef` uses the actual signature-role EID mapped to an
+  already built and verified signature algorithm node. `subjectPublicKeyRef`
+  and the key's `algorithmRef` use the actual same-host public-key role EIDs
+  and corresponding verified typed algorithm, not another role or an alias
+  guessed from the certificate text. Unknown/unverified/conflicted roles
+  omit the references, with fixed reasons and role IDs. A recorded unknown
+  public-key role may retain an opaque certificate-bound key node without
+  algorithm or certificate reference. Legacy evidence does not promote a
+  relation to verified. All emitted edges carry their exact role EIDs;
+  no new service binding, dependencies, trust, CA chain, negotiation, or
+  readiness/assessment claims are inferred.
+* Only local `VERIFIED_COMPANION` occurrences qualify dates and size, and
+  size also needs a public-key role in that same occurrence. A single known
+  date may be retained as partial; both dates require shared occurrence
+  support. Disjoint ends, reversed intervals and conflicts never produce a
+  fabricated interval. Signature inner/outer conflict omits signature refs;
+  conflicting key role omits size/ref. Never use the batch-wide C2 aggregated
+  field value to fill a host's gap. Local field_support records state and
+  exact qualifying occurrence IDs; validity_state, validity_occurrence_ids,
+  metadata gaps and role states are independent. The sidecar retains local
+  group/asset/evidence/collection/claim IDs and occurrence proof records
+  (detail hash, detail state and role EIDs), including recorded but not
+  retained detail. Certificate collection coverage includes the original
+  C2 host-local requested/state/basis/slot/detail state, e.g. NOT_REQUIRED
+  and REQUIRED_DETAIL_MISSING. No raw issuer/subject DN, target, path,
+  endpoint, source position text, raw key value, private bytes or unverified
+  lifetime/trust data are copied. The B1 safety filters remain unchanged.
+* New memberships and field/role/occurrence support are charged against the
+  same budget; combined canonical bytes/depth and official A validation are
+  unchanged. No success is returned for an invalid reference, exceeded cap,
+  invalid Store/companion or missing required official validation material.
+
 ## Verification and remaining boundaries
 
 Focused integration covers actual synthetic multi-host S1 publication,
@@ -149,8 +222,21 @@ engine/format/schema absence, no writes and offline network traps. Each
 successful fixture output is also consumed by the actual A validation API.
 No mock substitutes for the official schema engine or actual Store.open.
 A directly related official-validator regression is run without changing
-original tests. The legacy per-host CLI compatibility work remains B2/C;
+original tests. B2 focused tests reuse fixed C1/C2 actual Store fixtures (including the
+multi-host same-fingerprint and multi-occurrence case), S1 and legacy Store
+fixtures, explicit default/opt-in mode, actual role references, host-local
+verified dates/bits and gaps, conflicts, disjoint ends, the original #17 normalization followed by actual S1 Store
+publication without retained proof, generic usable exact-scope metadata
+(including schema 1.0, missing/unsupported taxonomy, time mismatch, arbitrary
+identity and conflicting key types), fail-closed omission, tampering,
+deterministic read-only output and combined caps. The
+original A schema and typed reference validator also rejects corrupted
+B2 output. C publication/legacy CLI compatibility remains separate;
 the original importer CLI is not executed by the minimal legacy Store test.
-B2 certificate/public-key roles, C publication, actual production Controller
-and OL9.7-9.9, Windows/Linux file:// and operational load/scale acceptance
-remain NOT_TESTED or out of scope for #27/#28. No Ansible runtime is needed.
+Native #17 producer-to-Store integration is not available under the fixed R
+certificate-only V2 contract; standalone generation remains disabled in this
+restricted B2 scope. The original normalized synthetic fixture still checks
+actual normalization and mandatory detail validation before publishing only
+its generic S1 rows. Actual production Controller and OL9.7-9.9,
+Windows/Linux file:// and operational load/scale acceptance remain
+NOT_TESTED or out of scope for #27/#28. No Ansible runtime is needed.

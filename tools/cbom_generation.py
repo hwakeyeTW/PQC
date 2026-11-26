@@ -1,8 +1,8 @@
-"""B1 read-only per-host CycloneDX 1.6 generation from verified Store data.
+"""B1/B2 read-only per-host CycloneDX 1.6 generation from verified Store data.
 
 No path, raw document or caller-constructed PublishedRun is a public input.
 This is a discovery projection, not an installed-software inventory, a PQC
-verdict, or authorization to publish. B2 owns certificate/key relationships.
+verdict, or authorization to publish. Certificate/key projection is opt-in.
 """
 from collections import defaultdict
 import hashlib
@@ -111,7 +111,8 @@ def _primitive(group, verified):
 
 
 class _Projection:
-    def __init__(self, published, host_id):
+    def __init__(self, published, host_id, *, include_certificates=False):
+        self.include_certificates = include_certificates
         self.pub = published
         m, doc = published.manifest, published.document
         self.hid, self.rid = host_id, m['run_id']
@@ -370,6 +371,206 @@ class _Projection:
                 'cryptoProperties': {'assetType': 'protocol', 'protocolProperties': details},
                 'properties': _properties(recorded_context=kind)}
 
+    def _usable(self, eid):
+        return self.collections[self.rows[eid]['collection_id']]['collection_state'] in _USABLE
+
+    def _certificate_field(self, occurrences, field, *, role=None):
+        # C2 has already verified the fixed companion and its exact role joins.
+        # Never select values or support IDs from the batch-wide group summary.
+        self.charge(3 + len(occurrences))
+        values = {oid: o['certificate_metadata'][field] for oid, o in occurrences.items()
+                  if o['detail_state'] == 'VERIFIED_COMPANION'
+                  and (role is None or role in o['role_evidence_ids'])
+                  and o['certificate_metadata'][field] is not None}
+        distinct = set(values.values())
+        state = ('CONFLICT' if len(distinct) > 1 else 'UNKNOWN' if not distinct else
+                 'RECORDED' if len(values) == len(occurrences) else 'PARTIAL')
+        return (next(iter(distinct)) if len(distinct) == 1 else None,
+                {'state': state, 'occurrence_ids': sorted(values)})
+
+    def _certificate_role(self, ids, primitive, conflict=False):
+        ids = sorted(set(ids))
+        self.charge(3 + len(ids))
+        algorithms = [self.rows[eid]['algorithm'] for eid in ids]
+        _require(all(a is not None for a in algorithms))
+        identities = {(*_algorithm_tuple(a), a['observed_name'] if a['algorithm_id'] is None else None)
+                      for a in algorithms}
+        if conflict or len(identities) > 1:
+            state, ref = 'CONFLICT', None
+        elif not ids or any(a['primitive'] != primitive or a['algorithm_id'] is None for a in algorithms):
+            state, ref = 'UNKNOWN', None
+        else:
+            # Reuse the actual B1 algorithm seed, never resolve by name or
+            # group membership alone. PUBLIC_KEY remains the recorded typed
+            # primitive; the official algorithm subtype may be "unknown".
+            targets = [self.algorithms.get(eid) for eid in ids]
+            refs = {t[0] for t in targets if t is not None and t[1]}
+            if len(refs) == 1 and all(t is not None and t[1] for t in targets):
+                ref = next(iter(refs))
+                _require(self.nodes[ref]['primitive'] == primitive
+                         and self.components[ref]['cryptoProperties']['assetType'] == 'algorithm')
+                if primitive == 'SIGNATURE':
+                    _require(self.components[ref]['cryptoProperties']['algorithmProperties']['primitive'] == 'signature')
+                state = 'VERIFIED_ALGORITHM'
+            else:
+                state, ref = 'UNVERIFIED', None
+        return {'state': state, 'evidence_ids': ids, 'algorithm_ref': ref}
+
+    def certificate_nodes(self):
+        from tools import portal_asset_indexes
+        index = portal_asset_indexes.project_asset_indexes(self.pub)
+        _require(index['run_id'] == self.rid and self.hid in index['hosts'])
+        seen = set()
+        for g in index['certificates']['groups']:
+            eids, aids, cids = self.members(g)
+            if not aids:
+                continue
+            _require(all(self.assets[aid]['asset_kind'] == 'certificate' for aid in aids)
+                     and not seen.intersection(aids))
+            seen.update(aids)
+            aid_set, eid_set = set(aids), set(eids)
+            occurrences, proofs, role_ids = {}, {}, defaultdict(set)
+            for oid in g['recorded_occurrence_ids']:
+                o = index['occurrences'][oid]
+                if o['host_id'] != self.hid:
+                    continue
+                roles = o['role_evidence_ids']
+                _require(o['id'] == oid and o['asset_id'] in aid_set
+                         and o['collection_id'] in self.collections
+                         and set(roles.values()) == set(o['evidence_ids']) <= eid_set
+                         and 'certificate' in roles and set(roles) <= {'certificate', 'public-key', 'signature'}
+                         and all(self.rows[eid]['asset_id'] == o['asset_id']
+                                 and self.rows[eid]['collection_id'] == o['collection_id']
+                                 and self._usable(eid) for eid in roles.values()))
+                self.charge(9 + 3 * len(roles))
+                occurrences[oid] = o
+                # Closed allowlist: no DN, path, vhost, target, raw block or key bytes.
+                proofs[oid] = {'asset_id': o['asset_id'], 'collection_id': o['collection_id'],
+                    'detail_sha256': o['detail_sha256'], 'detail_state': o['detail_state'],
+                    'role_evidence_ids': dict(roles)}
+                for role, eid in roles.items():
+                    role_ids[role].add(eid)
+            if g['kind'] == 'RECORDED_FINGERPRINT':
+                _require(bool(occurrences) and all(o['fingerprint'] == g['fingerprint']
+                                                  for o in occurrences.values()))
+                seeds = sorted(role_ids['certificate'])
+                fingerprint = g['fingerprint']
+                _require(type(fingerprint) is str and re.fullmatch(r'[0-9a-f]{64}', fingerprint))
+            else:
+                # Legacy/unverified identity stays opaque. A failed metadata
+                # row or claim membership alone cannot qualify an asset.
+                seeds = [eid for eid in eids if self.rows[eid]['asset_id'] in aid_set
+                         and self.rows[eid]['evidence_kind'] == 'ASSET_METADATA' and self._usable(eid)]
+                fingerprint = None
+                if g['kind'] == 'LEGACY_RUN_SCOPED' and seeds:
+                    for role in ('public-key', 'signature'):
+                        for eid in g[role.replace('-', '_')]['evidence_ids']:
+                            if (eid in eid_set and self.rows[eid]['asset_id'] in aid_set and self._usable(eid)
+                                    and self.rows[eid]['source']['source_kind'] == 'LEGACY_IMPORT'):
+                                self.charge(); role_ids[role].add(eid)
+            if not seeds:
+                self.omit('CERTIFICATE_ACQUISITION_UNAVAILABLE', eids, aids, group=g['id'])
+                continue
+            verified = sorted(oid for oid, o in occurrences.items() if o['detail_state'] == 'VERIFIED_COMPANION')
+            gaps = sorted({gap for oid in verified for gap in occurrences[oid]['metadata_gaps']})
+            self.charge(len(seeds) + len(verified) + len(gaps))
+            fields, values = {}, {}
+            for field in ('not_before', 'not_after', 'signature_inner', 'signature_outer',
+                          'public_key_algorithm', 'public_key_bits'):
+                values[field], fields[field] = self._certificate_field(occurrences, field,
+                    role='public-key' if field == 'public_key_bits' else None)
+            before, after = fields['not_before'], fields['not_after']
+            pairs = sorted(set(before['occurrence_ids']) & set(after['occurrence_ids']))
+            validity = ('CONFLICT' if 'VALIDITY_CONFLICT' in gaps or 'CONFLICT' in (before['state'], after['state'])
+                        else 'RECORDED' if before['state'] == after['state'] == 'RECORDED'
+                        else 'UNKNOWN' if before['state'] == after['state'] == 'UNKNOWN' else 'PARTIAL')
+            if validity == 'CONFLICT':
+                pairs = []
+            self.charge(len(pairs))
+            details = {}
+            if validity != 'CONFLICT' and (pairs or values['not_before'] is None or values['not_after'] is None):
+                for field, prop in (('not_before', 'notValidBefore'), ('not_after', 'notValidAfter')):
+                    if values[field] is not None:
+                        details[prop] = values[field]
+            if validity != 'RECORDED':
+                self.omit('CERTIFICATE_VALIDITY_' + validity, seeds, aids, group=g['id'])
+            signature_conflict = ('SIGNATURE_CONFLICT' in gaps or
+                                  any(fields[k]['state'] == 'CONFLICT' for k in ('signature_inner', 'signature_outer')))
+            sig = self._certificate_role(role_ids['signature'], 'SIGNATURE', signature_conflict)
+            key = self._certificate_role(role_ids['public-key'], 'PUBLIC_KEY',
+                                         fields['public_key_algorithm']['state'] == 'CONFLICT')
+            ref = self.ref('certificate', g['id'])
+            self.provenance(ref, 'CERTIFICATE', eids, aids=aids, cids=cids, group=g['id'],
+                identity_basis=g['kind'], certificate_fingerprint_sha256=fingerprint,
+                seed_evidence_ids=sorted(seeds), recorded_occurrence_ids=sorted(occurrences),
+                verified_occurrence_ids=verified, occurrences=proofs, metadata_gaps=gaps,
+                field_support=fields, validity_state=validity, validity_occurrence_ids=pairs,
+                signature_role=sig, public_key_role=key, distinguished_names_state='OMITTED')
+            if sig['algorithm_ref'] is not None:
+                details['signatureAlgorithmRef'] = sig['algorithm_ref']
+                for eid in sig['evidence_ids']:
+                    self.edge(ref, sig['algorithm_ref'], 'CERTIFICATE_SIGNATURE_ALGORITHM', eid)
+            else:
+                self.omit('CERTIFICATE_SIGNATURE_' + sig['state'], sig['evidence_ids'], aids, group=g['id'])
+            if key['evidence_ids']:
+                key_ref = self.ref('certificate-subject-public-key', g['id'])
+                material = {'type': 'public-key'}
+                # Only same-occurrence verified metadata and an actual key
+                # role may qualify size. No independently verified key hash.
+                size = values['public_key_bits'] if key['state'] != 'CONFLICT' else None
+                if size is not None:
+                    material['size'] = size
+                self.charge(len(fields['public_key_bits']['occurrence_ids']) + len(key['evidence_ids']))
+                self.provenance(key_ref, 'PUBLIC_KEY', key['evidence_ids'], group=g['id'],
+                    identity_basis='CERTIFICATE_BOUND_SUBJECT_KEY', certificate_ref=ref,
+                    key_fingerprint_sha256=None, algorithm_state=key['state'],
+                    algorithm_evidence_ids=key['evidence_ids'], size_state=(
+                        'CONFLICT' if key['state'] == 'CONFLICT' else fields['public_key_bits']['state']),
+                    size_occurrence_ids=fields['public_key_bits']['occurrence_ids'] if size is not None else [])
+                if key['algorithm_ref'] is not None:
+                    details['subjectPublicKeyRef'] = key_ref
+                    material['algorithmRef'] = key['algorithm_ref']
+                    for eid in key['evidence_ids']:
+                        self.edge(ref, key_ref, 'CERTIFICATE_SUBJECT_PUBLIC_KEY', eid)
+                        self.edge(key_ref, key['algorithm_ref'], 'PUBLIC_KEY_ALGORITHM', eid)
+                self.components[key_ref] = {'type': 'cryptographic-asset', 'name': key_ref, 'bom-ref': key_ref,
+                    'cryptoProperties': {'assetType': 'related-crypto-material', 'relatedCryptoMaterialProperties': material},
+                    'properties': _properties(identity_basis='CERTIFICATE_BOUND_SUBJECT_KEY')}
+            if key['algorithm_ref'] is None:
+                self.omit('CERTIFICATE_PUBLIC_KEY_' + key['state'], key['evidence_ids'], aids, group=g['id'])
+            self.components[ref] = {'type': 'cryptographic-asset', 'name': ref, 'bom-ref': ref,
+                'cryptoProperties': {'assetType': 'certificate', 'certificateProperties': details},
+                'properties': _properties(identity_basis=g['kind'], validity_state=validity, portal_group=g['id'])}
+        _require(seen == {aid for aid, a in self.assets.items() if a['asset_kind'] == 'certificate'})
+        self.standalone_keys()
+        # Keep the original coverage and expose only fixed, same-host C2
+        # coverage fields, including required detail missing/not required.
+        self.certificate_coverage = []
+        for row in index['coverage']:
+            if row['host_id'] == self.hid and row['slot'] in ('system_certs', 'nginx_certs'):
+                _require(all(cid in self.collections for cid in row['collection_ids']))
+                self.charge(8 + len(row['collection_ids']))
+                self.certificate_coverage.append({k: row[k] for k in ('slot', 'requested', 'state', 'basis',
+                    'slot_state', 'detail_slot_state', 'collection_ids')})
+
+    def standalone_keys(self):
+        # The current Store has no verified mandatory #17 companion contract.
+        # A generic valid row, including the S1 short alias, cannot establish
+        # the producer's source_ref, fingerprint, key type, bits or grammar.
+        # Fail closed for every standalone asset until that contract exists.
+        # Usable metadata distinguishes the omission reason only; it never
+        # authorizes a node, a fingerprint or a winner among conflicting rows.
+        for aid, a in self.assets.items():
+            if a['asset_kind'] not in ('public_key', 'public-key'):
+                continue
+            has_metadata = a['asset_kind'] == 'public_key' and any(
+                self._usable(eid) and self.rows[eid]['evidence_kind'] == 'ASSET_METADATA'
+                and self.collections[self.rows[eid]['collection_id']]['scope_key'] == 'ssh-keys'
+                for eid in a['evidence_ids'])
+            reason = ('STANDALONE_PUBLIC_KEY_PROOF_NOT_RETAINED' if has_metadata
+                      else 'STANDALONE_PUBLIC_KEY_UNAVAILABLE')
+            self.omit(reason, a['evidence_ids'], [aid])
+
     def cff_consistency(self, raw, observations, claims):
         # Actual Store.open already verified the saved pair. Compare the
         # shared IDs/recorded classification again, without reclassification.
@@ -410,9 +611,13 @@ class _Projection:
             refs = [eid for eid in r['evidence_ids'] if eid in self.rows]
             if refs:
                 self.omit('PIVOT_NOT_DEPENDENCY', refs)
-        deferred = sorted(aid for aid, a in self.assets.items() if a['asset_kind'] in _DEFERRED)
-        for aid in deferred:
-            self.omit('DEFERRED_B2', self.assets[aid]['evidence_ids'], [aid])
+        deferred = []
+        if self.include_certificates:
+            self.certificate_nodes()
+        else:
+            deferred = sorted(aid for aid, a in self.assets.items() if a['asset_kind'] in _DEFERRED)
+            for aid in deferred:
+                self.omit('DEFERRED_B2', self.assets[aid]['evidence_ids'], [aid])
         for aid, a in self.assets.items():
             if a['asset_kind'] not in _DEFERRED and aid not in self.nodes and not any(
                     eid in self.covered for eid in a['evidence_ids']):
@@ -465,11 +670,15 @@ class _Projection:
             'cff_sha256': None if cff is None else hashlib.sha256(cff).hexdigest(),
             'certificate_key_scope': 'DEFERRED_B2', 'deferred_asset_ids': deferred,
             'evidence_count': len(self.rows), 'projected_evidence_count': len(self.covered)}
+        if self.include_certificates:
+            coverage['certificate_key_scope'] = 'B2_CERTIFICATE_KEY'
+            coverage['certificate_collections'] = self.certificate_coverage
         bom = {'$schema': cbom_validation.ROOT_URI, 'bomFormat': 'CycloneDX', 'specVersion': '1.6',
                'version': 1, 'metadata': {'timestamp': m['recorded_at'], 'component': {
                    'type': 'device', 'name': self.hid, 'bom-ref': self.hid,
                    'properties': _properties(host_state=self.host['host_state'], run_state=m['run_state'],
-                       scope='B1_CORE_DEFERRED_B2', source_kind=m['source']['source_kind'])}},
+                       scope='B2_CERTIFICATE_KEY' if self.include_certificates else 'B1_CORE_DEFERRED_B2',
+                       source_kind=m['source']['source_kind'])}},
                'components': [self.components[r] for r in sorted(self.components)],
                'services': [self.services[r] for r in sorted(self.services)],
                'dependencies': [{'ref': r, 'dependsOn': sorted(targets)}
@@ -482,14 +691,15 @@ class _Projection:
         return bom, provenance
 
 
-def build_cbom_bytes(store, run_id, host_id):
+def build_cbom_bytes(store, run_id, host_id, *, include_certificates=False):
     """Return validated canonical BOM and provenance bytes, or a fixed error.
 
     The caller owns an already opened, trusted RunStore. Never accept a path,
     dict, NamedTuple, URI or a subclass overriding open as a trust witness.
     Reopen only the selected published run via its original verification API.
+    The explicit bool opts into B2; the default is the unchanged B1 result.
     """
-    _require(type(store) is run_store.RunStore and type(run_id) is str
+    _require(type(include_certificates) is bool and type(store) is run_store.RunStore and type(run_id) is str
              and re.fullmatch(run_store.RID, run_id) is not None and type(host_id) is str
              and re.fullmatch(r'h-[0-9a-f]{64}', host_id) is not None, 'CBOM_INPUT_TYPE')
     _require(portal_indexes is not None, 'CBOM_DEPENDENCY_UNAVAILABLE')
@@ -497,7 +707,7 @@ def build_cbom_bytes(store, run_id, host_id):
     try:
         published = run_store.RunStore.open(store, run_id)
         _require(host_id in published.manifest['expected_host_ids'], 'CBOM_HOST_NOT_FOUND')
-        bom, provenance = _Projection(published, host_id).finish()
+        bom, provenance = _Projection(published, host_id, include_certificates=include_certificates).finish()
         raw = _bytes(bom, MAX_BYTES)
         provenance['bom_sha256'] = hashlib.sha256(raw).hexdigest()
         sidecar = _bytes(provenance, MAX_BYTES - len(raw))
@@ -516,7 +726,7 @@ def build_cbom_bytes(store, run_id, host_id):
     raise CBOMGenerationError(code)
 
 
-def build_cbom(store, run_id, host_id):
+def build_cbom(store, run_id, host_id, *, include_certificates=False):
     """Return independent JSON trees of the same verified canonical bytes."""
-    raw, sidecar = build_cbom_bytes(store, run_id, host_id)
+    raw, sidecar = build_cbom_bytes(store, run_id, host_id, include_certificates=include_certificates)
     return json.loads(raw), json.loads(sidecar)
