@@ -1400,6 +1400,26 @@ class RunStore:
                 os.close(root_lock)
         raise StoreError('RUN_ID_COLLISION')
 
+    @_public
+    def _begin_v3(self, *, run_id, expected_hosts, requested_flags, limits, profile,
+                  producer_rules_raw, started_at=None):
+        """Private synthetic V3 only; the public contract selector stays closed."""
+        from tools import run_store_v3
+        return run_store_v3.begin(self, run_id=run_id, expected_hosts=expected_hosts,
+                                  requested_flags=requested_flags, limits=limits,
+                                  profile=profile, producer_rules_raw=producer_rules_raw,
+                                  started_at=started_at)
+
+    @_public
+    def _open_v3(self, run_id):
+        from tools import run_store_v3
+        return run_store_v3.open_run(self, run_id)
+
+    @_public
+    def _recover_v3(self, run_id):
+        from tools import run_store_v3
+        return run_store_v3.recover(self, run_id)
+
     @contextmanager
     def _locked_run(self, rid, *, shared):
         self._check(); _rid(rid)
