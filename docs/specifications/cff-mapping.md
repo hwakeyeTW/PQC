@@ -299,3 +299,52 @@ certification and complete offline release regression remain NOT_TESTED
 for the appropriate later work packages/#28. No real host probing, privilege
 changes or live dispatch are authorized. Development test PASS is not
 independent Review, formal release QA, or Owner merge/release approval.
+
+## Private V3 aggregate capacity profile (I2 C3a R2-P)
+
+`B04_V3_CAPACITY_R2` is a fixed code-side profile for the private, staged
+synthetic Evidence 1.1.0 path. It is not selectable by document metadata,
+manifest values, CLI options, or arbitrary numeric overrides. The existing
+public Evidence, Assessment and CFF APIs, their default limits, CFF 1.0.0
+wire schema, canonical ordering, rule semantics and legacy outputs remain
+unchanged. No product workflow selects this profile in R2-P.
+
+The private Evidence entry points `_parse_v3_raw`, `_validate_v3_raw`,
+`_canonical_v3_raw` use 64 MiB for the entire raw document; their `_v3_assessed`
+variants use 96 MiB for the assessed document. Both apply the original
+semantic validator and serializer, require 1–10 distinct expected hosts, and
+limit each registry to 20,000 rows per host and 200,000 per run. Host ownership
+is determined by validated references (including claim/finding subjects).
+The single-host Evidence budget remains 32 MiB, measured on a host-only view
+with the original run metadata and its one expected host; this view is only
+for accounting, not a separately assessed run or alternate digest.
+
+`assessment._evaluate_v3_raw` and `_evaluate_v3_assessed` use the same rule
+engine and reject conflicting owned results. `cff._project_v3_raw` and
+`_project_v3_assessed` produce the unchanged full per-host CFF/companion pair
+shape, bound each pair to the one canonical **full-run assessed Evidence**
+digest, and require exact expected-host correspondence. The corresponding
+private `_validate_v3_raw_projection`, `_validate_v3_assessed_projection`,
+`_canonical_v3_raw_projection` and `_canonical_v3_assessed_projection` replay
+that mapping; no host digest substitution or filtering of findings is allowed.
+
+Each complete pair is limited to 32 MiB, 2,000,000 JSON value nodes and 20,000
+items in any array; the full canonical wrapper is limited to 128 MiB and
+8,000,000 nodes including its own four nodes. Keys do not count separately
+as nodes. Depth 64 is measured from the wrapper root; string/numeric/type
+constraints are unchanged. Row materialization is cumulatively bounded before
+append; exact pair and wrapper accounting includes canonical UTF-8 encoding,
+metadata, separators and envelope fields. Each limit is independently applied;
+passing one is not permission to exceed another.
+
+Capacity failures have code `V3_CAPACITY_LIMIT` and a closed stage
+(`RAW_EVIDENCE`, `ASSESSED_EVIDENCE` or `CFF`); they are not missing evidence or
+a readiness result. No truncation, rule changes, omitted companion or partial
+successful publication can resolve an overflow. The aggregate Core budget
+remains 256 MiB (actual raw, assessed, CFF, all detail slots, batch and rules);
+the single host checkpoint cap remains 40 MiB and the proposed V3 checkpoint
+aggregate cap is 400 MiB. These independent persistence limits, retention of
+already durable checkpoints and trusted Store selection are R2-S, not changed
+or implemented by this profile. R2-P exercises the actual producer fixtures
+and estimates Core payload, but does not establish Store admission, production
+Controller/Oracle Linux capacity or release acceptance.

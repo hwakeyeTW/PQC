@@ -379,8 +379,21 @@ def evaluate_document(document, rules):
     Existing results owned by this ruleset must exactly match recomputation;
     unrelated valid results remain. Re-evaluate original evidence for changes.
     """
+    return _evaluate_document(document, rules)
+
+
+def _evaluate_v3_raw(document, rules):
+    return _evaluate_document(document, rules, evidence._V3Stage.RAW)
+
+
+def _evaluate_v3_assessed(document, rules):
+    """Replay persisted assessed results using the same owned-result oracle."""
+    return _evaluate_document(document, rules, evidence._V3Stage.ASSESSED)
+
+
+def _evaluate_document(document, rules, stage=None):
     aliases, ids = _compile(rules)
-    evidence.validate_document(document)
+    evidence._validate_document(document, stage)
     version, reasons = rules['rule_version'], rules['reason_codes']
     collections = {c['collection_id']: c for c in document['collections']}
     by_scope, by_collection, groups, known = defaultdict(list), defaultdict(list), defaultdict(list), {}
@@ -402,6 +415,28 @@ def evaluate_document(document, rules):
             context = json.dumps(conditions, sort_keys=True, separators=(',', ':'))
             groups[(subject_key, scope, level, fact, context)].append(row)
     claims, findings = [], []
+    counts = defaultdict(int)
+    generated_bytes = defaultdict(int)
+
+    def append(rows, row, registry):
+        if stage is not None:
+            key = (registry, row['subject']['host_id'])
+            evidence._v3_require(len(rows) < evidence._V3_RUN_ROWS and
+                                 counts[key] < evidence._V3_HOST_ROWS,
+                                 evidence._V3Stage.ASSESSED)
+            # Every freshly generated row survives the owned-result merge.
+            # Bound this lower bound before append; the final canonical
+            # validator accounts exact envelope and retained foreign rows.
+            host = key[1]
+            size = len(evidence._encode(row, stage=evidence._V3Stage.ASSESSED))
+            evidence._v3_require(generated_bytes[host] + size <= evidence._V3_HOST_BYTES
+                                 and generated_bytes[None] + size <= evidence._V3_ASSESSED_BYTES,
+                                 evidence._V3Stage.ASSESSED)
+            generated_bytes[host] += size
+            generated_bytes[None] += size
+            counts[key] += 1
+        rows.append(row)
+
     for (key, scope, level, fact, context), rows in groups.items():
         subject, conditions = _subject(key), json.loads(context)
         rule = rules['rules'][level]['rule_id']
@@ -410,30 +445,32 @@ def evaluate_document(document, rules):
             _applicability(by_scope[(key, scope)], collections, known), reasons)
         cl = _claim(document['run']['run_id'], subject, level, rule, claim_key, conditions,
                     state, reason, refs, version)
-        claims.append(cl)
-        findings.append(_finding(subject, rule, _token('fact-condition', [claim_key, conditions]),
-                                 state, reason, [], version, [cl]))
+        append(claims, cl, 'claims')
+        append(findings, _finding(subject, rule, _token('fact-condition', [claim_key, conditions]),
+                                  state, reason, [], version, [cl]), 'findings')
     # Group coverage without inventing an asset or algorithm for missing data.
     indexed_collections = set()
     for (cid, key), rows in by_collection.items():
         indexed_collections.add(cid)
         f = _coverage(collections[cid], rows, key, collections, known, reasons, version)
         if f is not None:
-            findings.append(f)
+            append(findings, f, 'findings')
     for cid, collection in collections.items():
         if cid not in indexed_collections:
-            findings.append(_coverage(collection, [], (collection['host_id'], None, None, 'unqualified'),
-                                      collections, known, reasons, version))
+            append(findings, _coverage(collection, [], (collection['host_id'], None, None, 'unqualified'),
+                                       collections, known, reasons, version), 'findings')
     hosts_with_collections = {c['host_id'] for c in collections.values()}
     for host in document['hosts']:
         if host['host_id'] not in hosts_with_collections:
             state = 'NOT_SCANNED' if host['host_state'] == 'NOT_ATTEMPTED' else 'UNKNOWN'
             reason = 'NOT_ATTEMPTED' if state == 'NOT_SCANNED' else reasons['unknown']
-            findings.append(_finding(_subject((host['host_id'], None, None)), COVERAGE_RULE,
-                                     'no-collection', state, reason, [], version))
+            append(findings, _finding(_subject((host['host_id'], None, None)), COVERAGE_RULE,
+                                      'no-collection', state, reason, [], version), 'findings')
     owned = {r['rule_id'] for r in rules['rules'].values()}
     result = {**document,
               'claims': _merge_results(document['claims'], claims, 'claim_id', owned),
               'findings': _merge_results(document['findings'], findings, 'finding_id', owned)}
     # canonical_bytes validates the full result and the exact #10 ID/ref contract.
+    if stage is not None:
+        return json.loads(evidence._canonical_v3_assessed(result))
     return json.loads(evidence.canonical_bytes(result))
