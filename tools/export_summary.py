@@ -455,22 +455,57 @@ def render_summary_exports(published):
     return _render_summary_projection(project_scan_summary(published))
 
 
-def _render_summary_projection(p):
-    # The caller owns the bounded projection derived from the verified run.
+def _validate_summary_v5_hosts(p):
+    # Coverage renders exactly one row for each expected host. Validate the
+    # same registry and finding subject IDs before adding any new links.
+    ids, hosts = p['expected_host_ids'], p['hosts']
+    _require(type(ids) is list and 0 < len(ids) <= 1000 and type(hosts) is dict)
+    for hid in ids:
+        _id(hid, 'host')
+    _require(ids == sorted(set(ids)) and set(ids) == set(hosts))
+    for hid in ids:
+        _require(hosts[hid]['host_id'] == hid)
+    findings = p['findings']
+    _require(findings is None or type(findings) is dict)
+    for finding in (findings or {}).values():
+        hid = _id(finding['subject']['host_id'], 'host')
+        _require(hid in hosts and hosts[hid]['host_id'] == hid)
+
+
+def _render_summary_projection(p, *, portal_v5=False, page_limit=None,
+                               html_limit=None, bundle_limit=None):
+    # Fixed private caller only. No new projection or public authority.
+    _require(type(portal_v5) is bool)
+    if portal_v5:
+        for cap in (page_limit, html_limit, bundle_limit):
+            _require(cap is None or (type(cap) is int and cap >= 0), 'SUMMARY_SIZE_LIMIT')
+        _validate_summary_v5_hosts(p)
     rid = p['run']['run_id']
     exports = {'scan_summary.json': _json_bytes(p),
                'summary.csv': _csv_bytes(rid, _SUMMARY_COLUMNS, p['metrics']),
                'algorithms.csv': _csv_bytes(rid, _ALGORITHM_COLUMNS, p['algorithm_rows'])}
     _require(len(exports['summary.csv']) + len(exports['algorithms.csv']) <= _MAX_CSV_TOTAL, 'SUMMARY_SIZE_LIMIT')
     pages = {}
+    if portal_v5 and bundle_limit is not None:
+        bundle_limit -= sum(map(len, exports.values()))
+        _require(bundle_limit >= 0, 'SUMMARY_SIZE_LIMIT')
     try:
         env = Environment(loader=FileSystemLoader(str(_TEMPLATES)), autoescape=True,
                           undefined=StrictUndefined, keep_trailing_newline=True)
         for name in ('findings', 'coverage'):
-            out = _Bytes(_MAX_HTML)
-            for chunk in env.get_template(name + '.html.j2').generate(p=p):
+            cap = _MAX_HTML
+            if portal_v5:
+                cap = min([cap, *(v for v in (page_limit, html_limit, bundle_limit)
+                                  if v is not None)])
+            out = _Bytes(cap)
+            for chunk in env.get_template(name + '.html.j2').generate(p=p, portal_v5=portal_v5):
                 out.write(chunk)
             pages[name + '.html'] = out.finish()
+            if portal_v5:
+                if html_limit is not None:
+                    html_limit -= len(out.data)
+                if bundle_limit is not None:
+                    bundle_limit -= len(out.data)
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('SUMMARY_RENDER_ERROR') from None
     return p, pages, exports

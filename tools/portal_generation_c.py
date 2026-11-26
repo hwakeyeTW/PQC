@@ -94,16 +94,27 @@ def _assemble(published, *, portal_v5=False):
     else:
         assets, asset_pages = portal_asset_indexes.render_asset_indexes(published)
     crypto = portal_indexes.project_crypto_indexes(published)
-    summary, summary_pages, exports = export_summary._render_summary_projection(
-        export_summary._project_scan_summary(published, crypto=crypto))
+    projected_summary = export_summary._project_scan_summary(published, crypto=crypto)
+    out = _Buffers()
+    if portal_v5:
+        # Charge the two existing asset pages before streaming summary HTML.
+        for name, raw in asset_pages.items():
+            out.page(name, raw)
+        summary, summary_pages, exports = export_summary._render_summary_projection(
+            projected_summary, portal_v5=True, page_limit=_MAX_HTML,
+            html_limit=_MAX_HTML_TOTAL - out.html, bundle_limit=_MAX_BUNDLE - out.total)
+    else:
+        summary, summary_pages, exports = export_summary._render_summary_projection(projected_summary)
     _require(assets['run_id'] == crypto['run_id'] == summary['run']['run_id'] == rid
              and set(assets['hosts']) == set(summary['expected_host_ids']) == set(ids)
              and assets['assessed'] == crypto['assessed'] == summary['assessed'])
     _require(set(asset_pages) == {'certificates.html', 'services.html'}
              and set(summary_pages) == {'findings.html', 'coverage.html'}
              and set(exports) == {'scan_summary.json', 'summary.csv', 'algorithms.csv'})
-    out = _Buffers()
-    for name, raw in (*asset_pages.items(), *summary_pages.items()):
+    if not portal_v5:
+        for name, raw in asset_pages.items():
+            out.page(name, raw)
+    for name, raw in summary_pages.items():
         out.page(name, raw)
     out.json('asset_indexes.json', portal_asset_indexes._bounded_bytes(assets))
     out.json('scan_summary.json', exports['scan_summary.json'])
@@ -132,7 +143,7 @@ def _assemble_payload(published, *, portal_v5=False):
     No partial result escapes on failure. Existing preview/public APIs and
     their error contracts are unchanged. C-B/C-C own navigation, receipt,
     publication and catalog admission; these buffers are not a generation.
-    The private exact boolean selects only the two V5 asset HTML pages.
+    The private exact boolean selects only the four V5 asset and summary HTML pages.
     """
     try:
         return _assemble(published, portal_v5=portal_v5)
