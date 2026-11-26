@@ -21,6 +21,61 @@ _MAX_BUNDLE = 512 * 1024 * 1024
 _HTML = ('certificates.html', 'coverage.html', 'findings.html', 'services.html')
 _JSON = ('asset_indexes.json', 'scan_summary.json')
 _CSV = ('algorithms.csv', 'certificates.csv', 'summary.csv')
+_DOWNLOADS = _JSON + _CSV
+
+
+def _download_entry(name, raw, rid, owner=None):
+    _require(type(raw) is bytes and bool(raw))
+    return dict(name=name, size=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
+                run_id=rid, host_id=owner)
+
+
+def _download_metadata(published, files, evidence_sha256):
+    # Only completed, bounded B1/B2 buffers from this assembler. Never take
+    # hrefs, file paths or ownership claims from a caller or decoded BOM.
+    m = published.manifest
+    rid, ids = m['run_id'], m['expected_host_ids']
+    expected = set(_HTML + _DOWNLOADS) | {
+        hid + suffix for hid in ids for suffix in ('.cbom.json', '.cbom.provenance.json')}
+    _require(set(files) == expected)
+    hosts = {h['host_id']: h for h in m['hosts']}
+    _require(set(hosts) == set(ids) and len(hosts) == len(m['hosts']))
+    pairs = {}
+    for hid in ids:
+        name, side = hid + '.cbom.json', hid + '.cbom.provenance.json'
+        bom, provenance = files[name], files[side]
+        _require(type(bom) is bytes and type(provenance) is bytes)
+        _require(len(bom) + len(provenance) <= _MAX_CBOM_PAIR, 'PORTAL_PAYLOAD_SIZE_LIMIT')
+        entry = _download_entry(name, bom, rid, hid)
+        # Decode one host at a time; the official schema/reference validation
+        # already ran before the pair entered out.files.
+        component = cbom_validation._parse_bytes(bom)['metadata']['component']
+        _require(component['name'] == component['bom-ref'] == hid)
+        del component
+        prov = cbom_validation._parse_bytes(provenance)
+        _require(set(prov) == {'version', 'run_id', 'host_id', 'evidence_schema_version',
+                  'source_kind', 'evidence_sha256', 'coverage', 'nodes', 'observations', 'claims',
+                  'relationships', 'omitted', 'bom_sha256'}
+                 and type(prov['version']) is int and prov['version'] == cbom_generation.VERSION
+                 and prov['evidence_schema_version'] == m['evidence_schema_version']
+                 and prov['source_kind'] == m['source']['source_kind']
+                 and all(type(prov[k]) is dict for k in ('coverage', 'nodes', 'observations', 'claims'))
+                 and all(type(prov[k]) is list for k in ('relationships', 'omitted')))
+        coverage = prov['coverage']
+        _require(prov['run_id'] == rid and prov['host_id'] == hid
+                 and prov['bom_sha256'] == entry['sha256']
+                 and prov['evidence_sha256'] == evidence_sha256
+                 and coverage['certificate_key_scope'] == 'B2_CERTIFICATE_KEY'
+                 and coverage['host_state'] == hosts[hid]['host_state']
+                 and coverage['attempted'] is hosts[hid]['attempted']
+                 and coverage['run_state'] == m['run_state']
+                 and coverage['recovery'] is m['recovery']
+                 and coverage['assessment_saved'] is (published.assessed is not None)
+                 and coverage['missing_artifact_count'] == len(m['missing_artifacts'])
+                 and type(coverage['certificate_collections']) is list)
+        del coverage, prov
+        pairs[hid] = (entry, _download_entry(side, provenance, rid, hid))
+    return tuple(_download_entry(name, files[name], rid) for name in sorted(_DOWNLOADS)), pairs
 
 
 class _RenderPayload(NamedTuple):
@@ -79,8 +134,9 @@ class _Buffers:
         self.cbom += size
 
 
-def _assemble(published, *, portal_v5=False, complete=False):
-    _require(type(portal_v5) is bool and type(complete) is bool and (not complete or portal_v5)
+def _assemble(published, *, portal_v5=False, complete=False, navigation=False):
+    _require(type(navigation) is bool and (not navigation or complete)
+             and type(portal_v5) is bool and type(complete) is bool and (not complete or portal_v5)
              and type(published) is run_store.PublishedRun)
     m, doc, _, _ = published
     rid = run_store._rid(m['run_id'])
@@ -141,9 +197,11 @@ def _assemble(published, *, portal_v5=False, complete=False):
         out.pair(hid, bom, provenance)
     _require(out.files.keys() == expected)
     if complete:
+        downloads = (_download_metadata(published, out.files, batch.evidence_sha256)
+                     if navigation else None)
         index, css, core = render_portal._render_v5_core(
             published, crypto, page_limit=_MAX_HTML, html_limit=_MAX_HTML_TOTAL - out.html,
-            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON)
+            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON, downloads=downloads)
         core_html = {'hosts.html', 'algorithms.html', 'libraries.html'} | {hid + '.html' for hid in ids}
         _require(set(core) == core_html | {'crypto_indexes.json'} and not (set(core) & expected))
         out.add('portal.css', css, render_portal._MAX_CSS)
@@ -178,17 +236,17 @@ def _assemble_payload(published, *, portal_v5=False):
     return _checked_assemble(published, portal_v5=portal_v5)
 
 
-def _assemble_v5_render_payload(published):
+def _assemble_v5_render_payload(published, *, navigation=False):
     """Internal complete render buffers for a pinned verified publication.
 
     No generation marker, receipt, catalog operation or file write.
     """
-    return _checked_assemble(published, portal_v5=True, complete=True)
+    return _checked_assemble(published, portal_v5=True, complete=True, navigation=navigation)
 
 
-def _checked_assemble(published, *, portal_v5, complete=False):
+def _checked_assemble(published, *, portal_v5, complete=False, navigation=False):
     try:
-        return _assemble(published, portal_v5=portal_v5, complete=complete)
+        return _assemble(published, portal_v5=portal_v5, complete=complete, navigation=navigation)
     except (run_store.StoreError, cbom_generation.CBOMGenerationError) as exc:
         if exc.code in ('PORTAL_PAYLOAD_SIZE_LIMIT', 'SUMMARY_SIZE_LIMIT', 'ASSET_INDEX_SIZE_LIMIT',
                         'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT', 'PORTAL_SIZE_LIMIT'):

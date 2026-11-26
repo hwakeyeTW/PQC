@@ -1073,11 +1073,15 @@ def _cb2a_check(pub, full):
                 if dest.startswith('portal-v5/h-') and frag in owners:
                     assert owners[frag] + '.html' == dest.removeprefix('portal-v5/')
             if hid and dest.startswith('portal-v5/h-') and dest != name:
-                # Only the explicit adjacent-host navigation, never a cross-host
-                # reference to another host's record.
                 assert not frag
-                i = ids.index(hid)
-                assert dest.removeprefix('portal-v5/').removesuffix('.html') in ids[max(0, i-1):i+2]
+                if dest.endswith(('.cbom.json', '.cbom.provenance.json')):
+                    assert dest in {'portal-v5/' + hid + suffix for suffix in
+                                    ('.cbom.json', '.cbom.provenance.json')}
+                else:
+                    # Only the explicit adjacent-host navigation, never a cross-host
+                    # reference to another host's record.
+                    i = ids.index(hid)
+                    assert dest.removeprefix('portal-v5/').removesuffix('.html') in ids[max(0, i-1):i+2]
     assert history_links == len(pages)
     assert {h for h in pages['index.html'].ids if h.startswith('h-')} == set(ids)
     assert {h for h in pages['portal-v5/hosts.html'].ids if h.startswith('h-')} == set(ids)
@@ -1117,12 +1121,9 @@ def _cb2a_check(pub, full):
     return pages
 
 
-@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
-def test_cb2a_actual_buffers_and_k_oracle(root, tmp_path, monkeypatch, kind):
-    import tools
-    from tools import render_portal as portal
+def _cb2a_publication(root, tmp_path, kind):
     from test_portal_overview import publish
-    from test_portal_crypto_index import publish_crypto, MALICIOUS
+    from test_portal_crypto_index import publish_crypto
     if kind.startswith('c1'):
         pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=kind == 'c1-assessed')
     elif kind == 'recovery':
@@ -1141,6 +1142,15 @@ def test_cb2a_actual_buffers_and_k_oracle(root, tmp_path, monkeypatch, kind):
             pub = store.open(a.RID)
     else:
         pub = a.publish(root, assessed=False, empty=True)
+    return pub
+
+
+@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
+def test_cb2a_actual_buffers_and_k_oracle(root, tmp_path, monkeypatch, kind):
+    import tools
+    from tools import render_portal as portal
+    from test_portal_crypto_index import MALICIOUS
+    pub = _cb2a_publication(root, tmp_path, kind)
     before, snapshot = c1._c2_tree(root), deepcopy(pub)
     old_ca, old_crypto, old_portal = _cb2a_original(tmp_path)
     marker = rs._json_bytes(pub.manifest)
@@ -1197,7 +1207,8 @@ def test_cb2a_actual_buffers_and_k_oracle(root, tmp_path, monkeypatch, kind):
     assert pub == snapshot and c1._c2_tree(root) == before
 
 
-def test_cb2a_actual_signatures_and_call_through(root, monkeypatch):
+@pytest.mark.parametrize('navigation', [False, True])
+def test_cb2a_actual_signatures_and_call_through(root, monkeypatch, navigation):
     import os
     from tools import render_portal as portal
     pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
@@ -1228,7 +1239,7 @@ def test_cb2a_actual_signatures_and_call_through(root, monkeypatch):
                 counts[_name] += 1
                 return _original(*args, **kwargs)
             monkeypatch.setattr(module, name, call)
-        full = ca._assemble_v5_render_payload(actual)
+        full = ca._assemble_v5_render_payload(actual, navigation=navigation)
         assert counts == {'project_asset_indexes': 1, 'project_crypto_indexes': 2,
             'validate_cbom_bytes': 3, '_verified_taxonomy': 1, '_project_scan_summary': 1,
             '_render_crypto_projection': 1, '_render_asset_indexes': 1,
@@ -1466,7 +1477,8 @@ def test_cb2a_missing_template(root, tmp_path, monkeypatch, missing):
     assert pub == snapshot and c1._c2_tree(root) == before
 
 
-def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch):
+@pytest.mark.parametrize('navigation', [False, True])
+def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch, navigation):
     # Persist an allowed but unclassified legacy field in a real Store. The
     # original host facts allowlist suppresses it; do not use a typed allowed
     # configuration value as if it were an unclassified raw diagnostic.
@@ -1488,7 +1500,7 @@ def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch):
     assert any(r['data'].get('value') == sentinel for r in pub.document['evidence'])
     assert any(sentinel.encode() in r for r in pub.artifacts.values())
     before, snapshot = c1._c2_tree(root), deepcopy(pub)
-    full = ca._assemble_v5_render_payload(pub)
+    full = ca._assemble_v5_render_payload(pub, navigation=navigation)
     assert all(sentinel.encode() not in r for r in (full.index, full.css, *full.files.values()))
     hid = pub.manifest['expected_host_ids'][0]
     assert b'Not displayed (unclassified legacy field)' in full.files[hid + '.html']
@@ -1537,3 +1549,255 @@ def test_cb2a_actual_v2_terminal_and_artifact_rows(root, recovery):
     if recovery:
         assert b'NOT_ATTEMPTED' in full.index and b'Recovered publication' in full.index
     assert c1._c2_tree(root) == before
+
+
+# B2b-1 independent M oracle: bind the actual historical modules and templates.
+_CB2B1_M = 'd2027a46281d4e08b3909817aa7e67fc6d631c2c'
+_CB2B1_M_FILES = {**_CB2A_K_FILES,
+    'tools/portal_generation_c.py': 'ecb79cdae9ed7edca286cfef2a90415d9ab7ddc1',
+    'tools/render_portal.py': 'b7d90f246ca0decdffe74695f3a745ff6979f57f',
+    'tools/portal_indexes.py': 'ab61c37d846c6971ead8f944f868a678d6fab842',
+    'templates/portal/run_index.html.j2': '8f31e4f534990fefec8cc1d4f5ebca8e1032343c',
+}
+
+
+def _cb2b1_original(tmp_path):
+    from types import ModuleType
+    old_assets, old_ca = _cb1b_original(tmp_path, _CB2B1_M, _CB2B1_M_FILES, 'm', 'PQC_CB2B1_M_ROOT')
+    modules = []
+    for name in ('portal_indexes', 'render_portal'):
+        path = tmp_path / 'fixed-m/tools' / (name + '.py')
+        module = ModuleType('_cb2b1_m_' + name)
+        module.__file__ = str(path)
+        exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        modules.append(module)
+    old_crypto, old_portal = modules
+    old_ca.portal_indexes = old_assets.portal_indexes = old_ca.export_summary.portal_indexes = old_crypto
+    old_ca.render_portal = old_portal
+    return old_ca, old_crypto, old_portal
+
+
+_CB2B1_BATCH = ('algorithms.csv', 'asset_indexes.json', 'certificates.csv', 'crypto_indexes.json',
+                'scan_summary.json', 'summary.csv')
+_CB2B1_SECTIONS = ('Hosts', 'Algorithms', 'Libraries', 'Certificates', 'Services', 'Findings', 'Coverage')
+
+
+def _cb2b1_nav(raw):
+    from html.parser import HTMLParser
+    class Nav(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.navs = {}; self.current = None; self.anchor = None
+            self.feed(raw.decode('utf-8')); self.close()
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'nav':
+                self.current = attrs.get('aria-label')
+                if self.current:
+                    assert self.current not in self.navs
+                    self.navs[self.current] = []
+            elif tag == 'a' and self.current:
+                self.anchor = [attrs['href'], attrs.get('aria-current'), '']
+        def handle_data(self, data):
+            if self.anchor is not None:
+                self.anchor[2] += data
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.anchor is not None:
+                self.navs[self.current].append(tuple(self.anchor)); self.anchor = None
+            elif tag == 'nav':
+                self.current = None
+    return Nav().navs
+
+
+def _cb2b1_check(pub, full):
+    pages = _cb2a_check(pub, full)
+    ids = pub.manifest['expected_host_ids']; rid = pub.manifest['run_id']
+    assert len(full.entries) == 15 + 3 * len(ids)
+    pairs = {hid: (hid + '.cbom.json', hid + '.cbom.provenance.json') for hid in ids}
+    all_pairs = [n for hid in ids for n in pairs[hid]]
+    for name, raw in [('index.html', full.index), ('hosts.html', full.files['hosts.html'])] + [
+            (hid + '.html', full.files[hid + '.html']) for hid in ids]:
+        nested = name != 'index.html'; prefix = '' if nested else 'portal-v5/'
+        hid = name.removesuffix('.html'); hid = hid if hid in ids else None
+        page = pages['portal-v5/' + name if nested else name]
+        navs = _cb2b1_nav(raw)
+        assert navs['Run sections'] == [(prefix + section.lower() + '.html',
+            ('location' if hid else 'page') if nested and i == 0 else None, section)
+            for i, section in enumerate(_CB2B1_SECTIONS)]
+        assert 'Breadcrumb' in navs and 'History' in raw.decode('utf-8') and '#main' in page.links
+        assert ('../' if nested else '') + 'portal.css' in page.links
+        if name == 'hosts.html':
+            assert 'downloads' not in page.ids
+            continue
+        assert {'downloads', 'artifacts'} <= page.ids
+        assert b'not published' in raw and b'CFF is a different projection' in raw
+        assert b'CBOM not available' not in raw and b'download integration is separate' not in raw
+        if not nested:
+            assert [link[0] for link in navs['Dashboard sections']] == ['#hosts', '#coverage', '#capability',
+                '#negotiation', '#assessment', '#artifacts', '#downloads']
+        else:
+            assert 'Host navigation' in navs and 'Host sections' in navs
+            i = ids.index(hid)
+            assert 'hosts.html#' + hid in page.links and '../index.html#' + hid in page.links
+            assert set(x[0] for x in navs['Host navigation'] if x[0].endswith('.html')) == {
+                h + '.html' for h in ids[max(0, i-1):i+2] if h != hid}
+        data = a.Page(raw)
+        expected = _CB2B1_BATCH + tuple(pairs[hid] if hid else all_pairs)
+        assert page.refs['downloads'] == {prefix + n for n in expected}
+        for table, names in [('batch-downloads', _CB2B1_BATCH), ('host-downloads', pairs[hid] if hid else all_pairs)]:
+            assert page.refs[table] == {prefix + n for n in names}
+            rows = [[n, rid, n.split('.')[0] if n.endswith(('.cbom.json', '.cbom.provenance.json')) else 'Batch-wide',
+                     str(len(full.files[n])), hashlib.sha256(full.files[n]).hexdigest()] for n in names]
+            assert data.tables[table][1:] == rows
+        if hid:
+            assert not any(x in page.links for x in all_pairs if x not in pairs[hid])
+    digest = hashlib.sha256(pub.artifacts['evidence.json']).hexdigest()
+    for hid, (name, side) in pairs.items():
+        bom = json.loads(full.files[name]); prov = json.loads(full.files[side])
+        assert bom['metadata']['component']['name'] == bom['metadata']['component']['bom-ref'] == hid
+        assert prov['run_id'] == rid and prov['host_id'] == hid
+        assert prov['bom_sha256'] == hashlib.sha256(full.files[name]).hexdigest()
+        assert prov['evidence_sha256'] == digest and prov['coverage']['certificate_key_scope'] == 'B2_CERTIFICATE_KEY'
+        host = next(h for h in pub.manifest['hosts'] if h['host_id'] == hid)
+        assert prov['coverage']['host_state'] == host['host_state'] and prov['coverage']['attempted'] is host['attempted']
+        assert type(prov['omitted']) is list
+
+
+@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
+def test_cb2b1_actual_m_oracle(root, tmp_path, monkeypatch, kind):
+    import tools
+    from tools import render_portal as portal
+    pub = _cb2a_publication(root, tmp_path, kind)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old_ca, old_crypto, old_portal = _cb2b1_original(tmp_path)
+    marker = rs._json_bytes(pub.manifest)
+    with monkeypatch.context() as patch:
+        patch.setattr(tools, 'portal_indexes', old_crypto)
+        patch.setattr(gen, 'portal_indexes', old_crypto)
+        old = old_ca._assemble_v5_render_payload(pub)
+        old_b1 = [old_ca._assemble_payload(pub, portal_v5=mode) for mode in (False, True)]
+        assert old_ca._assemble_payload(pub) == old_b1[0]
+        if not rs._is_producer_v2(pub.manifest):
+            css = old_portal._render_css()
+            public = [old_portal._render(pub)] + [getattr(old_portal, n)(pub, marker, css)
+                for n in ('_render_v2', '_render_v3', '_render_v4')]
+        else:
+            public = None
+            with pytest.raises(rs.StoreError) as exc:
+                old_portal._render(pub)
+            old_error = exc.value.code
+    assert ca._assemble_v5_render_payload(pub) == old
+    assert ca._assemble_v5_render_payload(pub, navigation=False) == old
+    assert ca._assemble_payload(pub) == old_b1[0]
+    assert [ca._assemble_payload(pub, portal_v5=mode) for mode in (False, True)] == old_b1
+    if public is not None:
+        assert [portal._render(pub)] + [getattr(portal, n)(pub, marker, css)
+            for n in ('_render_v2', '_render_v3', '_render_v4')] == public
+    else:
+        with pytest.raises(rs.StoreError) as exc:
+            portal._render(pub)
+        assert exc.value.code == old_error
+    full = ca._assemble_v5_render_payload(pub, navigation=True)
+    _cb2b1_check(pub, full)
+    changed = {'hosts.html'} | {hid + '.html' for hid in pub.manifest['expected_host_ids']}
+    assert set(full.files) == set(old.files) and full.css == old.css and full.index != old.index
+    assert {name for name in full.files if full.files[name] != old.files[name]} == changed
+    assert ca._assemble_v5_render_payload(pub, navigation=True) == full
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('fault', ['missing', 'extra', 'foreign-name', 'duplicate-name', 'malformed-bom',
+    'malformed-sidecar', 'duplicate-json', 'foreign-pair', 'name', 'bom-ref', 'run_id', 'host_id',
+    'bom_sha256', 'evidence_sha256', 'missing-omissions', 'scope', 'host-state'])
+def test_cb2b1_reject_completed_pair(root, monkeypatch, fault):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    ids = pub.manifest['expected_host_ids']; hid = ids[-1]
+    pair = ca._Buffers.pair
+    def inject(self, owner, bom, provenance):
+        pair(self, owner, bom, provenance)
+        if owner != hid:
+            return
+        n, s = hid + '.cbom.json', hid + '.cbom.provenance.json'
+        if fault == 'missing':
+            del self.files[s]
+        elif fault == 'extra':
+            self.files['../arbitrary.json'] = provenance
+        elif fault == 'foreign-name':
+            self.files['h-' + 'f'*64 + '.cbom.json'] = self.files.pop(n)
+        elif fault == 'duplicate-name':
+            self.add(n, bom, ca._MAX_CBOM_PAIR)
+        elif fault == 'malformed-bom':
+            self.files[n] = b'not JSON'
+        elif fault == 'malformed-sidecar':
+            self.files[s] = b'{"run_id":NaN}'
+        elif fault == 'duplicate-json':
+            self.files[s] = b'{"run_id":"x",' + provenance[1:]
+        elif fault == 'foreign-pair':
+            self.files[n] = self.files[ids[0] + '.cbom.json']
+            self.files[s] = self.files[ids[0] + '.cbom.provenance.json']
+        else:
+            p = json.loads(provenance)
+            if fault in ('name', 'bom-ref'):
+                data = json.loads(bom); data['metadata']['component'][fault] = ids[0]
+                self.files[n] = rs._json_bytes(data)
+                p['bom_sha256'] = hashlib.sha256(self.files[n]).hexdigest()
+            elif fault == 'missing-omissions':
+                del p['omitted']
+            elif fault in ('scope', 'host-state'):
+                p['coverage']['certificate_key_scope' if fault == 'scope' else 'host_state'] = 'FORGED'
+            else:
+                p[fault] = 'forged'
+            self.files[s] = rs._json_bytes(p)
+    monkeypatch.setattr(ca._Buffers, 'pair', inject)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_v5_render_payload(pub, navigation=True)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b1_invalid_mode_and_download_name(root, monkeypatch):
+    pub = a.publish(root, assessed=False, empty=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    for mode in (None, 0, 1, 'true', [], {}):
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+            ca._assemble_v5_render_payload(pub, navigation=mode)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._checked_assemble(pub, portal_v5=True, navigation=True)
+    metadata = ca._download_metadata
+    def inject(*args):
+        batch, hosts = metadata(*args)
+        batch[0]['name'] = '../arbitrary.json'
+        return batch, hosts
+    monkeypatch.setattr(ca, '_download_metadata', inject)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_v5_render_payload(pub, navigation=True)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('page_name', ['index.html', 'hosts.html', 'host'])
+@pytest.mark.parametrize('cap', ['_MAX_HTML_TOTAL', '_MAX_BUNDLE'])
+def test_cb2b1_remaining_capacity(root, monkeypatch, page_name, cap):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    full = ca._assemble_v5_render_payload(pub, navigation=True)
+    outputs = {'index.html': full.index, 'portal.css': full.css, **full.files}
+    order = ['algorithms.html', 'libraries.html', 'index.html', 'hosts.html'] + [
+        h + '.html' for h in pub.manifest['expected_host_ids']]
+    if page_name == 'host':
+        page_name = order[-1]
+    i = order.index(page_name)
+    preceding = set(order[:i+1]) | set(outputs) - set(order)
+    limit = sum(len(outputs[n]) for n in preceding if cap == '_MAX_BUNDLE' or n.endswith('.html'))
+    faults = _cb2a_watch_writers(monkeypatch)
+    monkeypatch.setattr(ca, cap, limit)
+    if i+1 == len(order):
+        assert ca._assemble_v5_render_payload(pub, navigation=True) == full
+    else:
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+            ca._assemble_v5_render_payload(pub, navigation=True)
+        assert faults[-1][:2] == (order[i+1], 0)
+    faults.clear()
+    monkeypatch.setattr(ca, cap, limit - 1)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+        ca._assemble_v5_render_payload(pub, navigation=True)
+    assert faults[-1][:2] == (page_name, len(outputs[page_name]) - 1)
+    assert pub == snapshot and c1._c2_tree(root) == before

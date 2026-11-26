@@ -435,7 +435,30 @@ def _render_pages(published, marker, css, *, history, crypto=False):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
 
 
-def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_limit, json_limit):
+def _v5_download_context(downloads, rid, ids, raw):
+    # Only fixed relative names are admitted to the templates. The assembler
+    # has already bound every row to the corresponding actual buffer.
+    batch, pairs = downloads
+    names = ('algorithms.csv', 'asset_indexes.json', 'certificates.csv', 'scan_summary.json', 'summary.csv')
+
+    def check(rows, expected, owner):
+        run_store.require(type(rows) is tuple and len(rows) == len(expected), 'PORTAL_PAYLOAD_INVALID')
+        for row, name in zip(rows, expected):
+            run_store.require(type(row) is dict and set(row) == {'name', 'size', 'sha256', 'run_id', 'host_id'}
+                and row['name'] == name and row['run_id'] == rid and row['host_id'] == owner
+                and type(row['size']) is int and row['size'] > 0 and type(row['sha256']) is str
+                and re.fullmatch(r'[0-9a-f]{64}', row['sha256']) is not None, 'PORTAL_PAYLOAD_INVALID')
+
+    check(batch, names, None)
+    run_store.require(type(pairs) is dict and set(pairs) == set(ids), 'PORTAL_PAYLOAD_INVALID')
+    for hid in ids:
+        check(pairs[hid], (hid + '.cbom.json', hid + '.cbom.provenance.json'), hid)
+    batch = tuple(sorted((*batch, dict(name=_CRYPTO_JSON, size=len(raw), sha256=_digest(raw),
+        run_id=rid, host_id=None)), key=lambda row: row['name']))
+    return batch, pairs
+
+
+def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_limit, json_limit, downloads=None):
     """Fixed private root/nested buffers, no receipt, marker, or publication.
 
     Only the trusted assembler supplies the existing verified projection and
@@ -461,6 +484,14 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
         html = min(html_limit, _MAX_TOTAL_HTML)
         page_cap = min(page_limit, _MAX_HTML)
         pages = {_CRYPTO_JSON: raw}
+        navigation = downloads is not None
+        if navigation:
+            # The trusted assembler supplied fixed metadata for the actual
+            # B1/B2 buffers. Add the sixth export from this exact JSON buffer.
+            batch_downloads, host_downloads = _v5_download_context(
+                downloads, v['run']['run_id'], published.manifest['expected_host_ids'], raw)
+        else:
+            batch_downloads, host_downloads = (), {}
         crypto_pages = indexes._render_crypto_projection(projection, page_limit=page_cap,
                                                        total_limit=min(html, remaining))
         run_store.require(set(crypto_pages) == set(_CRYPTO_PAGES), 'INVALID_CRYPTO_INDEX_PUBLICATION')
@@ -480,7 +511,7 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
             out = bytearray()
             for chunk in env.get_template(template).generate(
                     v=v, portal_v2=True, portal_v3=True, portal_v4=True, portal_v5=True,
-                    crypto_backlinks=backlinks, **context):
+                    crypto_backlinks=backlinks, private_navigation=navigation, **context):
                 raw = chunk.encode('utf-8')
                 run_store.require(len(raw) <= limit - len(out), 'PORTAL_SIZE_LIMIT')
                 out.extend(raw)
@@ -488,10 +519,12 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
             remaining -= len(out)
             return bytes(out)
 
-        index = page('run_index.html.j2')
+        index = page('run_index.html.j2', batch_downloads=batch_downloads, host_downloads=host_downloads)
         pages['hosts.html'] = page('hosts.html.j2', nested=True, hosts=hosts)
         for host in views:
-            pages[host['host_id'] + '.html'] = page('host.html.j2', nested=True, host=host)
+            pages[host['host_id'] + '.html'] = page('host.html.j2', nested=True, host=host,
+                batch_downloads=batch_downloads,
+                host_downloads=host_downloads[host['host_id']] if navigation else ())
         return index, css, pages
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
