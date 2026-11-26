@@ -180,6 +180,65 @@ known public-key source observations; unique assets are separate. Complete
 zero is allowed only after a successful bounded candidate enumeration with no
 gaps. Unknown layout or bad input never creates a complete zero assertion.
 
+## I1b SSH S1: fixed native file-stage module (restricted acquisition)
+
+Owner-approved S1 contract: #57 proposal #7181940265 and dispatch
+#7182097900. `pqc_ssh_acquire` (short name or collection FQCN) accepts only
+`stage: config | keys`, supports check mode, uses no-log, and returns
+`changed: false`. It performs exactly one read-only file stage. It is not a
+scan entry point or an authorization decision; the future trusted S2 caller
+must bind eligibility, host, flags, ordering and cleanup. The original role,
+normalizer, Q/T false gates, registries and live denial remain unchanged.
+
+S1 retains the #17 parser/row/gap grammar above, with root-owned and not
+group/other-writable fixed directories and single-link regular source inodes
+checked before reading and at closure. (The trusted UID is code-only root.)
+A permission failure is a gap; symlink, hardlink, special inode, untrusted
+owner/mode and drift do not yield successful source rows. Only fixed `.pub`
+files, the fixed main config, and the exact Include allowlist are opened.
+Private filenames, arbitrary HostKey paths, external commands, NSS and
+network/service evaluation are excluded. A private-format marker encountered
+inside a permitted input is rejected, never projected. No `-Q`, `-T` or `-G`
+command exists in this module. The existing static coverage limitations in
+S02 remain; no effective-setting, L2/L3 or daemon-use assertion is added.
+
+The fixed child is imported from the same private AnsiballZ archive with
+isolated Python (`-I -S -B`), a closed stage enum and no caller-selectable
+path/argv/environment. It uses the existing bounded-execution process-group
+primitive, with a dedicated fixed S1 stdout+stderr allocation of 262145 bytes
+(the canonical 262144-byte slot plus one LF); existing public 16 KiB and CP1
+64 KiB+1 runner entries and bridge frames are unchanged. The 23-second inner
+monotonic deadline and alarm bound acquisition/projection; the shared runner
+has work <=27 seconds and total <=28 seconds including its cleanup reserve
+(no increase over the original 27+2 outer window). Nonzero exit, overflow,
+interruption or uncertain cleanup yields no payload. A typed inner TIMEOUT
+has no rows/gaps; S2 must stop on that or any existing halt/uncertain outcome.
+No later stage is dispatched by S1 itself.
+
+The closed receipt is `{format: 1, stage, reason_code, rc,
+cleanup_confirmed, payload}`. `COMMAND_OK` means only the fixed child exited
+cleanly and delivered one original file-slot object (`state`, `reason`, `rc`,
+`rows`, `gaps`); its inner rc is always null. The actual slot state is not
+inferred from the outer rc. Other outer reasons have null payload. Child JSON
+is canonical ASCII, exact single LF, rejects duplicates, nonfinite numbers,
+floats and extra fields. The original row validator semantics are repeated
+for the two permitted file slots; invalid payload/receipt fails closed.
+
+The slot cap is measured on the full canonical slot object, not just rows.
+Receipt capacity adds the maximum exact compact success-envelope overhead
+(with the four-byte `null` placeholder subtracted). The normal Ansible frame
+adds `changed`, `receipt`, `invocation.module_args.stage`, default JSON
+separator whitespace and two LFs. Its exact byte length is checked before
+return; a conservative upper allocation of twice the slot cap plus the
+maximum fixed frame overhead remains below 1 MiB. Over-cap slots are discarded
+in full as `ERROR/OUTPUT_LIMIT`, never truncated as success. Native short/FQCN
+packaging tests check actual emitted frame lengths, including a >64 KiB real
+synthetic file projection and the exact 256 KiB validator-legal serializer
+boundary. S1 does not widen or allocate the existing 1 MiB aggregate handoff;
+S2 must separately validate its actual frame/aggregate budget before joining
+this stage. No bridge/registry/eligibility changes or release qualification
+are implied by S1.
+
 ## S02: shared parser, restricted T candidate and remaining HOLD
 
 The test-only G and production T output use the same `parse_effective` and
