@@ -97,7 +97,7 @@ def _collector_attempt(host, requested, row):
 
 
 class _Projection:
-    def __init__(self, published):
+    def __init__(self, published, *, crypto=None):
         # As in #21, this API is not an authenticator for a caller-created
         # NamedTuple. Supply the unmodified result of trusted RunStore.open.
         _require(type(published) is run_store.PublishedRun)
@@ -108,6 +108,7 @@ class _Projection:
         for name in ('evidence.json', *(['assessed_evidence.json'] if assessed is not None else [])):
             _require(type(artifacts.get(name)) is bytes and 0 < len(artifacts[name]) <= evidence.MAX_BYTES)
         self.published, self.m, self.doc, self.saved = published, m, doc, assessed
+        self._crypto = crypto
         self.b = _Budget()
         self.b.charge(len(ids))
         self.host_ids = list(ids)
@@ -305,7 +306,8 @@ class _Projection:
     def artifact_status(self):
         for row in self.m['artifacts']:
             self.b.charge()
-            parts, _ = run_store._slot(row['kind'], row['host_id'], row['slot'])
+            parts, _ = run_store._slot(row['kind'], row['host_id'], row['slot'],
+                                       producer_v2=run_store._is_producer_v2(self.m))
             _require('/'.join(parts) == row['path'] and row['path'] in self.published.artifacts)
             record = {k: row[k] for k in ('kind', 'format_version', 'host_id', 'slot', 'required', 'sha256')}
             for field, registry in (('collection_ids', self.collections), ('asset_ids', self.assets), ('evidence_ids', self.rows)):
@@ -331,7 +333,9 @@ class _Projection:
     def crypto(self):
         # #21 owns all classification/group membership decisions. Reuse it
         # once; export only its IDs, taxonomy, observed names and safe context.
-        index = portal_indexes.project_crypto_indexes(self.published)['algorithms']
+        crypto = self._crypto if self._crypto is not None else portal_indexes.project_crypto_indexes(self.published)
+        _require(crypto['run_id'] == self.m['run_id'])
+        index = crypto['algorithms']
         self.unresolved = self.b.refs(index['unresolved_claim_ids'])
         for g in index['groups']:
             self.b.charge()
@@ -401,7 +405,12 @@ class _Projection:
 
 def project_scan_summary(published):
     """Return a bounded deterministic projection, with no reassessment or I/O."""
-    result = _Projection(published).finish()
+    return _project_scan_summary(published)
+
+
+def _project_scan_summary(published, *, crypto=None):
+    # Private reuse within one already verified publication; no trust witness.
+    result = _Projection(published, crypto=crypto).finish()
     _json_bytes(result)
     return result
 
@@ -443,7 +452,11 @@ def _csv_bytes(run_id, columns, rows):
 
 def render_summary_exports(published):
     """Return (projection, two fixed HTML byte streams, three fixed exports)."""
-    p = project_scan_summary(published)
+    return _render_summary_projection(project_scan_summary(published))
+
+
+def _render_summary_projection(p):
+    # The caller owns the bounded projection derived from the verified run.
     rid = p['run']['run_id']
     exports = {'scan_summary.json': _json_bytes(p),
                'summary.csv': _csv_bytes(rid, _SUMMARY_COLUMNS, p['metrics']),
@@ -574,8 +587,10 @@ def _certificate_json_cell(value, budget, cap):
     return _csv_text(out.finish().decode('ascii'))
 
 
-def _certificate_csv_bytes(run_id, rows):
+def _certificate_csv_bytes(run_id, rows, *, limit=None):
     cap = min(_MAX_CSV, _MAX_CSV_TOTAL)
+    if limit is not None:
+        cap = min(cap, limit)
     out, budget = _Bytes(cap), _Budget()
     out.write('\ufeff')
     writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator='\r\n')
@@ -627,5 +642,10 @@ def render_certificate_csv(store, run_id):
     rid = run_store._rid(run_id)
     from tools import portal_asset_indexes
     p = portal_asset_indexes.project_asset_indexes(store.open(rid))
+    return _render_certificate_projection(p, rid)
+
+
+def _render_certificate_projection(p, rid, *, limit=None):
+    # Internal C2 projection, not a new public PublishedRun input.
     _require(p['run_id'] == rid)
-    return _certificate_csv_bytes(rid, _certificate_rows(p))
+    return _certificate_csv_bytes(rid, _certificate_rows(p), limit=limit)
