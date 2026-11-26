@@ -228,9 +228,27 @@ def _trusted_executable(filename, *, alias):
         return False
 
 
+def _waitable_sigchld():
+    # Dedicated Linux worker: CPython's signal.signal installs a fresh
+    # sigaction, clearing SIG_IGN and SA_NOCLDWAIT even if the cached Python
+    # disposition was already SIG_DFL. Do not restore an auto-reap state.
+    # This does not alter the signal mask or any other signal disposition.
+    if (sys.platform != 'linux' or sys.implementation.name != 'cpython'
+            or threading.current_thread() is not threading.main_thread()
+            or threading.active_count() != 1):
+        return False
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        return signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _process_control():
     if (sys.platform != 'linux' or threading.current_thread() is not threading.main_thread()
             or threading.active_count() != 1 or os.getpid() != os.getpgrp()):
+        return False
+    if not _waitable_sigchld():
         return False
     libc = ctypes.CDLL(None, use_errno=True)
     return libc.prctl(36, 1, 0, 0, 0) == 0
@@ -295,7 +313,8 @@ def reap(proc, terminate):
                 children = []
             for child in children:
                 try:
-                    # No PID is reaped by another thread or signal handler.
+                    # Waitable SIGCHLD excludes kernel auto-reap; no other
+                    # thread or signal handler reaps these owned children.
                     if os.getpgid(child) != os.getpgrp():
                         return False
                     os.kill(child, signal.SIGKILL)
@@ -1012,6 +1031,7 @@ def validate_receipt(receipt, stage):
     why, rc, clean, payload = (receipt[k] for k in ('reason_code', 'rc', 'cleanup_confirmed', 'payload'))
     require(type(why) is str and why in _REASONS and (rc is None or integer(rc, -255, 255)))
     require(type(clean) is bool and clean == (why not in ('PROCESS_CONTROL_UNAVAILABLE', 'REMOTE_CLEANUP_UNCONFIRMED')))
+    require(rc != 70 or (why == 'REMOTE_CLEANUP_UNCONFIRMED' and not clean and payload is None))
     if why == 'COMMAND_OK':
         require(type(rc) is int and rc == 0 and clean)
         _validate_payload(payload)
@@ -1079,6 +1099,8 @@ def _run_stage(stage):
         return validate_receipt(_receipt(stage, 'TOOL_UNAVAILABLE', None, True, _python_unavailable()), stage)
     if not _trusted_executable(_OPENSSL, alias=False):
         return validate_receipt(_receipt(stage, 'COMMAND_START_FAILED', None, True, None), stage)
+    if not _waitable_sigchld():
+        return validate_receipt(_receipt(stage, 'PROCESS_CONTROL_UNAVAILABLE', None, False, None), stage)
     return _from_result(stage, _bounded_runner(argv[6])(argv, STAGE_SECONDS, CHILD_BYTES))
 
 
@@ -1110,7 +1132,9 @@ def _child(stage):
     _stage(stage)
     _payload_archive()
     require(sys.platform == 'linux' and sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode)
-    if not _process_control():
+    global _cleanup_uncertain
+    if _cleanup_uncertain or not _process_control():
+        _cleanup_uncertain = True
         raise SystemExit(70)
     try:
         if (not _trusted_executable(_SYSTEM_PYTHON, alias=True)

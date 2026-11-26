@@ -121,10 +121,12 @@ def _package(tmp, fixture, stage='system', **extra):
     return dest, env
 
 
-def _invoke(pack, *, fail=False):
+def _invoke(pack, *, fail=False, inherited_sigchld=None):
     start = time.monotonic()
     p = subprocess.run([BASE_PYTHON, '-I', '-B', str(pack[0])], cwd=pack[0].parent,
-                       env=pack[1], capture_output=True, timeout=32)
+                       env=pack[1], capture_output=True, timeout=32,
+                       preexec_fn=(None if inherited_sigchld is None else
+                                   lambda: signal.signal(signal.SIGCHLD, inherited_sigchld)))
     assert len(p.stdout) + len(p.stderr) <= acq.WRAPPER_BYTES
     if fail:
         assert p.returncode != 0 and b'"receipt"' not in p.stdout
@@ -565,3 +567,157 @@ def test_original_controller_actual_oracle(tmp_path, certs):
     ca.validate_cert_details(legacy.merged(doc, result), result['details'], rules)
     for delta in (0, 1):
         ca.validate_snapshot(_sized_payload(acq.MAX_PROJECTION + delta)['roots'])
+
+
+@pytest.mark.parametrize('inherited', [signal.SIG_DFL, signal.SIG_IGN], ids=['default', 'ignored'])
+@pytest.mark.parametrize('exit_code', [0, 17, 70])
+def test_r1_native_outer_waitable(tmp_path, inherited, exit_code):
+    # Set disposition in the launcher, then exec the actual native wrapper.
+    # Observe the inherited state at the real _run_stage boundary, before it
+    # has an opportunity to normalize SIGCHLD. Only synthetic roots are used.
+    def patch(s):
+        s = _replace(s, 'def _run_stage(stage):\n',
+                     'def _run_stage(stage):\n    assert signal.getsignal(signal.SIGCHLD) == '
+                     + str(int(inherited)) + '\n')
+        if exit_code:
+            body = '    os.write(1,b"fixture-output")\n' if exit_code == 17 else ''
+            s = _replace(s, 'def _acquire(deadline):\n',
+                         'def _acquire(deadline):\n' + body + '    os._exit(' + str(exit_code) + ')\n')
+        return s
+    pack = _package(tmp_path / 'native', _fixture(tmp_path / 'candidate', _root(tmp_path), patch=patch))
+    receipt, _ = _invoke(pack, inherited_sigchld=inherited)
+    if exit_code == 0:
+        assert _payload(receipt)['roots'] == {k: dict(acq.empty(), root_target_id=acq.source_id(v))
+                                             for k, v in acq.ROOTS.items()}
+    elif exit_code == 17:
+        assert receipt == acq._receipt('system', 'COMMAND_FAILED', 17, True, None)
+    else:
+        assert receipt == acq._receipt('system', 'REMOTE_CLEANUP_UNCONFIRMED', 70, False, None)
+
+
+@pytest.mark.parametrize('inherited', [signal.SIG_DFL, signal.SIG_IGN], ids=['default', 'ignored'])
+def test_r1_native_inner_waitable(tmp_path, inherited):
+    # Independently of the outer normalization, exec the real isolated child
+    # with an inherited disposition. Its acquisition entry must be waitable
+    # even before the first capture call. The unchanged runner owns its group.
+    launcher = ('import os,signal,sys; signal.signal(signal.SIGCHLD,' + str(int(inherited))
+                + '); os.execv(sys.executable,[sys.executable,"-I","-S","-B","-c",sys.argv[4],*sys.argv[1:4]])')
+    def patch(s):
+        s = _replace(s, "return [_SYSTEM_PYTHON, '-I', '-S', '-B', '-c', _CHILD, archive, __spec__.name, _stage(stage)]",
+                     "return [_SYSTEM_PYTHON, '-I', '-S', '-B', '-c', " + repr(launcher)
+                     + ", archive, __spec__.name, _stage(stage), _CHILD]")
+        s = _replace(s, 'def _child(stage):\n', 'def _child(stage):\n    assert signal.getsignal(signal.SIGCHLD) == '
+                     + str(int(inherited)) + '\n')
+        return _replace(s, 'def _acquire(deadline):\n',
+                        'def _acquire(deadline):\n    assert signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL\n'
+                        '    for code in (17, 0):\n'
+                        '        command = "import os;os.write(1,b\'fixture-output\');os._exit(%d)" % code\n'
+                        '        rc,raw,why=capture([_SYSTEM_PYTHON,"-I","-B","-c",command],b"",time.monotonic()+2)\n'
+                        '        assert (rc,raw,why) == ((17,None,"COMMAND_FAILED") if code else (0,b"fixture-output",None))\n')
+    pack = _package(tmp_path / 'native', _fixture(tmp_path / 'candidate', _root(tmp_path), patch=patch))
+    with subprocess.Popen([BASE_PYTHON, '-I', '-B', '-c', 'import time;time.sleep(20)'],
+                          env=pack[1], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as sibling:
+        try:
+            receipt, _ = _invoke(pack)
+            assert _payload(receipt)['roots'] == {k: dict(acq.empty(), root_target_id=acq.source_id(v))
+                                                 for k, v in acq.ROOTS.items()}
+            assert sibling.poll() is None
+        finally:
+            sibling.terminate()
+            sibling.wait(timeout=3)
+
+
+@pytest.mark.parametrize('inherited', [signal.SIG_DFL, signal.SIG_IGN], ids=['default', 'ignored'])
+def test_r1_actual_capture_inherited_exit_status(inherited):
+    # Direct capture boundary: ignore/default is inherited across exec, not
+    # a mocked wait or a test-side reset. A nonzero child writes real bytes.
+    script = '''import importlib.util,json,os,signal,sys,time
+spec=importlib.util.spec_from_file_location('fixture_cert',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+assert os.getpid()==os.getpgrp() and signal.getsignal(signal.SIGCHLD)==int(sys.argv[2])
+for sig in (signal.SIGTERM,signal.SIGINT,signal.SIGALRM): signal.signal(sig,m._interrupt)
+rows=[]
+for code in (17,0):
+ rc,raw,why=m.capture(['/usr/bin/python3','-I','-B','-c',"import os;os.write(1,b'fixture-output');os._exit(%d)"%code],b'',time.monotonic()+2)
+ rows.append([rc,None if raw is None else raw.decode('ascii'),why])
+print(json.dumps(dict(rows=rows,uncertain=m._cleanup_uncertain,pgid=os.getpgrp(),disposition=signal.getsignal(signal.SIGCHLD))))
+'''
+    launcher = ('import os,signal,sys;signal.signal(signal.SIGCHLD,int(sys.argv[3]));'
+                'os.execv(sys.executable,[sys.executable,"-I","-B","-c",sys.argv[1],sys.argv[2],sys.argv[3]])')
+    outcome = helper._run_bounded([sys.executable, '-I', '-B', '-c', launcher, script,
+                                   str(MODULE), str(int(inherited))], 6, 16384)
+    assert outcome.reason_code == 'COMMAND_OK' and outcome.cleanup_confirmed and not outcome.stderr
+    actual = json.loads(outcome.stdout)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(actual['pgid'], 0)
+    assert actual['rows'] == [[17, None, 'COMMAND_FAILED'], [0, 'fixture-output', None]]
+    assert actual['uncertain'] is False and actual['disposition'] == signal.SIG_DFL
+
+
+@pytest.mark.parametrize('why', ['COMMAND_TIMEOUT', 'COMMAND_OUTPUT_LIMIT', 'COMMAND_IO_FAILED',
+                                'RESIDUAL_PROCESS', 'INTERRUPTED', 'COMMAND_FAILED'])
+def test_r1_rc70_closed_receipt(why):
+    with pytest.raises(ValueError):
+        acq.validate_receipt(acq._receipt('system', why, 70, True, None), 'system')
+    fatal = acq._receipt('system', 'REMOTE_CLEANUP_UNCONFIRMED', 70, False, None)
+    assert acq._from_result('system', helper.CommandResult(why, 70, b'', b'', True)) == fatal
+    assert acq.validate_receipt(fatal, 'system') == fatal
+    normal = acq._receipt('system', why, 17, True, None)
+    assert acq.validate_receipt(normal, 'system') == normal
+    assert acq._from_result('system', helper.CommandResult(why, 17, b'', b'', True)) == normal
+    for rc in (None, 0, -9, 17):
+        other = acq._receipt('system', 'REMOTE_CLEANUP_UNCONFIRMED', rc, False, None)
+        assert acq.validate_receipt(other, 'system') == other
+
+
+@pytest.mark.parametrize('boundary', ['outer', 'inner'])
+def test_r1_native_waitability_failure_zero_acquisition(tmp_path, boundary):
+    witness = tmp_path / 'unexpected-acquire'
+    def patch(s):
+        # Code-only injection of a failed SIGCHLD setup at exactly one
+        # boundary. The other boundary and native runner remain actual.
+        when = 'not sys.flags.no_site' if boundary == 'outer' else 'sys.flags.no_site'
+        s = _replace(s, '        signal.signal(signal.SIGCHLD, signal.SIG_DFL)\n',
+                     '        if ' + when + ': raise OSError("fixture-sigaction-failure")\n'
+                     '        signal.signal(signal.SIGCHLD, signal.SIG_DFL)\n')
+        s = _replace(s, 'def _acquire(deadline):\n',
+                     'def _acquire(deadline):\n    open(' + repr(str(witness)) + ',"w").close()\n'
+                     '    raise AssertionError("unexpected acquisition")\n')
+        if boundary == 'outer':
+            s = _replace(s, 'def _bounded_runner(archive):\n',
+                         'def _bounded_runner(archive):\n    raise AssertionError("unexpected launch")\n')
+        else:
+            s = _replace(s, '        raise SystemExit(70)\n    try:',
+                         '        assert _cleanup_uncertain\n        raise SystemExit(70)\n    try:')
+        return s
+    pack = _package(tmp_path / 'native', _fixture(tmp_path / 'candidate', _root(tmp_path), patch=patch))
+    receipt, _ = _invoke(pack, inherited_sigchld=signal.SIG_IGN)
+    expected = ('PROCESS_CONTROL_UNAVAILABLE', None) if boundary == 'outer' else ('REMOTE_CLEANUP_UNCONFIRMED', 70)
+    assert receipt == acq._receipt('system', *expected, False, None)
+    assert not witness.exists()
+
+
+def test_r1_capture_waitability_failure_is_sticky(tmp_path, monkeypatch):
+    # Failure before a new Popen is a constant fatal gap, not success. Run
+    # the exact capture path in the dedicated group using a real wrapper.
+    script = '''import importlib.util,json,os,signal,sys,time
+spec=importlib.util.spec_from_file_location('fixture_cert',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+assert os.getpid()==os.getpgrp()
+real_signal=signal.signal
+def denied(sig,handler):
+ if sig==signal.SIGCHLD: raise OSError('fixture-sigaction-failure')
+ return real_signal(sig,handler)
+signal.signal=denied
+argv=['/usr/bin/python3','-I','-B','-c','open('+repr(sys.argv[2])+',"w").close()']
+first=m.capture(argv,b'',time.monotonic()+2)
+signal.signal=real_signal
+second=m.capture(argv,b'',time.monotonic()+2)
+print(json.dumps(dict(first=first,second=second,uncertain=m._cleanup_uncertain,pgid=os.getpgrp())))
+'''
+    witness = tmp_path / 'unexpected-spawn'
+    outcome = helper._run_bounded([sys.executable, '-I', '-B', '-c', script, str(MODULE), str(witness)], 5, 16384)
+    assert outcome.reason_code == 'COMMAND_OK' and outcome.cleanup_confirmed and not outcome.stderr
+    result = json.loads(outcome.stdout)
+    assert result['first'] == result['second'] == [None, None, 'CLEANUP_FAILED']
+    assert result['uncertain'] is True and not witness.exists()
+    with pytest.raises(ProcessLookupError):
+        os.killpg(result['pgid'], 0)
