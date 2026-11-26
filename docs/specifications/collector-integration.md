@@ -474,3 +474,38 @@ restricted in-memory synthetic/offline engineering, not Store persistence,
 CBOM standalone qualification, live SSH, Certificate native acquisition
 or C3. #8/#17 mandatory qualifications remain HOLD; #28 formal environment
 verification remains NOT_TESTED until the fixed release candidate.
+
+### I1b Cert S2: closed native typed handoff
+
+The explicit staged Cert binding uses the fixed canonical S1 validator, with
+196608 B payload, 131072 B metadata, 196609 B child, 196707 B receipt and
+393411 B combined wrapper output bounds. The other stage bounds are unchanged.
+Exact issued binding identity, one-use begin, independently witnessed clean
+completion, wrapper rc0, empty stderr, exact invocation and closed ASCII JSON
+are mandatory. Duplicate, malformed, foreign, non-finite and oversized frames
+cannot yield evidence. Inner cleanup uncertainty is fatal even with a clean
+outer process witness. The private `staged_cert` Boolean is supplied by the
+trusted worker/session and parent ledger, never by the serialized handoff.
+
+An eligible P1 with either tool not proved available produces `P1_TOOL_GAP`,
+null rc, clean, zero stages and three exact skipped TOOL_UNAVAILABLE roots.
+The false interpreter field is a not-established sentinel, not a Python
+probe. `TOOL_UNAVAILABLE` instead requires the actual native fixed S1 special
+receipt, null rc and the exact Python-unavailable payload. A noneligible
+platform uses the original exact PLATFORM_GAP. COMMAND_OK requires rc0 and
+all three attempted validated roots. Ordinary whole-producer failures retain
+rc/reason, no snapshot or refs; confirmed SSH host-local halt leaves Cert
+STOPPED. Fatal or incomplete records cannot produce fabricated positives.
+
+Worker and parent apply the same plan, typed validator, original #18
+normalizer and evidence/companion bindings. The five producer compact payload
+budgets are 3x16384 + 7x16384 + 2x65536 + 2x262144 + 196608 = 1015808 B.
+The 32768 B structure reserve gives 1048576 B/host; the actual compact
+serializer accounts for payload pieces and structure, including gap and
+terminal records, at both ends. The original 10 MiB/10 hosts, 3500 B IPC,
+64-depth/node and 294-ref limits, three Cert scopes and 2 MiB detail cap,
+mandatory in-memory typed companion and Evidence 1.1.0/assessment contracts
+are unchanged. Raw native frames never enter the handoff or queue. Legal
+payload stress and independent exact/+1 serializer controls are distinct;
+no invalid padding is accepted as typed evidence. No Store/C3/live integration
+or production acquisition is granted by this restricted bridge.

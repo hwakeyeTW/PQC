@@ -733,3 +733,37 @@ root, native Q/T query, real SSH transport, C3, Certificate native bridge or
 persistent SSH companion is enabled. Actual Controller, OL9.7/9.8/9.9,
 transport, remote lifetime, permissions and load remain formal QA under #28;
 #8/#17 mandatory transport and Q/T qualifications remain HOLD.
+
+### I1b Cert S2: fixed private native worker extension
+
+A selected staged Cert adapter requires the same worker's validated P1
+snapshot and legal completed selected O2, CP2 and SSH producers, in order.
+Mixed generic selected prior adapters are denied before connection. An SSH
+host-local halt stops Cert for that host. Cert has exactly one system stage,
+ordinal 0, bound to the run, target, task UUID and exact issued binding object.
+Only eligible OL9 (UNVERIFIED) with P1 openssl and timeout available true can
+launch. The private P1 tool gap is not a native Python-unavailable receipt.
+No caller-supplied root, path, argv, executable, UID or context is accepted.
+Both live registries stay empty and LIVE_NOT_AVAILABLE is unchanged.
+
+The existing two guards and earliest wave lease bound packaging and the
+synthetic connection witness. The one-use gate bounds the stage to 76 s
+(30 guard + 15 connection + 30 command + 1 return) and cumulative producer
+validation to 30 s, hence 106 s for the explicit staged adapter. P1/O2/CP2/SSH
+remain 258/562/182/182 s. All-five producer/host/ten-host invocation bounds
+are 1290/1342/14085 s. The legacy Cert surrogate stays 31 s. These are
+conservative internal bounds, not runtime predictions or increased resource
+limits. Expired leases cannot authorize dispatch or successful completion.
+Only matching independent clean lifecycle evidence may clear an active slot.
+A validated inner cleanup uncertainty, including rc70, remains fatal; a
+launcher exception cannot attest cleanup. Clean ordinary S1 errors retain
+the actual reason and rc and allow other authorized hosts to continue.
+
+The Controller validates the private Cert stage context again before accepting
+any V2 terminal projection. Guard/deadline terminal outcomes require the
+actual ordered retained prior evidence; there are no Cert refs for a whole
+producer error. A shape-only manifest is not cleanup proof. The original V1
+and default legacy grammar, bounded host/wave cancellation, peer cleanup,
+receipt queue and exclusive handoff slots are unchanged. No production or
+active dispatch is authorized. Formal Controller/OL9.7-9.9/transport/load and
+remote lifetime verification remain in #28.
