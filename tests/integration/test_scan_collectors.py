@@ -3096,3 +3096,442 @@ def test_ssh_s2_actual_prior_ordinary_and_empty_policy(fixture,monkeypatch):
     assert projection.special is None and projection.outcomes[bridge.PACKAGES]['rc']==7
     assert bridge.SSH in projection.companions and bridge.OPENSSL not in projection.companions
     assert not trap.exists()
+
+
+# Cert S2: use the fixed reviewed S1 module, not a generic Cert callable.
+def _cert_s2_fixture_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('cert_s1_fixture', ROOT / 'tests/unit/test_cert_acquire.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Cert2Driver(_P2Driver):
+    def __init__(self, tmp, ctx, *, fqcn=False, certificates=None, modes=None, fault=None):
+        super().__init__(tmp, ctx, modes=modes, fault=fault)
+        self.s1 = _cert_s2_fixture_module()
+        self.fqcn, self.certificates = fqcn, certificates or {}
+        self.parent_pid = os.getpid()
+        self.validator = bridge._bound_cert_stage_validator()
+
+    def prepare(self, binding):
+        import selectors
+        import subprocess
+        assert type(binding) is bridge._CertStageBinding and binding.producer_id == bridge.CERT
+        name, stage, ordinal = binding.target_id, binding.stage, binding.ordinal
+        assert binding.run_id and binding.task_uuid and name in self.ctx._targets
+        assert os.getpid() != self.parent_pid and stage == 'system' and ordinal == 0
+        stem = f'{name}-{ordinal}'
+        private = self.tmp / stem
+        private.mkdir(mode=0o700)
+        s1 = self.s1
+        root = s1._root(private)
+        if self.certificates:
+            (s1._loc(root) / 'a.pem').write_bytes(self.certificates['rsa'][0])
+            (s1._loc(root) / 'b.der').write_bytes(self.certificates['ec'][1])
+        mode = self.modes.get((name, 0), 'ok')
+        group = self.tmp / (stem + '-group.json')
+        def patch(source):
+            if mode in ('python-missing', 'openssl-missing'):
+                key, old = ('_SYSTEM_PYTHON', '/usr/bin/python3') if mode == 'python-missing' else ('_OPENSSL', '/usr/bin/openssl')
+                return s1._replace(source, f'{key} = {old!r}', f"{key} = '/usr/bin/pqc-nonexistent-fixture-tool'")
+            if mode in ('rc17', 'rc70'):
+                return s1._replace(source, 'def _child(stage):\n', f'def _child(stage):\n    raise SystemExit({mode[2:]})\n')
+            if mode in ('max', 'over'):
+                data = s1._sized_payload(s1.acq.MAX_PROJECTION + (mode == 'over'))
+                return s1._replace(source, 'def _acquire(deadline):\n', 'def _acquire(deadline):\n    return ' + repr(data['roots']) + '\n')
+            if mode in ('consumer-loss', 'outer-timeout'):
+                source = s1._replace(source, 'WORK_SECONDS, ALARM_SECONDS, STAGE_SECONDS = 23, 25, 29',
+                                     'WORK_SECONDS, ALARM_SECONDS, STAGE_SECONDS = 23, 25, ' + str(self.stage_seconds))
+                return s1._replace(source, 'def _acquire(deadline):\n', 'def _acquire(deadline):\n'
+                    f'    with open({str(group)!r}, "x") as f: json.dump(dict(pids=[os.getpid()],pgid=os.getpgrp()),f)\n'
+                    '    time.sleep(60)\n')
+            return source
+        pack = s1._package(private / 'native', s1._fixture(private / 'candidate', root, fqcn=self.fqcn, patch=patch))
+        if self.fault is not None:
+            self.fault('prepare', binding, None)
+        def launch(begin):
+            if mode == 'no-begin':
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            end = begin()
+            if mode == 'false-clean':
+                raise bridge._StageFailure('COMMAND_FAILED', 17, True)
+            proc = subprocess.Popen([s1.BASE_PYTHON, '-I', '-B', str(pack[0])], cwd=pack[0].parent,
+                env=pack[1], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            (self.tmp / (stem + '-launch.json')).write_text(json.dumps(dict(stage=stage, ordinal=ordinal,
+                task=binding.task_uuid, run=binding.run_id, worker=os.getpid(), supervisor=proc.pid,
+                began=time.monotonic(), end=end)))
+            buffers = [bytearray(), bytearray()]
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for i, stream in enumerate((proc.stdout, proc.stderr)):
+                        sel.register(stream, selectors.EVENT_READ, i)
+                    while sel.get_map() or proc.poll() is None:
+                        if mode == 'consumer-loss' and group.exists():
+                            os._exit(17)
+                        left = end - time.monotonic()
+                        assert left > 0
+                        if not sel.get_map():
+                            time.sleep(min(.01, left)); continue
+                        for key, _ in sel.select(min(.02, left)):
+                            room = bridge._CERT_FRAME_BYTES - sum(map(len, buffers))
+                            data = os.read(key.fd, min(4096, room + 1))
+                            assert len(data) <= room
+                            if data: buffers[key.data].extend(data)
+                            else: sel.unregister(key.fileobj)
+                proc.wait(timeout=max(.01, end-time.monotonic()))
+            finally:
+                proc.stdout.close(); proc.stderr.close()
+                if proc.poll() is None:
+                    proc.wait(timeout=30)
+            assert proc.returncode == 0 and not buffers[1] and not batch._scope.group_exists(proc.pid)
+            assert not Path('/proc', str(proc.pid)).exists()
+            raw = bytes(buffers[0]); receipt = self.validator(json.loads(raw)['receipt'], stage)
+            (self.tmp / (stem + '-done.json')).write_text(json.dumps(dict(reason=receipt['reason_code'],
+                outer_rc=receipt['rc'], payload=receipt['payload'], cleanup=receipt['cleanup_confirmed'],
+                ended=time.monotonic(), frame_bytes=len(raw))))
+            completion = bridge._StageCompletion(binding, raw, bytes(buffers[1]), proc.returncode, True, True)
+            return self.fault('completion', binding, completion) if self.fault is not None else completion
+        return launch
+
+
+def _cert_s2_register(monkeypatch, ctx, trace, *, all_prior=False, platform_kwargs=None, ssh_kwargs=None, **kwargs):
+    if all_prior:
+        prior = _ssh_s2_register(monkeypatch, ctx, trace, all_prior=True, platform_kwargs=platform_kwargs,
+                                 fqcn=kwargs.get('fqcn', False), **(ssh_kwargs or {}))
+    else:
+        prior = (_p2_register(monkeypatch, ctx, trace, **(platform_kwargs or {})),)
+    directory = trace.parent / 'cert-s2'
+    directory.mkdir(mode=0o700)
+    driver = _Cert2Driver(directory, ctx, **kwargs)
+    registry = bridge._producer_adapters()
+    registry[bridge.CERT] = bridge._CertStageAdapter(driver.prepare)
+    monkeypatch.setattr(bridge, '_producer_adapters', lambda: registry)
+    return (*prior, driver)
+
+
+def test_cert_s2_budgets_and_caps():
+    session = batch._ProducerSession(RULES)
+    assert session.budget(bridge.PRODUCERS) == 155
+    session.staged = session.openssl_staged = session.policy_staged = session.ssh_staged = session.cert_staged = True
+    assert batch._cert_budget() == 106 and session.budget(bridge.PRODUCERS) == 1290
+    assert session.budget(bridge.PRODUCERS[:-1]) == 1184
+    host = batch._GUARD_SECONDS+batch._SSH_SECONDS+1290+batch._WORKER_GRACE+5
+    assert host == 1342 and 2*batch._GUARD_SECONDS+10*(2*batch._GUARD_SECONDS+host)+5 == 14085
+    assert (bridge._CERT_PAYLOAD_BYTES, bridge._CERT_CHILD_BYTES, bridge._CERT_RECEIPT_BYTES,
+            bridge._CERT_FRAME_BYTES, bridge._CERT_STAGED_PAYLOAD_BUDGET, bridge._CERT_STRUCTURE_RESERVE,
+            bridge._CERT_STAGED_WIRE_BUDGET, bridge.MAX_WIRE, bridge.MAX_HOSTS, bridge.MAX_REFS, batch._QUEUE_BYTES) == (
+                196608,196609,196707,393411,1015808,32768,1048576,1048576,10,294,3500)
+    assert not bridge._producer_adapters() and not batch._passive_adapters()
+
+
+@pytest.mark.parametrize('fqcn',[False,True])
+def test_cert_s2_actual_five(fixture,monkeypatch,tmp_path_factory,fqcn):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=ALL); n=names[0]
+    certs=_cert_s2_fixture_module().certs.__wrapped__(tmp_path_factory)
+    drivers=_cert_s2_register(monkeypatch,ctx,trace,all_prior=True,fqcn=fqcn,certificates=certs)
+    write=bridge.Handoff.write
+    def observe(self,target,value):
+        (trace.parent/'cert-s2-envelope.json').write_bytes(bridge.wire_bytes(value))
+        return write(self,target,value)
+    monkeypatch.setattr(bridge.Handoff,'write',observe)
+    rc,m,bundle=checked(ctx)
+    launches=[_p2_rows(d,n) for d in drivers]
+    assert [[x['ordinal'] for x in xs] for xs in launches]==[[0,1,2],list(range(7)),[0,1],[0,1],[0]]
+    assert len({x['worker'] for xs in launches for x in xs})==len({x['task'] for xs in launches for x in xs})==1
+    for prior,next_stage in zip(drivers,launches[1:]):
+        assert _p2_rows(prior,n,'done')[-1]['ended'] <= next_stage[0]['began']
+    detail=bundle['companions'][n][bridge.CERT]
+    cert.validate_cert_details(bundle['document'],detail,RULES)
+    assert len(next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.CERT_FLAG)['collection_ids'])==3
+    assert {c['fingerprint'] for c in drivers[-1].s1._observations(_p2_rows(drivers[-1],n,'done')[0]['payload']['roots'])}=={certs[k][2] for k in ('rsa','ec')}
+    raw=(trace.parent/'cert-s2-envelope.json').read_bytes(); payload, overhead=bridge._cert_handoff_budget(bridge.read_wire(raw))
+    assert len(raw)==payload+overhead==bundle['handoff_metrics'][n]['typed_bytes']<=1048576
+    assert bundle['handoff_metrics'][n]['ipc_bytes']<=3500 and not trap.exists()
+    print('CERT_S2_NATIVE',fqcn,rc,len(raw),payload,overhead,len(bundle['document']['collections']))
+
+
+@pytest.mark.parametrize('mode,reason,inner', [('python-missing','TOOL_UNAVAILABLE',None),
+    ('openssl-missing','COMMAND_START_FAILED',None),('rc17','COMMAND_FAILED',17),
+    ('rc70','REMOTE_CLEANUP_UNCONFIRMED',70),('false-clean','REMOTE_CLEANUP_UNCONFIRMED',None),
+    ('no-begin','REMOTE_CLEANUP_UNCONFIRMED',None)])
+def test_cert_s2_native_failure(fixture,monkeypatch,mode,reason,inner):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.CERT_FLAG)); n=names[0]
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,modes={(n,0):mode})
+    rc,m,bundle=checked(ctx)
+    done=_p2_rows(d,n,'done')
+    if done:
+        assert done[0]['reason']==reason and done[0]['outer_rc']==inner
+    row=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.CERT_FLAG)
+    if mode=='python-missing':
+        assert len(row['collection_ids'])==3 and bridge.CERT in bundle['companions'][n]
+    else:
+        assert row['reason_code']==reason and not row['collection_ids']
+        assert row['rc']==inner
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('kind',['disabled','platform','p1-tool'])
+def test_cert_s2_zero_dispatch(fixture,monkeypatch,kind):
+    make,_,trace,trap,_=fixture
+    flags=selected_flags() if kind=='disabled' else selected_flags(bridge.CERT_FLAG)
+    ctx,names=make(count=1,flags=flags); n=names[0]
+    kw=({'versions':{n:{'distribution':'Debian','os_family':'Debian'}}} if kind=='platform' else
+        {'tool_rows':{n:{'timeout':[dict(state='OK',exists=False,isreg=None,islnk=None,executable=None)]}}} if kind=='p1-tool' else {})
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,platform_kwargs=kw)
+    rc,m,bundle=checked(ctx)
+    assert not _p2_rows(d,n) and not trap.exists()
+    if kind=='disabled':
+        assert not _p2_rows(p2,n) and not bundle['companions']
+    else:
+        assert len(next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.CERT_FLAG)['collection_ids'])==3
+        cert.validate_cert_details(bundle['document'],bundle['companions'][n][bridge.CERT],RULES)
+        # The fixed P1 RPM plan also requires timeout; both cases run metadata only.
+        assert [x['ordinal'] for x in _p2_rows(p2,n)]==[0]
+        if kind=='p1-tool':
+            assert bridge._cert_plan(flags, platform_snapshot())==((0,'system'),)
+            assert bridge._cert_plan(flags, {**platform_snapshot(), 'tools':{**platform_snapshot()['tools'], **kw['tool_rows'][n]}})==()
+
+
+@pytest.mark.parametrize('prior',[bridge.PLATFORM,bridge.OPENSSL,bridge.POLICY,bridge.SSH])
+def test_cert_s2_mixed_prior(fixture,monkeypatch,prior):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=ALL)
+    register(monkeypatch,trace,p=0); generic=bridge._producer_adapters()
+    drivers=_cert_s2_register(monkeypatch,ctx,trace,all_prior=True)
+    registry=bridge._producer_adapters(); registry[prior]=generic[prior]
+    monkeypatch.setattr(bridge,'_producer_adapters',lambda:registry)
+    calls=[]; monkeypatch.setattr(batch,'_restricted_connection',lambda n:calls.append(n) or 'CONNECTED')
+    with pytest.raises(batch.Denied,match='INVALID_ADAPTER_REGISTRY'):
+        batch.execute_producer_batch(ctx,RULES)
+    assert not calls and not trap.exists() and not any(_p2_rows(d,names[0]) for d in drivers)
+
+
+@pytest.mark.parametrize('mode,reason',[('guard','GUARD_REJECTED'),('foreign','REMOTE_CLEANUP_UNCONFIRMED'),
+                                      ('duplicate','INVALID_ADAPTER_RESULT'),('cleanup','REMOTE_CLEANUP_UNCONFIRMED')])
+def test_cert_s2_fatal_boundary(fixture,monkeypatch,mode,reason):
+    make,_,trace,trap,cfg=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.CERT_FLAG)); n,other=names
+    def mutate(when,binding,completion):
+        if when=='prepare' and mode=='guard':
+            with cfg.open('a') as f:f.write('\n# fixture guard drift\n')
+        if when!='completion':return completion
+        if mode=='foreign':return completion._replace(binding=binding._replace(task_uuid='foreign'))
+        if mode=='cleanup':return completion._replace(clean=False)
+        if mode=='duplicate':return completion._replace(stdout=b'{"changed":false,"changed":false}')
+        return completion
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,fault=mutate)
+    rc,m,bundle=checked(ctx)
+    assert rc==6 and m['reason_code']==reason and m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    assert not _p2_rows(d,other) and not _p2_rows(p2,other) and not trap.exists()
+    assert set(bundle['companions'][n])=={bridge.PLATFORM}
+
+
+@pytest.mark.parametrize('mode',['max','over'])
+def test_cert_s2_native_payload_boundary(fixture,monkeypatch,mode):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.CERT_FLAG)); n=names[0]
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,modes={(n,0):mode})
+    rc,m,bundle=checked(ctx)
+    result=_p2_rows(d,n,'done')[0]
+    assert result['reason']=='COMMAND_OK' and result['outer_rc']==0 and result['cleanup'] is True
+    if mode=='max':
+        assert len(bridge.wire_bytes(result['payload']))==196608 and result['frame_bytes']<=393411
+    else:
+        assert result['payload']['roots']==d.s1.acq._error_roots('PROJECTION_LIMIT')
+    cert.validate_cert_details(bundle['document'],bundle['companions'][n][bridge.CERT],RULES)
+    assert not trap.exists()
+
+
+def test_cert_s2_legal_full_capacity(fixture):
+    make,_,_,_,_=fixture; make(count=1)
+    value=envelope(p=256,flags=ALL,target='h'*247+'.invalid'); value['run_id']='r'*64
+    for r in value['records']:r['observed_at']='2026-01-01T00:00:00.000000Z'
+    value['records'][3]['snapshot']=_ssh_s2_typed_snapshot(ALL,
+        config=_ssh_s2_fixture_module()._sized_slot(262144),keys=dict(state='PARTIAL',reason='KEY_GAP',rc=None,gaps=['KEY_TYPE_UNKNOWN'],rows=[dict(
+        source_ref='key-'+f'{i:064x}',key_type='ssh-'+('x'*124),bits=None,fingerprint_sha256=f'{i:064x}',grammar='UNKNOWN_TYPE') for i in range(32)]))
+    value['records'][4]['snapshot']=_cert_s2_fixture_module()._sized_payload(196608)
+    kw=dict(staged_openssl=True,staged_policy=True,staged_ssh=True,staged_cert=True)
+    payload,structure=bridge._cert_handoff_budget(value); raw=bridge.wire_bytes(value)
+    assert 0<=structure<=32768 and len(raw)==payload+structure<=1048576
+    projected=bridge.normalize_handoff(bridge.read_wire(raw),value['run_id'],value['target_id'],ALL,TIME,RULES,**kw)
+    cert.validate_cert_details(projected.document,projected.companions[bridge.CERT],RULES)
+    ssh.validate_details(projected.document,projected.companions[bridge.SSH],RULES)
+    assert len(projected.document['collections'])<=294
+    print('CERT_S2_FULL_CAPACITY',len(raw),payload,structure,len(projected.document['collections']))
+    over=copy.deepcopy(value); over['records'][-1]['snapshot']=_cert_s2_fixture_module()._sized_payload(196609)
+    with pytest.raises((ValueError,bridge.BridgeError)):bridge.normalize_handoff(over,value['run_id'],value['target_id'],ALL,TIME,RULES,**kw)
+    for fault in ('gap','python','rc70','reorder','foreign','fake-context'):
+        forged=copy.deepcopy(value); last=forged['records'][-1]
+        if fault=='gap':last.update(reason_code='P1_TOOL_GAP',rc=None,snapshot=bridge._cert_tool_gap())
+        elif fault=='python':last.update(reason_code='TOOL_UNAVAILABLE',rc=0,snapshot=bridge._cert_tool_gap())
+        elif fault=='rc70':last.update(reason_code='COMMAND_FAILED',rc=70,snapshot=None)
+        elif fault=='reorder':forged['records'][-1],forged['records'][-2]=forged['records'][-2],forged['records'][-1]
+        elif fault=='foreign':forged['target_id']='foreign.invalid'
+        else:forged['staged_cert']=True
+        with pytest.raises((ValueError,bridge.BridgeError)):bridge.normalize_handoff(forged,value['run_id'],value['target_id'],ALL,TIME,RULES,**kw)
+    for key in ('staged_openssl','staged_policy','staged_ssh'):
+        with pytest.raises(bridge.BridgeError):bridge.normalize_handoff(value,value['run_id'],value['target_id'],ALL,TIME,RULES,**{**kw,key:False})
+
+
+def test_cert_s2_ordinary_two_hosts(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.CERT_FLAG)); n,other=names
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,modes={(n,0):'rc17'})
+    rc,m,bundle=checked(ctx)
+    rows=[next(c for c in h['collectors'] if c['collector_id']==bridge.CERT_FLAG) for h in m['hosts']]
+    assert rc==5 and rows[0]['reason_code']=='COMMAND_FAILED' and rows[0]['rc']==17 and not rows[0]['collection_ids']
+    assert len(rows[1]['collection_ids'])==3 and not set(rows[1]['collection_ids'])&set(rows[0]['collection_ids'])
+    assert bridge.CERT not in bundle['companions'][n] and bridge.CERT in bundle['companions'][other]
+    assert [_p2_rows(d,h)[0]['stage'] for h in names]==['system','system'] and not trap.exists()
+
+
+def test_cert_s2_prior_ssh_halt(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    flags=selected_flags(bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG)
+    ctx,names=make(count=2,forks=1,flags=flags); n,other=names
+    drivers=_cert_s2_register(monkeypatch,ctx,trace,all_prior=True,ssh_kwargs={'modes':{(n,0):'inner-exec-error'}})
+    rc,m,bundle=checked(ctx); d=drivers[-1]; s2=drivers[-2]
+    assert rc==5 and [_p2_rows(s2,h)[0]['ordinal'] for h in names]==[0,0]
+    assert not _p2_rows(d,n) and len(_p2_rows(d,other))==1
+    first=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.CERT_FLAG)
+    assert first['reason_code']=='STOPPED' and not first['collection_ids'] and bridge.CERT not in bundle['companions'][n]
+    assert bridge.SSH in bundle['companions'][n] and bridge.CERT in bundle['companions'][other] and not trap.exists()
+
+
+@pytest.mark.parametrize('mode',['consumer-loss','signal'])
+def test_cert_s2_actual_consumer_loss(fixture,monkeypatch,mode):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.CERT_FLAG)); n=names[0]
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,modes={(n,0):'consumer-loss' if mode=='consumer-loss' else 'outer-timeout'})
+    d.stage_seconds=3
+    sent=[]; before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    if mode=='signal':
+        poll=batch._ProducerWorkerWave.poll
+        def interrupt(self):
+            if not sent and (d.tmp/f'{n}-0-group.json').exists():
+                sent.append(time.monotonic());os.kill(os.getpid(),signal.SIGINT)
+            return poll(self)
+        monkeypatch.setattr(batch._ProducerWorkerWave,'poll',interrupt)
+    with _p2_owned_supervisors(d) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert rc==(7 if mode=='signal' else 6) and m['reason_code']==('INTERRUPTED' if mode=='signal' else 'REMOTE_CLEANUP_UNCONFIRMED')
+    assert (mode!='signal' or sent) and [h for h,_ in launches]==names[:1]
+    assert _signal_state()==before and m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    assert _p2_rows(d,n)[0]['supervisor'] in reaped and not bundle['document']['collections'] and not trap.exists()
+
+
+@pytest.mark.parametrize('in_flight',[False,True])
+def test_cert_s2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.CERT_FLAG)); a,b,_=names
+    ready=trace.parent/'cert-s2-a-ready'; verified=trace.parent/'cert-s2-b-verified'; marks={}
+    def synchronize(when,binding,completion):
+        if not in_flight and when=='prepare' and binding.target_id==a:
+            ready.write_text('ready');_p2_wait(verified)
+            worker=batch._PLATFORM_WORKER.get();end=worker.lease.limit(a)
+            (trace.parent/'cert-s2-child-lease.json').write_text(json.dumps(dict(end=end,now=time.monotonic())))
+        return completion
+    p2,d=_cert_s2_register(monkeypatch,ctx,trace,platform_kwargs={'versions':{b:{'distribution':'Debian','os_family':'Debian'}}},
+        modes={(a,0):'outer-timeout'} if in_flight else {},fault=synchronize)
+    d.stage_seconds=6
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator);send=q.send_task_result
+        def hold(result):
+            if result.as_wire_task_result().host_name==b:
+                _p2_wait(d.tmp/f'{a}-0-group.json' if in_flight else ready)
+                send(result);time.sleep(15)
+            else:send(result)
+        q.send_task_result=hold;return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+    accepted=batch._ProducerWorkerWave._receipt_accepted
+    def observe(self):
+        result=accepted(self)
+        if b in self.ledger.projections and not verified.exists():
+            assert b not in self.confirmed and self.workers[b].is_alive()
+            end=self.limit();assert end==min(self.ends[b],self.grace[b])<self.ends[a]
+            assert self.lease.limit(a)==end
+            marks.update(earliest=end,verified=time.monotonic());verified.write_text('verified')
+        return result
+    monkeypatch.setattr(batch._ProducerWorkerWave,'_receipt_accepted',observe)
+    before=_signal_state();launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(d) as reaped:rc,m,bundle=checked(ctx)
+    assert marks['verified']<marks['earliest'] and [n for n,_ in launches]==names[:2]
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert rc==6 and b in bundle['companions'] and not _p2_rows(d,b)
+    assert not any(_p2_rows(d,n) or _p2_rows(p2,n) for n in names[2:])
+    if in_flight:
+        assert len(_p2_rows(d,a))==1 and not _p2_rows(d,a,'done') and _p2_rows(d,a)[0]['supervisor'] in reaped
+        assert m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED' and a not in bundle['companions']
+    else:
+        child=json.loads((trace.parent/'cert-s2-child-lease.json').read_bytes())
+        assert child['end']==marks['earliest'] and 0<child['end']-child['now']<=batch._WORKER_GRACE
+        assert not _p2_rows(d,a) and m['reason_code']=='CONTROLLER_TIMEOUT'
+        assert set(bundle['companions'][a])=={bridge.PLATFORM}
+    assert not trap.exists() and _signal_state()==before
+
+
+def test_cert_s2_frame_receipt_boundary(fixture):
+    make,_,_,_,_=fixture; make(count=1)
+    s1=_cert_s2_fixture_module(); binding=bridge._CertStageBinding(RUN,HOST,'task',bridge.CERT,'system',0)
+    payload=s1._sized_payload(196608)
+    receipt=dict(format=1,stage='system',reason_code='COMMAND_OK',rc=0,cleanup_confirmed=True,payload=payload)
+    assert len(s1.acq.canonical(payload))==196608 and len(s1.acq.canonical(receipt))==196707
+    def frame(r):return json.dumps(dict(changed=False,invocation={'module_args':{'stage':'system'}},receipt=r)).encode('ascii')
+    raw=frame(receipt); exact=raw+b' '*(393411-len(raw))
+    assert len(exact)==393411
+    completion=bridge._StageCompletion(binding,exact,b'',0,True,True)
+    assert bridge._stage_receipt(completion,binding)==receipt
+    over={**receipt,'payload':s1._sized_payload(196609)}
+    for bad in (completion._replace(stdout=exact+b' '),completion._replace(stderr=b'x'),
+                completion._replace(stdout=frame(over)),completion._replace(stdout=frame({**receipt,'extra':None})),
+                completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": 0.0',1)),
+                completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": NaN',1)),
+                completion._replace(stdout=b'{"changed":false,"changed":false}'),completion._replace(stdout=b'\xff'),
+                completion._replace(wrapper_rc=True),completion._replace(started=False),completion._replace(clean=False),
+                *(completion._replace(binding=b) for b in (binding._replace(),binding._replace(run_id='other'),
+                    binding._replace(target_id='other.invalid'),binding._replace(task_uuid='other'),
+                    binding._replace(ordinal=1),binding._replace(stage='nginx'),binding._replace(producer_id=bridge.SSH)))):
+        with pytest.raises(bridge._StageFailure):bridge._stage_receipt(bad,binding)
+    for b in (binding._replace(ordinal=1),binding._replace(stage='nginx'),binding._replace(producer_id=bridge.SSH)):
+        with pytest.raises(bridge._StageFailure):bridge._stage_receipt(completion._replace(binding=b),b)
+    print('CERT_S2_EXACT_CAPS',196608,196707,len(raw),len(exact))
+
+
+def test_cert_s2_wire_ipc_exact_limits(fixture):
+    from types import SimpleNamespace
+    make,_,_,_,_=fixture;make(count=1)
+    targets=[f'host-{i:02d}.example.invalid' for i in range(10)]
+    h=bridge.Handoff(RUN,targets)
+    # Wire-only stress: deliberately invalid typed padding, not valid producer data.
+    try:
+        for n in targets:
+            data=envelope(p=0,target=n); data['wire_test']=''
+            data['wire_test']='x'*(1048576-len(bridge.wire_bytes(data)))
+            assert len(bridge.wire_bytes(data))==1048576
+            data['wire_test']+='x'
+            with pytest.raises(bridge.BridgeError,match='HANDOFF_SIZE_LIMIT'):h.write(n,data)
+            assert os.fstat(h.slots[n][1]).st_size==0
+            data['wire_test']=data['wire_test'][:-1]
+            receipt=h.write(n,data); assert receipt['byte_count']==1048576 and h.read(n,receipt)==data
+            with pytest.raises(bridge.BridgeError):h.read(n,receipt)
+        assert h.total==10485760
+        with pytest.raises(bridge.BridgeError):bridge.Handoff(RUN,targets+['overflow.invalid'])
+    finally:assert h.close()
+    q=batch._make_queue(lambda row,name:True)
+    # The validator seam isolates the unchanged actual ClosedQueue byte limit.
+    # It does not assert that arbitrary padding is a legal typed receipt.
+    row={'fixture':''};task='a'*36
+    wrapper={'target_id':HOST,'task_uuid':task,'row':row}
+    row['fixture']='x'*(3500-len(json.dumps(wrapper,separators=(',',':'),ensure_ascii=True).encode('ascii')))
+    messages=[];q.put=messages.append
+    def send():
+        q.send_task_result(SimpleNamespace(as_wire_task_result=lambda:SimpleNamespace(host_name=HOST,task_uuid=task,
+            return_data={'stdout':json.dumps(row,separators=(',',':')),'rc':0,'stderr':''})))
+    send(); assert len(messages[-1])==3500 and json.loads(messages[-1])['row']==row
+    row['fixture']+='x';send();assert len(messages[-1])<=3500 and json.loads(messages[-1])['row'] is None

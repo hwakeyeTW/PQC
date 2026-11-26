@@ -112,6 +112,16 @@ _SSH_ORDINARY_FAILURES = MappingProxyType({
     'COMMAND_START_FAILED': 'EXECUTION_ERROR', 'COMMAND_FAILED': 'EXECUTION_ERROR',
     'COMMAND_IO_FAILED': 'EXECUTION_ERROR', 'RESIDUAL_PROCESS': 'EXECUTION_ERROR',
 })
+_CERT_STAGES = ('system',)
+_CERT_PAYLOAD_BYTES = 196608
+_CERT_METADATA_BYTES = 131072
+_CERT_CHILD_BYTES = 196609
+_CERT_RECEIPT_BYTES = 196707
+_CERT_FRAME_BYTES = 393411
+_CERT_STRUCTURE_RESERVE = 32768
+_CERT_STAGED_PAYLOAD_BUDGET = _SSH_STAGED_PAYLOAD_BUDGET + _CERT_PAYLOAD_BYTES
+_CERT_STAGED_WIRE_BUDGET = _CERT_STAGED_PAYLOAD_BUDGET + _CERT_STRUCTURE_RESERVE
+_CERT_ORDINARY_FAILURES = frozenset(_SSH_ORDINARY_FAILURES)
 _STAGE_FRAME_BYTES = 32 * 1024
 _STAGE_RECEIPT_BYTES = 16 * 1024
 _STAGE_RPM_FAILURES = MappingProxyType({
@@ -156,12 +166,21 @@ class _SSHStageBinding(NamedTuple):
     ordinal: int
 
 
+class _CertStageBinding(NamedTuple):
+    run_id: str
+    target_id: str
+    task_uuid: str
+    producer_id: str
+    stage: str
+    ordinal: int
+
+
 class _StageCompletion(NamedTuple):
     # The binding is the actual controller-issued object, not fields taken
     # from remote output. clean is the trusted driver's independent lifecycle
     # receipt, never copied from an unchecked frame. started=False requires
     # proof that no stage process was launched.
-    binding: _StageBinding | _OpenSSLStageBinding | _PolicyStageBinding | _SSHStageBinding
+    binding: _StageBinding | _OpenSSLStageBinding | _PolicyStageBinding | _SSHStageBinding | _CertStageBinding
     stdout: bytes
     stderr: bytes
     wrapper_rc: int | None
@@ -237,6 +256,67 @@ def _bound_ssh_stage_validator():
             and ssh_posture.NATIVE_T_QUALIFIED is False,
             'INVALID_STAGE_VALIDATOR')
     return pqc_ssh_acquire.validate_receipt
+
+
+def _bound_cert_stage_validator():
+    from ansible_collections.security.compliance_pqc_readiness.plugins.modules import pqc_cert_acquire
+    expected = (Path(__file__).resolve().parents[1] / 'ansible_collections/security/'
+                'compliance_pqc_readiness/plugins/modules/pqc_cert_acquire.py')
+    require(Path(pqc_cert_acquire.__file__).resolve() == expected
+            and pqc_cert_acquire.STAGES == _CERT_STAGES
+            and pqc_cert_acquire.MAX_PROJECTION == _CERT_PAYLOAD_BYTES
+            and pqc_cert_acquire.METADATA_BUDGET == _CERT_METADATA_BYTES
+            and pqc_cert_acquire.CHILD_BYTES == _CERT_CHILD_BYTES
+            and pqc_cert_acquire.RECEIPT_BYTES == _CERT_RECEIPT_BYTES
+            and pqc_cert_acquire.WRAPPER_BYTES == _CERT_FRAME_BYTES,
+            'INVALID_STAGE_VALIDATOR')
+    return pqc_cert_acquire.validate_receipt
+
+
+def _cert_plan(flags, snapshot):
+    require(type(flags[CERT_FLAG]) is bool)
+    if not flags[CERT_FLAG] or _platform_status(snapshot) != 'UNVERIFIED':
+        return ()
+    tools = platform.normalize_tools(snapshot['tools'])
+    return ((0, 'system'),) if all(tools[k][2]['available'] is True
+                                    for k in ('openssl', 'timeout')) else ()
+
+
+def _cert_tool_gap():
+    # False denotes not established, not an observation of installed Python.
+    return dict(system_python_available=False, roots={s: dict(attempted=False,
+        rc=None, entries=0, directories=0, skipped=0, root_target_id=None,
+        gaps=['TOOL_UNAVAILABLE'], sources=[]) for s in cert_assets.ROOTS})
+
+
+def _validate_staged_cert(reason, rc, clean, snapshot, flags, platform_snapshot):
+    require(flags[CERT_FLAG] is True and platform_snapshot is not None)
+    status = _platform_status(platform_snapshot)
+    plan = _cert_plan(flags, platform_snapshot)
+    if reason == 'PLATFORM_GAP':
+        require(status != 'UNVERIFIED' and rc is None and clean is True
+                and cert_assets.strict_equal(snapshot, _gap_snapshot(CERT, flags, status)))
+    elif reason == 'P1_TOOL_GAP':
+        require(status == 'UNVERIFIED' and not plan and rc is None and clean is True
+                and cert_assets.strict_equal(snapshot, _cert_tool_gap()))
+    elif reason in ('COMMAND_OK', 'TOOL_UNAVAILABLE'):
+        require(bool(plan) and clean is True and type(snapshot) is dict
+                and len(wire_bytes(snapshot)) <= _CERT_PAYLOAD_BYTES
+                and not _uncertain(snapshot))
+        _bound_cert_stage_validator()(dict(format=1, stage='system', reason_code=reason,
+            rc=rc, cleanup_confirmed=clean, payload=snapshot), 'system')
+    elif reason in _CERT_ORDINARY_FAILURES:
+        require(bool(plan) and clean is True and snapshot is None)
+        _bound_cert_stage_validator()(dict(format=1, stage='system', reason_code=reason,
+            rc=rc, cleanup_confirmed=clean, payload=None), 'system')
+    else:
+        # A local guard/validation deadline may precede an empty plan. It is
+        # fatal, not proof of launch or of a valid typed acquisition.
+        require(reason in FATAL and snapshot is None
+                and (clean is False if reason == 'REMOTE_CLEANUP_UNCONFIRMED' else clean is True)
+                and (rc != 70 or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
+                and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT',
+                                    'INVALID_COMMAND_CONTRACT', 'PROCESS_CONTROL_UNAVAILABLE') or rc is None))
 
 
 def _ssh_plan(flags, snapshot):
@@ -362,7 +442,11 @@ def _stage_receipt(completion, binding):
         raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
     try:
         out, err, rc = completion.stdout, completion.stderr, completion.wrapper_rc
-        if type(binding) is _SSHStageBinding:
+        if type(binding) is _CertStageBinding:
+            require(binding.producer_id == CERT and type(binding.ordinal) is int
+                    and binding.ordinal == 0 and binding.stage == 'system')
+            frame_bytes = _CERT_FRAME_BYTES
+        elif type(binding) is _SSHStageBinding:
             require(binding.producer_id == SSH and type(binding.ordinal) is int
                     and 0 <= binding.ordinal < len(_SSH_STAGES)
                     and binding.stage == _SSH_STAGES[binding.ordinal])
@@ -392,6 +476,8 @@ def _stage_receipt(completion, binding):
             validator = _bound_policy_stage_validator()
         elif type(binding) is _SSHStageBinding:
             validator = _bound_ssh_stage_validator()
+        elif type(binding) is _CertStageBinding:
+            validator = _bound_cert_stage_validator()
         else:
             require(type(binding) is _OpenSSLStageBinding and binding.producer_id == OPENSSL
                     and type(binding.ordinal) is int and 0 <= binding.ordinal < len(_OPENSSL_STAGES)
@@ -400,7 +486,7 @@ def _stage_receipt(completion, binding):
         receipt = validator(frame['receipt'], binding.stage)
         if not receipt['cleanup_confirmed']:
             raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED', receipt['rc'])
-        if (type(binding) is _PolicyStageBinding and receipt['payload'] is not None
+        if (type(binding) in (_PolicyStageBinding, _CertStageBinding) and receipt['payload'] is not None
                 and _uncertain(receipt['payload'])):
             # A clean outer supervisor cannot certify an uncertain inner
             # --show cleanup. Retain pending and deny further dispatch.
@@ -580,6 +666,34 @@ class _SSHStageAdapter:
         snapshot = dict(flags={f: flags[f] for f in (SSHD, KEYS)}, platform_status=status,
                         context_refs=['global-default'], slots=slots)
         return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
+
+
+class _CertStageAdapter:
+    """One fixed S1 system stage; only the trusted worker issues the gate."""
+    def __init__(self, prepare):
+        require(callable(prepare), 'INVALID_STAGE_DRIVER')
+        self.prepare = prepare
+
+    def collect(self, run_id, target, task_uuid, flags, platform_snapshot, invoke, validate):
+        require(flags[CERT_FLAG] is True)
+        plan = validate(_cert_plan, flags, platform_snapshot)
+        status = validate(_platform_status, platform_snapshot)
+        if status != 'UNVERIFIED':
+            return dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                        snapshot=_gap_snapshot(CERT, flags, status))
+        if not plan:
+            return dict(reason_code='P1_TOOL_GAP', rc=None, cleanup_confirmed=True,
+                        snapshot=_cert_tool_gap())
+        require(plan == ((0, 'system'),))
+        binding = _CertStageBinding(run_id, target, task_uuid, CERT, 'system', 0)
+        try:
+            receipt = invoke(self.prepare, binding)
+            if receipt['reason_code'] not in ('COMMAND_OK', 'TOOL_UNAVAILABLE'):
+                raise _StageFailure(receipt['reason_code'], receipt['rc'], receipt['cleanup_confirmed'])
+        except _StageFailure as exc:
+            return exc.value()
+        return dict(reason_code=receipt['reason_code'], rc=receipt['rc'],
+                    cleanup_confirmed=receipt['cleanup_confirmed'], snapshot=copy.deepcopy(receipt['payload']))
 
 
 def _json_guard(value):
@@ -891,11 +1005,12 @@ def precheck(producer, snapshot, flags, platform_snapshot, run_id, target, obser
 
 
 def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False,
-           staged_openssl=False, staged_policy=False, staged_ssh=False):
+           staged_openssl=False, staged_policy=False, staged_ssh=False, staged_cert=False):
     """Validate one trusted adapter return and bind its observed time."""
     require(type(staged_openssl) is bool and (not staged_openssl or producer == OPENSSL)
             and type(staged_policy) is bool and (not staged_policy or producer == POLICY)
-            and type(staged_ssh) is bool and (not staged_ssh or producer == SSH))
+            and type(staged_ssh) is bool and (not staged_ssh or producer == SSH)
+            and type(staged_cert) is bool and (not staged_cert or producer == CERT))
     if staged_ssh:
         require(platform_snapshot is not None and any(flags[f] for f in (SSHD, KEYS)))
     if staged_policy:
@@ -907,6 +1022,12 @@ def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=Fal
     reason, rc, clean, snapshot = (value[k] for k in ('reason_code', 'rc', 'cleanup_confirmed', 'snapshot'))
     require(type(reason) is str and type(clean) is bool and
             (rc is None or type(rc) is int and -255 <= rc <= 255))
+    if staged_cert:
+        require(gap == (reason == 'PLATFORM_GAP'))
+        _validate_staged_cert(reason, rc, clean, snapshot, flags, platform_snapshot)
+        if snapshot is not None:
+            precheck(producer, snapshot, flags, platform_snapshot, run_id, target, now)
+        return dict(producer_id=producer, observed_at=now, **copy.deepcopy(value))
     if reason == 'COMMAND_OK' or gap:
         require(clean and type(snapshot) is dict and (reason, rc) == (('PLATFORM_GAP', None) if gap else ('COMMAND_OK', 0)))
         require(not staged_openssl or not _uncertain(snapshot))
@@ -1066,14 +1187,55 @@ class HostProjection:
         self.special = special
 
 
+def _cert_handoff_budget(envelope):
+    """Check actual compact bytes and reserved structure for a staged Cert host.
+
+    The prior producers' closed record grammars are checked by normalize_handoff;
+    payload accounting must include even gap placeholders and failed records.
+    """
+    payload_bytes = 0
+    for row in envelope['records']:
+        s = row['snapshot']
+        if s is None:
+            continue
+        producer = row['producer_id']
+        if producer == PLATFORM:
+            pieces = [({k: v for k, v in s.items() if k != 'rpms'}, 16384),
+                      *((v, 16384) for v in s['rpms'].values())]
+        elif producer == OPENSSL:
+            pieces = [(v, 16384) for v in s['slots'].values()]
+        elif producer == POLICY:
+            pieces = [({k: v for k, v in s.items() if k != 'profile-show'}, 65536),
+                      ({'profile-show': s['profile-show']}, 65536)]
+        elif producer == SSH:
+            pieces = [(s['slots'][k], _SSH_SLOT_BYTES) for k in _SSH_STAGES]
+        else:
+            require(producer == CERT)
+            pieces = [(s, _CERT_PAYLOAD_BYTES)]
+        for part, cap in pieces:
+            n = len(wire_bytes(part))
+            require(n <= cap, 'HANDOFF_SIZE_LIMIT')
+            payload_bytes += n
+    total = len(wire_bytes(envelope))
+    require(payload_bytes <= _CERT_STAGED_PAYLOAD_BUDGET
+            and 0 <= total - payload_bytes <= _CERT_STRUCTURE_RESERVE
+            and total <= _CERT_STAGED_WIRE_BUDGET, 'HANDOFF_SIZE_LIMIT')
+    return payload_bytes, total - payload_bytes
+
+
 def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
-                      staged_openssl=False, staged_policy=False, staged_ssh=False):
+                      staged_openssl=False, staged_policy=False, staged_ssh=False, staged_cert=False):
     """Bind actual typed snapshots to one frozen target, in fixed producer order.
 
     The optional private context comes only from the trusted staged session,
     never the handoff itself. The legacy synthetic contract is unchanged.
     """
-    require(type(staged_openssl) is bool and type(staged_policy) is bool and type(staged_ssh) is bool)
+    require(type(staged_openssl) is bool and type(staged_policy) is bool and type(staged_ssh) is bool
+            and type(staged_cert) is bool)
+    require(not staged_cert or (flags[CERT_FLAG] is True
+            and (staged_openssl or not any(flags[f] for f in (PACKAGES, SSL)))
+            and (staged_policy or not flags[POLICY_FLAG])
+            and (staged_ssh or not any(flags[f] for f in (SSHD, KEYS)))))
     require(not staged_policy or flags[POLICY_FLAG] is True)
     require(not staged_ssh or (any(flags[f] for f in (SSHD, KEYS))
             and (staged_openssl or not any(flags[f] for f in (PACKAGES, SSL)))
@@ -1117,9 +1279,14 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
         fset = (PLATFORM,) if producer == PLATFORM else PRODUCER_FLAGS[producer]
         if staged_policy and producer == POLICY:
             require(platform_snapshot is not None and flags[POLICY_FLAG] is True)
+        cert_context = staged_cert and producer == CERT
+        if cert_context:
+            _validate_staged_cert(reason, rc, clean, snapshot, flags, platform_snapshot)
         if snapshot is not None:
             require(clean and type(snapshot) is dict)
-            if reason == 'PLATFORM_GAP':
+            if cert_context:
+                pass  # Closed reason/rc/plan/payload already validated above.
+            elif reason == 'PLATFORM_GAP':
                 require(producer != PLATFORM and rc is None and _platform_status(platform_snapshot) != 'UNVERIFIED'
                         and snapshot == _gap_snapshot(producer, flags, _platform_status(platform_snapshot)))
             else:
@@ -1148,7 +1315,7 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
             require(reason in FAILURES and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                     and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
                      or producer == PLATFORM or (staged_openssl and producer == OPENSSL)
-                     or (staged_policy and producer == POLICY) or (staged_ssh and producer == SSH))
+                     or (staged_policy and producer == POLICY) or (staged_ssh and producer == SSH) or cert_context)
                     and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean)
                     and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0))
             for f in fset:
@@ -1163,6 +1330,8 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
     require(len(refs) == len(set(refs)) == len(doc['collections']) and set(refs) == {c['collection_id'] for c in doc['collections']})
     caps = {PLATFORM: 10, PACKAGES: 2, SSL: 5 + p, POLICY_FLAG: 9, SSHD: 8, KEYS: 1, CERT_FLAG: 3, NGINX: 0, TLS: 0}
     require(len(refs) <= 38 + p and all(len(outcomes[f]['collection_ids']) <= cap for f, cap in caps.items()), 'PRODUCER_REFERENCE_LIMIT')
+    if staged_cert:
+        _cert_handoff_budget(envelope)
     evidence.validate_document(doc)
     return HostProjection(doc, outcomes, companions, p, special)
 
