@@ -10,6 +10,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from types import MappingProxyType
+from typing import NamedTuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
 
@@ -482,8 +484,360 @@ def render_crypto_indexes(published):
     return result, _render_crypto_projection(result)
 
 
-def _render_crypto_projection(result, *, page_limit=None, total_limit=None):
+# B2b-2: a separate, bounded render-only index. Never serialize these rows
+# into the crypto/asset/summary projections or infer a relationship from labels.
+_MAX_PIVOT_MEMBERSHIPS = _MAX_MEMBERSHIPS
+_PIVOT_ERROR = 'PORTAL_PAYLOAD_INVALID'
+
+
+class _PivotBudget:
+    def __init__(self):
+        self.used = 0
+
+    def charge(self, count=1):
+        _require(count <= _MAX_PIVOT_MEMBERSHIPS - self.used, 'PORTAL_PAYLOAD_SIZE_LIMIT')
+        self.used += count
+
+
+def _pivot_ids(values, budget, registry):
+    _require(type(values) is list, _PIVOT_ERROR)
+    budget.charge(len(values))  # before allocating a set, even on bad input
+    _require(all(type(ref) is str and ref in registry for ref in values), _PIVOT_ERROR)
+    refs = set(values)
+    _require(len(refs) == len(values) and values == sorted(refs), _PIVOT_ERROR)
+    return refs
+
+
+class _PivotRow(NamedTuple):
+    kind: str
+    ref: str
+    owner: str | None
+    basis: str
+    matches: tuple
+    state: str | None = None
+    reason: str | None = None
+    attempt_status: str | None = None
+    dispatch_intent: bool | None = None
+
+    @property
+    def href(self):
+        # No href is accepted from a caller. Closed target grammar only.
+        if self.kind == 'collection':
+            return _href(self.owner, self.ref, 'c-')
+        page, prefix = {'certificate': ('certificates', 'cert-'),
+                        'service': ('services', 'svc-'),
+                        'occurrence': ('certificates', 'occ-'),
+                        'finding': ('findings', 'f-'),
+                        'host coverage': ('coverage', 'h-')}[self.kind]
+        return page + '.html#' + _id(self.ref, prefix)
+
+    @property
+    def host_href(self):
+        return _href(self.owner, self.ref, 'f-') if self.kind == 'finding' else None
+
+
+class _ReverseContext(NamedTuple):
+    run_id: str
+    expected_hosts: tuple
+    projection: dict
+    groups: object
+    host_links: object
+
+
+def _reverse_pivot_context(published, projection, asset_index, summary):
+    """Reuse the three actual projections of one verified PublishedRun.
+
+    Validate identity/ownership and explicit membership, not the assessment or
+    collector semantics again. Inverted refs make candidate visits proportional
+    to the bounded input and actual candidate edges, not all group pairs.
+    The resulting immutable rows contain only fixed IDs and recorded states.
+    """
+    budget = _PivotBudget()
+    m, doc, saved, _ = published
+    rid, ids = m['run_id'], m['expected_host_ids']
+    assessed = saved is not None
+    _require(projection['run_id'] == asset_index['run_id'] == summary['run']['run_id'] == rid
+             and summary['expected_host_ids'] == ids
+             and all(p['assessed'] is assessed for p in (projection, asset_index, summary)), _PIVOT_ERROR)
+    # Summary's closed registries are checked against the actual verified rows.
+    # Do not retain a copy of the document or raw facts in the render context.
+    definitions = {
+        'hosts': ('host_id', 'h-', ('target_id', 'host_state', 'reason_code', 'attempted',
+                                   'attempt_status', 'dispatch_intent'), ()),
+        'collections': ('collection_id', 'c-', ('host_id', 'collection_state', 'reason_code',
+                                                 'collector_id'), ('evidence_ids',)),
+        'assets': ('asset_id', 'a-', ('host_id', 'asset_kind', 'identity_scope'), ('evidence_ids',)),
+        'evidence': ('evidence_id', 'e-', ('host_id', 'asset_id', 'collection_id', 'evidence_kind'), ()),
+        'claims': ('claim_id', 'cl-', ('subject', 'level', 'assessment_state', 'reason_code',
+                                      'rule_id', 'rule_version'), ('evidence_ids',)),
+        'findings': ('finding_id', 'f-', ('subject', 'assessment_state', 'reason_code',
+                                        'rule_id', 'rule_version', 'condition_key'), ('claim_ids', 'evidence_ids')),
+    }
+    registries = {}
+    for kind, (key, prefix, fields, ref_fields) in definitions.items():
+        actual = m['hosts'] if kind == 'hosts' else ((saved or {}).get(kind, [])
+                    if kind in ('claims', 'findings') else doc[kind])
+        table = summary[kind]
+        if kind in ('claims', 'findings') and not assessed:
+            _require(table is None, _PIVOT_ERROR)
+            table = {}
+        _require(type(table) is dict and len(table) == len(actual), _PIVOT_ERROR)
+        budget.charge(len(actual) + len(table))
+        seen = set()
+        for raw in actual:
+            ref = _id(raw[key], prefix)
+            _require(ref not in seen and ref in table, _PIVOT_ERROR)
+            seen.add(ref)
+            row = table[ref]
+            owner = ref if kind == 'hosts' else (raw['subject']['host_id']
+                if kind in ('claims', 'findings') else raw['host_id'])
+            _require(type(row) is dict and row[key] == ref and owner in summary['hosts']
+                     and row['href'] == _href(owner, ref, prefix)
+                     and all(row[f] == raw[f] for f in fields), _PIVOT_ERROR)
+            for field in ref_fields:
+                budget.charge(len(raw[field]))
+                refs = _pivot_ids(row[field], budget, summary['claims' if field == 'claim_ids' else 'evidence'])
+                _require(refs == set(raw[field]), _PIVOT_ERROR)
+        registries[kind] = table
+    hosts, cols, ars, evs, cls, fs = (registries[k] for k in definitions)
+    _require(list(sorted(hosts)) == ids and len(ids) <= 1000, _PIVOT_ERROR)
+
+    # The projections may have narrower registries than Summary. Their
+    # common ID fields and fixed original host hrefs must agree exactly.
+    for p in (projection, asset_index):
+        for kind in ('hosts', 'assets', 'evidence', 'claims'):
+            key, _, fields, ref_fields = definitions[kind]
+            table = p[kind]
+            _require(type(table) is dict, _PIVOT_ERROR)
+            budget.charge(len(table))
+            for ref, row in table.items():
+                _require(ref in registries[kind] and type(row) is dict, _PIVOT_ERROR)
+                original = registries[kind][ref]
+                # Some original projections intentionally omit display fields.
+                identity = ('subject',) if kind == 'claims' else (
+                    ('target_id', 'host_state') if kind == 'hosts' else
+                    (('host_id', 'asset_kind', 'identity_scope') if kind == 'assets' else fields))
+                _require(row[key] == ref and row['href'] == original['href'] and
+                         all(row[f] == original[f] for f in identity), _PIVOT_ERROR)
+                if kind == 'claims':
+                    refs = _pivot_ids(row['evidence_ids'], budget, evs)
+                    budget.charge(len(original['evidence_ids']))
+                    _require(refs == set(original['evidence_ids']), _PIVOT_ERROR)
+    group_names, memberships = {}, {}
+    by_ref = {k: defaultdict(set) for k in ('assets', 'evidence', 'claims')}
+    edges = defaultdict(dict)
+    host_edges = defaultdict(lambda: defaultdict(set))
+
+    def group_members(p, name, group, prefix):
+        gid = _id(group['id'], prefix)
+        _require(group['backlink'] == name + '.html#' + gid, _PIVOT_ERROR)
+        budget.charge()
+        members = {kind: _pivot_ids(group[field], budget, p[kind]) for kind, field in
+                   (('hosts', 'host_ids'), ('assets', 'asset_ids'),
+                    ('evidence', 'evidence_ids'), ('claims', 'claim_ids'))}
+        return gid, members
+
+    def add(gid, kind, ref, owner, basis, match=None, *, state=None, reason=None,
+            attempt_status=None, dispatch_intent=None):
+        # Count each accepted candidate/ref and materialized edge before add.
+        budget.charge(2)
+        key = (kind, ref, owner or '', basis)
+        if key not in edges[gid]:
+            budget.charge()
+            edges[gid][key] = (set(), state, reason, attempt_status, dispatch_intent)
+        refs, *metadata = edges[gid][key]
+        _require(tuple(metadata) == (state, reason, attempt_status, dispatch_intent), _PIVOT_ERROR)
+        if match is not None:
+            budget.charge()
+            refs.add(match)
+        if kind in ('finding', 'collection'):
+            budget.charge()
+            host_edges[owner][ref].add(group_names[gid] + '.html#' + gid)
+
+    for name, prefix in (('algorithms', 'alg-'), ('libraries', 'lib-')):
+        for group in projection[name]['groups']:
+            gid, members = group_members(projection, name, group, prefix)
+            _require(gid not in memberships, _PIVOT_ERROR)
+            group_names[gid], memberships[gid] = name, members
+            actual_hosts, actual_assets = set(), set()
+            for kind in ('evidence', 'claims'):
+                for ref in members[kind]:
+                    row = registries[kind][ref]
+                    subject = row['subject'] if kind == 'claims' else row
+                    budget.charge(3)
+                    actual_hosts.add(subject['host_id'])
+                    if subject['asset_id'] is not None:
+                        actual_assets.add(subject['asset_id'])
+                    if kind == 'claims':
+                        budget.charge(len(row['evidence_ids']))
+                        _require(all(eid in members['evidence'] for eid in row['evidence_ids']), _PIVOT_ERROR)
+                    by_ref[kind][ref].add(gid)
+            _require(actual_hosts == members['hosts'] and actual_assets == members['assets'], _PIVOT_ERROR)
+            for aid in members['assets']:
+                budget.charge(); by_ref['assets'][aid].add(gid)
+            for hid in members['hosts']:
+                h = hosts[hid]
+                add(gid, 'host coverage', hid, hid, 'HOST_MEMBERSHIP',
+                    state=h['host_state'], reason=h['reason_code'], attempt_status=h['attempt_status'],
+                    dispatch_intent=h['dispatch_intent'])
+            for eid in members['evidence']:
+                r = evs[eid]; cid = r['collection_id']; c = cols[cid]
+                _require(c['host_id'] == r['host_id'], _PIVOT_ERROR)
+                add(gid, 'collection', cid, r['host_id'], 'SHARED_EVIDENCE_ID', eid,
+                    state=c['collection_state'], reason=c['reason_code'])
+
+    # Preserve the explicit algorithm/library relationships. They are not
+    # inputs to any asset or finding join. Reject conflicting relation refs.
+    related = defaultdict(list)
+    relation_pairs = set()
+    for rel in projection['relations']:
+        ag, lg = rel['algorithm_group_id'], rel['library_group_id']
+        budget.charge(3)
+        _require(rel['basis'] == 'EXPLICIT_EVIDENCE_OR_ASSET_REFERENCE'
+                 and group_names.get(ag) == 'algorithms' and group_names.get(lg) == 'libraries'
+                 and (ag, lg) not in relation_pairs, _PIVOT_ERROR)
+        relation_pairs.add((ag, lg))
+        refs = _pivot_ids(rel['evidence_ids'], budget, evs)
+        _require(bool(refs) and refs <= memberships[ag]['evidence']
+                 and refs <= memberships[lg]['evidence'], _PIVOT_ERROR)
+        related[ag].append(dict(group_id=lg, href='libraries.html#' + lg, evidence_ids=rel['evidence_ids']))
+        related[lg].append(dict(group_id=ag, href='algorithms.html#' + ag, evidence_ids=rel['evidence_ids']))
+    for name in ('algorithms', 'libraries'):
+        for group in projection[name]['groups']:
+            budget.charge(len(group['relations']))
+            _require(group['relations'] == related[group['id']], _PIVOT_ERROR)
+
+    # Each certificate/service asset has exactly one C2 group. The algorithm
+    # reverse edge must agree with the original C2 shared-evidence relation.
+    # Libraries use the identical evidence-ID join independently, not A->L
+    # transitivity, same-host coincidence, fingerprint or package spelling.
+    seen_groups, seen_assets, seen_occ = set(), set(), set()
+    occurrences = asset_index['occurrences']
+    budget.charge(len(doc['evidence']))
+    raw_evidence = {r['evidence_id']: r for r in doc['evidence']}
+    budget.charge(len(doc['assets']))
+    raw_assets = {r['asset_id']: r for r in doc['assets']}
+    _require(type(occurrences) is dict, _PIVOT_ERROR)
+    for name, prefix, kind in (('certificates', 'cert-', 'certificate'), ('services', 'svc-', 'service')):
+        for group in asset_index[name]['groups']:
+            target, members = group_members(asset_index, name, group, prefix)
+            _require(target not in seen_groups and not seen_assets.intersection(members['assets']), _PIVOT_ERROR)
+            budget.charge(1 + len(members['assets']))
+            seen_groups.add(target); seen_assets.update(members['assets'])
+            expected_hosts, expected_refs = set(), set()
+            _require(bool(members['assets']), _PIVOT_ERROR)
+            for aid in members['assets']:
+                row = ars[aid]
+                _require(row['asset_kind'] == kind, _PIVOT_ERROR)
+                if kind == 'service':
+                    identity = [rid, row['host_id'], aid]
+                elif group['kind'] == 'RECORDED_FINGERPRINT':
+                    _require(group['fingerprint'] == raw_assets[aid]['identity_key'], _PIVOT_ERROR)
+                    identity = [group['kind'], group['source_kind'], group['fingerprint']]
+                else:
+                    _require(group['kind'] in ('LEGACY_RUN_SCOPED', 'UNVERIFIED_IDENTITY')
+                             and group['fingerprint'] is None, _PIVOT_ERROR)
+                    identity = [group['kind'], rid, row['host_id'], aid]
+                _require(target == _key(prefix[:-1], identity), _PIVOT_ERROR)
+                budget.charge(1 + len(row['evidence_ids']))
+                expected_hosts.add(row['host_id']); expected_refs.update(row['evidence_ids'])
+            _require(expected_hosts == members['hosts'] and expected_refs == members['evidence'], _PIVOT_ERROR)
+            for cid in members['claims']:
+                c = cls[cid]
+                budget.charge(len(c['evidence_ids']) + 1)
+                _require(c['subject']['asset_id'] in members['assets'] and
+                         all(eid in members['evidence'] for eid in c['evidence_ids']), _PIVOT_ERROR)
+            expected_algorithms = defaultdict(set)
+            for eid in members['evidence']:
+                for gid in by_ref['evidence'].get(eid, ()):
+                    budget.charge()
+                    add(gid, kind, target, None, 'SHARED_EVIDENCE_ID', eid)
+                    if group_names[gid] == 'algorithms':
+                        budget.charge(); expected_algorithms[gid].add(eid)
+            links = {}
+            for link in group['algorithm_links']:
+                gid = link['group_id']; budget.charge()
+                _require(gid in expected_algorithms and gid not in links and
+                         link['basis'] == 'SHARED_EVIDENCE_ID' and link['href'] == 'algorithms.html#' + gid,
+                         _PIVOT_ERROR)
+                links[gid] = _pivot_ids(link['evidence_ids'], budget, evs)
+            _require(links == expected_algorithms and _pivot_ids(group['algorithm_group_ids'], budget,
+                     group_names) == set(expected_algorithms), _PIVOT_ERROR)
+            occ_ids = _pivot_ids(group['recorded_occurrence_ids'], budget, occurrences)
+            _require(kind == 'certificate' or not occ_ids, _PIVOT_ERROR)
+            for oid in occ_ids:
+                r = occurrences[oid]; _id(oid, 'occ-')
+                budget.charge()
+                aid, hid, cid = r['asset_id'], r['host_id'], r['collection_id']
+                _require(oid == r['id'] == _key('occ', [hid, cid, aid, r['source_id'],
+                         r['block_index'], r['detail_sha256']]) and oid not in seen_occ and aid in members['assets'] and
+                         hid == ars[aid]['host_id'] == cols[cid]['host_id'] and
+                         r['detail_state'] in ('VERIFIED_COMPANION', 'DETAIL_NOT_RETAINED'), _PIVOT_ERROR)
+                _require(group['kind'] == 'RECORDED_FINGERPRINT'
+                         and r['fingerprint'] == group['fingerprint']
+                         and r['source']['source_kind'] == group['source_kind'], _PIVOT_ERROR)
+                seen_occ.add(oid)
+                refs = _pivot_ids(r['evidence_ids'], budget, evs)
+                roles = r['role_evidence_ids']
+                _require(type(roles) is dict, _PIVOT_ERROR)
+                budget.charge(len(roles))
+                _require('certificate' in roles and roles.keys() <= {'certificate', 'public-key', 'signature'}
+                         and set(roles.values()) == refs and len(roles) == len(refs)
+                         and refs <= members['evidence'], _PIVOT_ERROR)
+                for role, eid in roles.items():
+                    row = raw_evidence[eid]
+                    _require((row['host_id'], row['asset_id'], row['collection_id']) == (hid, aid, cid)
+                             and row['observation_key'] == r['source_id'] + '-' + str(r['block_index']) + '-' + role
+                             and row.get('raw_sha256') == r['detail_sha256']
+                             and row.get('evidence_ref') == r['detail_ref'] == 'cert-' + r['detail_sha256'], _PIVOT_ERROR)
+                    for gid in by_ref['evidence'].get(eid, ()):
+                        budget.charge()
+                        add(gid, 'occurrence', oid, hid, 'SHARED_EVIDENCE_ID', eid, state=r['detail_state'])
+    _require(seen_assets == asset_index['assets'].keys() and seen_occ == occurrences.keys(), _PIVOT_ERROR)
+
+    # Saved findings only. Index explicit subject assets and claim/evidence
+    # references, not host-only membership or a textual algorithm label.
+    for fid, f in fs.items():
+        hid, aid = f['subject']['host_id'], f['subject']['asset_id']
+        for kind, field, basis in (('claims', 'claim_ids', 'SHARED_CLAIM_ID'),
+                                    ('evidence', 'evidence_ids', 'SHARED_EVIDENCE_ID'),
+                                    ('assets', None, 'EXACT_SUBJECT_ASSET_ID')):
+            refs = f[field] if field is not None else (() if aid is None else (aid,))
+            for ref in refs:
+                budget.charge()
+                row = registries[kind][ref]
+                _require((row['subject'] if kind == 'claims' else row)['host_id'] == hid, _PIVOT_ERROR)
+                for gid in by_ref[kind].get(ref, ()):
+                    budget.charge()
+                    _require(hid in memberships[gid]['hosts'], _PIVOT_ERROR)
+                    add(gid, 'finding', fid, hid, basis, ref, state=f['assessment_state'], reason=f['reason_code'])
+
+    # Freeze, with deterministic ordering. No raw rows or paths per edge.
+    output = {}
+    for gid in sorted(memberships):
+        rows = []
+        for (kind, ref, owner, basis), (refs, state, reason, attempt, dispatch) in sorted(edges[gid].items()):
+            budget.charge(1 + len(refs))
+            rows.append(_PivotRow(kind, ref, owner or None, basis, tuple(sorted(refs)), state, reason, attempt, dispatch))
+        output[gid] = tuple(rows)
+    backlinks = {}
+    for hid, by_record in host_edges.items():
+        budget.charge(len(by_record))
+        frozen = {}
+        for ref, hrefs in sorted(by_record.items()):
+            budget.charge(len(hrefs))
+            frozen[ref] = tuple(sorted(hrefs))
+        backlinks[hid] = MappingProxyType(frozen)
+    return _ReverseContext(rid, tuple(ids), projection, MappingProxyType(output), MappingProxyType(backlinks))
+
+
+def _render_crypto_projection(result, *, page_limit=None, total_limit=None, pivots=None):
     """Render the same trusted projection; optional internal remaining byte caps."""
+    if pivots is not None:
+        _require(type(pivots) is _ReverseContext and pivots.projection is result
+                 and pivots.run_id == result['run_id'] and set(result['hosts']) <= set(pivots.expected_hosts)
+                 and set(pivots.groups) == {g['id'] for n in ('algorithms', 'libraries')
+                                           for g in result[n]['groups']}, _PIVOT_ERROR)
     pages = {}
     cap = _MAX_HTML if page_limit is None else min(_MAX_HTML, page_limit)
     remaining = total_limit
@@ -493,7 +847,7 @@ def _render_crypto_projection(result, *, page_limit=None, total_limit=None):
         for name in ('algorithms', 'libraries'):
             limit = cap if remaining is None else min(cap, remaining)
             out = bytearray()
-            for chunk in env.get_template(name + '.html.j2').generate(p=result, index=result[name]):
+            for chunk in env.get_template(name + '.html.j2').generate(p=result, index=result[name], pivots=pivots.groups if pivots is not None else None):
                 raw = chunk.encode('utf-8')
                 _require(len(raw) <= limit - len(out), 'CRYPTO_INDEX_SIZE_LIMIT')
                 out.extend(raw)

@@ -1478,7 +1478,7 @@ def test_cb2a_missing_template(root, tmp_path, monkeypatch, missing):
 
 
 @pytest.mark.parametrize('navigation', [False, True])
-def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch, navigation):
+def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch, navigation, reverse_pivots=False):
     # Persist an allowed but unclassified legacy field in a real Store. The
     # original host facts allowlist suppresses it; do not use a typed allowed
     # configuration value as if it were an unclassified raw diagnostic.
@@ -1500,7 +1500,7 @@ def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch, navigation):
     assert any(r['data'].get('value') == sentinel for r in pub.document['evidence'])
     assert any(sentinel.encode() in r for r in pub.artifacts.values())
     before, snapshot = c1._c2_tree(root), deepcopy(pub)
-    full = ca._assemble_v5_render_payload(pub, navigation=navigation)
+    full = ca._assemble_v5_render_payload(pub, navigation=navigation, reverse_pivots=reverse_pivots)
     assert all(sentinel.encode() not in r for r in (full.index, full.css, *full.files.values()))
     hid = pub.manifest['expected_host_ids'][0]
     assert b'Not displayed (unclassified legacy field)' in full.files[hid + '.html']
@@ -1800,4 +1800,338 @@ def test_cb2b1_remaining_capacity(root, monkeypatch, page_name, cap):
     with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
         ca._assemble_v5_render_payload(pub, navigation=True)
     assert faults[-1][:2] == (page_name, len(outputs[page_name]) - 1)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+_CB2B2_F = '243d1bb2c8ee5dc64ed1b919c75d054f177feb43'
+_CB2B2_F_FILES = {**_CB2B1_M_FILES,
+    'tools/portal_generation_c.py': 'b9c3281bbc0c82f8726ec5e6d91f5d30404e28f5',
+    'tools/render_portal.py': '1bda66268de3aaeb3b07c7c1492798d781ffb177',
+    'templates/portal/base.html.j2': '2c4bc170fdf5845cff820180c284c4e717ec8056',
+    'templates/portal/host.html.j2': 'bc70759fc8fa2baba7896233fbbfbb1315dfe708',
+    'templates/portal/run_index.html.j2': '40dcc7b1c274a11d74857cc2cd656c8656e7addc',
+}
+
+
+def _cb2b2_original(tmp_path):
+    from types import ModuleType
+    old_assets, old_ca = _cb1b_original(tmp_path, _CB2B2_F, _CB2B2_F_FILES, 'f', 'PQC_CB2B2_F_ROOT')
+    modules = []
+    for name in ('portal_indexes', 'render_portal'):
+        path = tmp_path / 'fixed-f/tools' / (name + '.py')
+        module = ModuleType('_cb2b2_f_' + name)
+        module.__file__ = str(path)
+        exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        modules.append(module)
+    old_crypto, old_portal = modules
+    old_ca.portal_indexes = old_assets.portal_indexes = old_ca.export_summary.portal_indexes = old_crypto
+    old_ca.render_portal = old_portal
+    return old_ca, old_crypto, old_portal
+
+
+def _cb2b2_check(pub, full, previous):
+    # Independent expected href sets from actual stored records and exported
+    # memberships, not the candidate render context.
+    _cb2b1_check(pub, full)
+    pages = _cb2a_check(pub, full)
+    assert full.index == previous.index and full.css == previous.css
+    assert set(full.files) == set(previous.files)
+    indexes = json.loads(full.files['crypto_indexes.json'])
+    asset_index = json.loads(full.files['asset_indexes.json'])
+    evs = {r['evidence_id']: r for r in pub.document['evidence']}
+    saved = pub[2] or {}
+    by_host = {}
+    metrics = Counter()
+    for name in ('algorithms', 'libraries'):
+        raw = full.files[name + '.html']; page = pages['portal-v5/' + name + '.html']
+        assert _cb2b1_nav(raw)['Run sections'] == [(section.lower() + '.html',
+            'page' if section.lower() == name else None, section) for section in _CB2B1_SECTIONS]
+        old_page = _cb2a_parse(previous.files[name + '.html'])
+        assert old_page.ids <= page.ids
+        assert set(old_page.links) <= set(page.links)
+        assert {'../../index.html', '../index.html', '../portal.css', '#main'} <= set(page.links)
+        for group in indexes[name]['groups']:
+            gid = group['id']; shared = set(group['evidence_ids'])
+            expected = set()
+            for kind in ('certificates', 'services'):
+                for asset_group in asset_index[kind]['groups']:
+                    refs = shared & set(asset_group['evidence_ids'])
+                    if refs:
+                        expected.add(kind + '.html#' + asset_group['id'])
+                        metrics[name + '-' + kind] += 1
+                    occs = asset_group['recorded_occurrence_ids']; selected = []
+                    for oid in occs:
+                        occ = asset_index['occurrences'][oid]
+                        if shared & set(occ['evidence_ids']):
+                            expected.add('certificates.html#' + oid); selected.append(oid)
+                            metrics['occurrence-' + occ['detail_state']] += 1
+                    if 0 < len(selected) < len(occs): metrics['occurrence-subset'] += 1
+            for finding in saved.get('findings', []):
+                subject = finding['subject']; hid = subject['host_id']; fid = finding['finding_id']
+                if (set(finding['claim_ids']) & set(group['claim_ids']) or
+                        set(finding['evidence_ids']) & shared or subject['asset_id'] in group['asset_ids']):
+                    assert hid in group['host_ids']
+                    expected.update(('findings.html#' + fid, hid + '.html#' + fid))
+                    by_host.setdefault(hid, {}).setdefault(fid, set()).add(name + '.html#' + gid)
+                    metrics[name + '-finding'] += 1
+            for hid in group['host_ids']:
+                expected.add('coverage.html#' + hid)
+            for eid in shared:
+                row = evs[eid]; hid, cid = row['host_id'], row['collection_id']
+                expected.update((hid + '.html#' + cid, 'coverage.html#recorded-collections'))
+                by_host.setdefault(hid, {}).setdefault(cid, set()).add(name + '.html#' + gid)
+            assert page.refs[gid] == old_page.refs[gid] | expected
+    for hid in pub.manifest['expected_host_ids']:
+        name = hid + '.html'; page = pages['portal-v5/' + name]
+        old_page = _cb2a_parse(previous.files[name]); expected = by_host.get(hid, {})
+        for ref in old_page.ids:
+            if ref.startswith(('c-', 'f-')):
+                assert page.refs[ref] == old_page.refs[ref] | expected.get(ref, set())
+        assert (full.files[name] != previous.files[name]) == bool(expected)
+        assert old_page.ids <= page.ids and set(old_page.links) <= set(page.links)
+        assert set(page.links) == set(old_page.links) | set().union(*expected.values())
+    changed = {n for n in full.files if full.files[n] != previous.files[n]}
+    assert changed == {'algorithms.html', 'libraries.html'} | {hid + '.html' for hid in by_host}
+    if pub[2] is None:
+        assert not any(k.endswith('-finding') for k in metrics)
+    return metrics
+
+
+@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
+def test_cb2b2_actual_f_oracle(root, tmp_path, monkeypatch, kind):
+    import tools
+    from tools import render_portal as portal
+    pub = _cb2a_publication(root, tmp_path, kind)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old_ca, old_crypto, old_portal = _cb2b2_original(tmp_path)
+    marker = rs._json_bytes(pub.manifest)
+    with monkeypatch.context() as patch:
+        patch.setattr(tools, 'portal_indexes', old_crypto)
+        patch.setattr(gen, 'portal_indexes', old_crypto)
+        old = old_ca._assemble_v5_render_payload(pub, navigation=True)
+        default = old_ca._assemble_v5_render_payload(pub)
+        assert old_ca._assemble_v5_render_payload(pub, navigation=False) == default
+        b1 = [old_ca._assemble_payload(pub, portal_v5=mode) for mode in (False, True)]
+        css = old_portal._render_css()
+        if not rs._is_producer_v2(pub.manifest):
+            public = [old_portal._render(pub)] + [getattr(old_portal, n)(pub, marker, css)
+                for n in ('_render_v2', '_render_v3', '_render_v4')]
+        else:
+            public = None
+            with pytest.raises(rs.StoreError) as exc:
+                old_portal._render(pub)
+            old_error = exc.value.code
+    assert ca._assemble_v5_render_payload(pub) == default
+    assert ca._assemble_v5_render_payload(pub, navigation=False, reverse_pivots=False) == default
+    assert ca._assemble_v5_render_payload(pub, navigation=True) == old
+    assert ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=False) == old
+    assert [ca._assemble_payload(pub, portal_v5=mode) for mode in (False, True)] == b1
+    if public is not None:
+        assert [portal._render(pub)] + [getattr(portal, n)(pub, marker, css)
+            for n in ('_render_v2', '_render_v3', '_render_v4')] == public
+    else:
+        with pytest.raises(rs.StoreError) as exc:
+            portal._render(pub)
+        assert exc.value.code == old_error
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    metrics = _cb2b2_check(pub, full, old)
+    if kind == 'c1-assessed':
+        assert metrics['algorithms-certificates'] and metrics['algorithms-finding']
+        assert metrics['occurrence-VERIFIED_COMPANION']
+    if kind == 's1':
+        assert metrics['libraries-finding']
+        assert b'&lt;img src=x onerror=alert(1)&gt;' in full.files['algorithms.html']
+    assert ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True) == full
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b2_actual_multi_occurrence(root, monkeypatch):
+    original = c1.cert_snapshot
+    def snapshot(partial=False, large=False):
+        roots = original(partial, large)
+        if partial:
+            for block in (b for r in roots.values() for src in r['sources'] for b in src['blocks']
+                          if b['certificate']['fingerprint'] == c1.digest('public-fixture-0')):
+                cert = block['certificate']
+                cert['signature_inner'] = cert['signature_outer'] = None
+                cert['gaps'] = c1.ca.metadata_gaps(cert)
+                block['reason'] = 'METADATA_GAP'
+        return roots
+    monkeypatch.setattr(c1, 'cert_snapshot', snapshot)
+    platform = c1.platform_snapshot
+    def with_rpms():
+        data = platform()
+        data['rpms'] = {k: dict(state='COLLECTED', reason='OK', rows=[[k, '9.10', '1', 'x86_64']])
+                        for k in c1.platform.PACKAGES}
+        return data
+    monkeypatch.setattr(c1, 'platform_snapshot', with_rpms)
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old = ca._assemble_v5_render_payload(pub, navigation=True)
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    metrics = _cb2b2_check(pub, full, old)
+    assert metrics['occurrence-subset'] and metrics['occurrence-VERIFIED_COMPANION']
+    assert metrics['algorithms-certificates'] and metrics['algorithms-finding']
+    # Coincident host and fingerprint are not shared evidence.
+    assert json.loads(full.files['crypto_indexes.json'])['libraries']['groups']
+    assert metrics['libraries-certificates'] == 0
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b2_actual_asset_service(root):
+    from test_portal_asset_index import publish_assets
+    pub = publish_assets(root, assessed=True, coverage_extra=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old = ca._assemble_v5_render_payload(pub, navigation=True)
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    metrics = _cb2b2_check(pub, full, old)
+    assert metrics['algorithms-services'] and metrics['libraries-services'] and metrics['libraries-finding']
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b2_actual_call_through(root, monkeypatch):
+    from tools import render_portal as portal
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    with rs.RunStore(root) as store, store._locked_run(c1.RID, shared=True) as (fd, lock):
+        actual = store.open(c1.RID)
+        sigs = portal._core_signatures(fd, store._device, actual, portal_v5=True)
+        counts = Counter()
+        with monkeypatch.context() as patch:
+            for module, name in ((rs.RunStore, 'open'), (crypto, 'project_crypto_indexes'),
+                (assets, 'project_asset_indexes'), (ex, '_project_scan_summary'),
+                (validator, 'validate_cbom_bytes'), (gen, '_verified_taxonomy'),
+                (crypto, '_render_crypto_projection'), (assets, '_render_asset_indexes'),
+                (ex, '_render_summary_projection'), (portal, '_render_v5_core'), (crypto, '_reverse_pivot_context')):
+                original = getattr(module, name)
+                def call(*args, _name=name, _original=original, **kwargs):
+                    counts[_name] += 1
+                    return _original(*args, **kwargs)
+                patch.setattr(module, name, call)
+            full = ca._assemble_v5_render_payload(actual, navigation=True, reverse_pivots=True)
+            assert counts == {'project_asset_indexes': 1, 'project_crypto_indexes': 2,
+                'validate_cbom_bytes': 3, '_verified_taxonomy': 1, '_project_scan_summary': 1,
+                '_render_crypto_projection': 1, '_render_asset_indexes': 1,
+                '_render_summary_projection': 1, '_render_v5_core': 1, '_reverse_pivot_context': 1}
+        assert portal._core_signatures(fd, store._device, actual, portal_v5=True) == sigs
+    _cb2b1_check(pub, full)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('fault', ['foreign-evidence', 'duplicate-evidence', 'foreign-host', 'href', 'run',
+    'asset-algorithm-link', 'asset-group-id', 'occurrence-owner', 'occurrence-role', 'occurrence-id', 'finding-owner',
+    'finding-ref', 'collection-ref', 'coverage-state', 'malformed'])
+def test_cb2b2_reject_actual_context(root, monkeypatch, fault):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    original = crypto._reverse_pivot_context
+    def inject(published, projection, asset_index, summary):
+        group = projection['algorithms']['groups'][0]
+        occ = next(iter(asset_index['occurrences'].values()))
+        if fault == 'foreign-evidence': group['evidence_ids'] = ['e-' + 'f'*64]
+        elif fault == 'duplicate-evidence': group['evidence_ids'].append(group['evidence_ids'][0])
+        elif fault == 'foreign-host': group['host_ids'] = ['h-' + 'f'*64]
+        elif fault == 'href': group['backlink'] = 'https://example.invalid/foreign'
+        elif fault == 'run': summary['run']['run_id'] = 'foreign-run'
+        elif fault == 'asset-algorithm-link':
+            next(g for g in asset_index['certificates']['groups'] if g['algorithm_links'])['algorithm_links'][0]['evidence_ids'] = []
+        elif fault == 'asset-group-id':
+            target = asset_index['certificates']['groups'][0]
+            target['id'] = 'cert-' + 'f'*64
+            target['backlink'] = 'certificates.html#' + target['id']
+        elif fault == 'occurrence-owner': occ['host_id'] = 'h-' + 'f'*64
+        elif fault == 'occurrence-role': occ['role_evidence_ids']['foreign'] = occ['role_evidence_ids'].pop('certificate')
+        elif fault == 'occurrence-id': occ['block_index'] += 1
+        elif fault == 'finding-owner': next(iter(summary['findings'].values()))['subject']['host_id'] = 'h-' + 'f'*64
+        elif fault == 'finding-ref': next(iter(summary['findings'].values()))['evidence_ids'] = ['e-' + 'f'*64]
+        elif fault == 'collection-ref': next(iter(summary['collections'].values()))['evidence_ids'] = ['e-' + 'f'*64]
+        elif fault == 'coverage-state': next(iter(summary['hosts'].values()))['host_state'] = 'FOREIGN'
+        else: group['evidence_ids'] = 'not-a-list'
+        return original(published, projection, asset_index, summary)
+    monkeypatch.setattr(crypto, '_reverse_pivot_context', inject)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b2_invalid_modes(root):
+    pub = c1._c2_open(root, ('complete',))
+    before = c1._c2_tree(root)
+    for value in (None, 0, 1, 'true', [], {}):
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+            ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=value)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_v5_render_payload(pub, navigation=False, reverse_pivots=True)
+    for complete, mode in ((False, True), (True, False)):
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+            ca._checked_assemble(pub, complete=complete, portal_v5=mode, navigation=True, reverse_pivots=True)
+    assert c1._c2_tree(root) == before
+
+
+def test_cb2b2_membership_capacity(root, monkeypatch):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    charged = []
+    original = crypto._PivotBudget.charge
+    def charge(self, count=1):
+        assert type(count) is int and count >= 0
+        original(self, count)
+        charged.append(self.used)
+    monkeypatch.setattr(crypto._PivotBudget, 'charge', charge)
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    limit = charged[-1]; assert 0 < limit < crypto._MAX_PIVOT_MEMBERSHIPS
+    monkeypatch.setattr(crypto, '_MAX_PIVOT_MEMBERSHIPS', limit)
+    assert ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True) == full
+    monkeypatch.setattr(crypto, '_MAX_PIVOT_MEMBERSHIPS', limit - 1)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+        ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('page_name', ['algorithms.html', 'libraries.html', 'host'])
+@pytest.mark.parametrize('cap', ['_MAX_HTML_TOTAL', '_MAX_BUNDLE'])
+def test_cb2b2_remaining_capacity(root, monkeypatch, page_name, cap):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    def render():
+        return ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    full = render()
+    outputs = {'index.html': full.index, 'portal.css': full.css, **full.files}
+    order = ['algorithms.html', 'libraries.html', 'index.html', 'hosts.html'] + [
+        h + '.html' for h in pub.manifest['expected_host_ids']]
+    if page_name == 'host': page_name = order[-1]
+    i = order.index(page_name)
+    preceding = set(order[:i+1]) | set(outputs) - set(order)
+    limit = sum(len(outputs[n]) for n in preceding if cap == '_MAX_BUNDLE' or n.endswith('.html'))
+    faults = _cb2a_watch_writers(monkeypatch)
+    monkeypatch.setattr(ca, cap, limit)
+    if i+1 == len(order): assert render() == full
+    else:
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'): render()
+        assert faults[-1][:2] == (order[i+1], 0)
+    faults.clear(); monkeypatch.setattr(ca, cap, limit - 1)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'): render()
+    assert faults[-1][:2] == (page_name, len(outputs[page_name]) - 1)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2b2_actual_legacy_raw_sentinel(root, monkeypatch):
+    test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch, True, True)
+
+
+def test_cb2b2_crypto_page_capacity(root, monkeypatch):
+    from test_portal_crypto_index import publish_crypto
+    pub = publish_crypto(root)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    p = crypto.project_crypto_indexes(pub)
+    asset_index = assets.project_asset_indexes(pub)
+    summary = ex._project_scan_summary(pub, crypto=p)
+    ctx = crypto._reverse_pivot_context(pub, p, asset_index, summary)
+    pages = crypto._render_crypto_projection(p, pivots=ctx)
+    name = max(pages, key=lambda n: len(pages[n])); limit = len(pages[name])
+    assert crypto._render_crypto_projection(p, pivots=ctx, page_limit=limit) == pages
+    faults = _cb2a_watch_writers(monkeypatch)
+    with pytest.raises(rs.StoreError, match='^CRYPTO_INDEX_SIZE_LIMIT$'):
+        crypto._render_crypto_projection(p, pivots=ctx, page_limit=limit-1)
+    assert faults[-1][:2] == (name, limit-1)
     assert pub == snapshot and c1._c2_tree(root) == before
