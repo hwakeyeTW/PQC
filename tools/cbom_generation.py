@@ -66,7 +66,20 @@ def _properties(**values):
 
 
 def _version(value):
-    return value if type(value) is str and _SAFE_VERSION.fullmatch(value) else None
+    if type(value) is not str or not _SAFE_VERSION.fullmatch(value):
+        return None
+    # A dotted version can also encode an IPv4 address. Conservatively omit
+    # any four consecutive decimal octets, including zero padding, a suffix
+    # or surrounding numeric segments. This is a narrow display rule only;
+    # the recorded taxonomy/Portal identity remains unchanged.
+    parts = [int(part) for part in value.rstrip('abcdefghijklmnopqrstuvwxyz').split('.')]
+    if any(all(part <= 255 for part in parts[i:i + 4]) for i in range(len(parts) - 3)):
+        return None
+    return value
+
+
+def _version_state(value, displayed):
+    return 'MISSING' if value is None else 'RECORDED' if displayed is not None else 'UNSAFE_OMITTED'
 
 
 def _verified_taxonomy(published):
@@ -181,6 +194,7 @@ class _Projection:
                         and all(assessment._known(self.rows[eid]['algorithm'], *self.taxonomy) is not None
                                 for eid in seeds))
             version = _version(g['taxonomy_version'])
+            version_state = _version_state(g['taxonomy_version'], version)
             # A saved taxonomy ID is a validated slug. Never use observed_name.
             name = g['algorithm_id'] if verified else g['id']
             ref = self.ref('algorithm', g['id'])
@@ -189,10 +203,11 @@ class _Projection:
                 'cryptoProperties': {'assetType': 'algorithm', 'algorithmProperties': {'primitive': primitive}},
                 'properties': _properties(classification=g['classification'], family=g['family'],
                     primitive=g['primitive'], taxonomy_version=version,
-                    portal_group=g['id'])}
+                    taxonomy_version_state=version_state, portal_group=g['id'])}
             self.provenance(ref, 'ALGORITHM', eids, aids=aids, cids=cids, group=g['id'],
                 classification=g['classification'], family=g['family'], primitive=g['primitive'],
-                taxonomy_version=version, algorithm_id=g['algorithm_id'] if verified else None,
+                taxonomy_version=version, taxonomy_version_state=version_state,
+                algorithm_id=g['algorithm_id'] if verified else None,
                 taxonomy_version_sha256=None if g['taxonomy_version'] is None else hashlib.sha256(
                     g['taxonomy_version'].encode('ascii')).hexdigest(),
                 taxonomy_id_state='VERIFIED_SAVED_TAXONOMY' if verified else 'OPAQUE_RECORDED_ID',
@@ -235,27 +250,55 @@ class _Projection:
                     if matches and d['name'] == g['name'] and d['version'] == g['version']:
                         seeds.append(eid)
                 ref = self.ref('library', g['id'])
-            if not any(self.collections[self.rows[eid]['collection_id']]['collection_state'] in _USABLE
-                       for eid in seeds):
+            usable_seeds = [eid for eid in seeds if
+                            self.collections[self.rows[eid]['collection_id']]['collection_state'] in _USABLE]
+            if not usable_seeds:
                 self.omit('ACQUISITION_UNAVAILABLE', eids, aids, group=g['id'])
                 continue
-            # No arbitrary package/provider name, version or identity key.
-            name = g['name'] if g['name'] in _LIBRARY_NAMES and g['metadata_state'] != 'CONFLICT' else g['id']
+            # Group membership is a provenance pivot, not qualification of
+            # metadata. In particular, runtime evidence on a library asset
+            # cannot authorize fields from a failed ASSET_METADATA row.
+            metadata_seeds = [eid for eid in usable_seeds if kind != 'LIBRARY_ASSET'
+                              or self.rows[eid]['evidence_kind'] == 'ASSET_METADATA']
+            metadata_state = g['metadata_state']
+            raw_name = raw_version = None
+            if metadata_state != 'CONFLICT':
+                if metadata_seeds:
+                    # The existing group has no conflict, so qualified
+                    # same-host metadata must agree. Never choose a winner.
+                    values = {(self.rows[eid]['data']['name'], self.rows[eid]['data']['version'])
+                              for eid in metadata_seeds}
+                    _require(len(values) == 1)
+                    raw_name, raw_version = next(iter(values))
+                elif kind == 'LIBRARY_ASSET' and any(self.rows[eid]['evidence_kind'] == 'ASSET_METADATA'
+                                                       for eid in seeds):
+                    metadata_state = 'METADATA_UNAVAILABLE'
+                else:
+                    metadata_state = 'MISSING_METADATA'
+            # Retain the original Portal conflict even if only one of its
+            # rows is usable. Do not expose raw metadata or identity keys.
+            name = raw_name if raw_name in _LIBRARY_NAMES else g['id']
             ctype = 'application' if kind in ('OPENSSL_CLI', 'LEGACY_RUNTIME_METADATA') else 'library'
-            version = _version(g['version']) if g['metadata_state'] != 'CONFLICT' else None
-            version_state = ('CONFLICT' if g['metadata_state'] == 'CONFLICT' else
-                             'MISSING' if g['version'] is None else
-                             'RECORDED' if version is not None else 'UNSAFE_OMITTED')
+            version = _version(raw_version)
+            version_state = ('CONFLICT' if metadata_state == 'CONFLICT' else
+                             'UNAVAILABLE' if metadata_state == 'METADATA_UNAVAILABLE' else
+                             _version_state(raw_version, version))
+            self.charge(len(metadata_seeds) + (len(metadata_seeds) if name == raw_name else 0)
+                        + (len(metadata_seeds) if version is not None else 0))
+            metadata_ids = sorted(metadata_seeds)
             self.components[ref] = {'type': ctype, 'name': name, 'bom-ref': ref,
                 'properties': _properties(recorded_kind=kind, presence=g['presence'],
-                    metadata_state=g['metadata_state'], version_state=version_state, portal_group=g['id'])}
+                    metadata_state=metadata_state, version_state=version_state, portal_group=g['id'])}
             if version is not None:
                 self.components[ref]['version'] = version
             self.provenance(ref, kind, eids, aids=aids, cids=cids, group=g['id'],
-                            presence=g['presence'], metadata_state=g['metadata_state'],
-                            version_state=version_state, seed_evidence_ids=sorted(seeds))
-            if g['metadata_state'] in ('CONFLICT', 'MISSING_METADATA'):
-                self.omit('LIBRARY_' + g['metadata_state'], eids, aids, group=g['id'])
+                            presence=g['presence'], metadata_state=metadata_state,
+                            portal_metadata_state=g['metadata_state'], version_state=version_state,
+                            seed_evidence_ids=sorted(seeds), metadata_evidence_ids=metadata_ids,
+                            name_evidence_ids=metadata_ids if name == raw_name else [],
+                            version_evidence_ids=metadata_ids if version is not None else [])
+            if metadata_state in ('CONFLICT', 'MISSING_METADATA', 'METADATA_UNAVAILABLE'):
+                self.omit('LIBRARY_' + metadata_state, eids, aids, group=g['id'])
 
     def service_nodes(self):
         for aid, asset in self.assets.items():
@@ -385,11 +428,13 @@ class _Projection:
                 level, state = None, None
                 self.omit('LEGACY_USAGE_NOT_PROVEN', [eid])
             a = row['algorithm']
+            version = None if a is None else _version(a['taxonomy_version'])
             observations[eid] = {'collection_id': row['collection_id'], 'asset_id': row['asset_id'],
                 'source_kind': row['source']['source_kind'], 'evidence_kind': row['evidence_kind'],
                 'collection_state': c['collection_state'], 'level': level, 'observation_state': state,
                 'observed_at': row['observed_at'], 'algorithm': None if a is None else {
-                    'family': a['family'], 'primitive': a['primitive'], 'taxonomy_version': _version(a['taxonomy_version']),
+                    'family': a['family'], 'primitive': a['primitive'], 'taxonomy_version': version,
+                    'taxonomy_version_state': _version_state(a['taxonomy_version'], version),
                     'taxonomy_version_sha256': None if a['taxonomy_version'] is None else
                         hashlib.sha256(a['taxonomy_version'].encode('ascii')).hexdigest()}}
         claims = {}

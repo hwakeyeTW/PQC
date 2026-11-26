@@ -147,7 +147,7 @@ def s1_pair(assessed):
     return dict(format='S1_CFF_PAIR', projection_version='1.0.0', evidence_document_sha256=digest, per_host=entries)
 
 
-def publish(root, *, saved=True, cff=False, reverse=False, rid=RID):
+def publish(root, *, saved=True, cff=False, reverse=False, rid=RID, populate_extra=None):
     with rs.RunStore(root) as store, store.begin(**options(saved=saved, cff=cff, rid=rid)) as w:
         s = w.scope
         hosts = s['hosts']
@@ -161,6 +161,8 @@ def publish(root, *, saved=True, cff=False, reverse=False, rid=RID):
         for h in hosts:
             if h['target_id'] in TARGETS[:2]:
                 populate(doc, h, h['target_id'] == TARGETS[1])
+                if populate_extra is not None:
+                    populate_extra(doc, h, h['target_id'] == TARGETS[1])
         if reverse:
             for k in ('collections', 'assets', 'evidence'):
                 doc[k].reverse()
@@ -470,3 +472,184 @@ def test_actual_foreign_bom_reference_is_rejected(root, monkeypatch):
     with rs.RunStore(root) as store:
         with pytest.raises(generation.CBOMGenerationError, match='REFERENCE_DANGLING'):
             generation.build_cbom_bytes(store, RID, a)
+
+
+# R1 correction: real published Store rows, not a replacement validator or
+# direct calls to a mocked projection. Keep the original fixture assertions.
+def _r1_props(component):
+    return {p['name']: p['value'] for p in component['properties']}
+
+
+def _r1_row(pub, hid, key):
+    matches = [r for r in pub.document['evidence'] if r['host_id'] == hid
+               and r['observation_key'] == key]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _r1_node(bom, prov, kind, eid):
+    matches = [(ref, n) for ref, n in nodes(prov, kind).items()
+               if eid in n['seed_evidence_ids']]
+    assert len(matches) == 1
+    ref, node = matches[0]
+    return next(c for c in bom['components'] if c['bom-ref'] == ref), node
+
+
+def test_b1_r1_numeric_versions(root):
+    # Documentation-only IPv4 addresses, zero padding, suffixes and longer
+    # dotted strings. Ordinary safe versions must survive unchanged.
+    unsafe = ('192.0.2.123', '203.0.113.7', '0192.000.002.0123',
+              '198.51.100.7a', '999.203.0.113.7.999', '192.0.2.123.256')
+    safe = ('3.6.1', '3.6.1a', '256.1.2.3')
+    versions = unsafe + safe
+
+    def extra(doc, host, second):
+        if second:
+            return
+        for i, version in enumerate(versions):
+            suffix = str(i)
+            lib = asset(doc, host, 'library', 'r1-version-' + suffix)
+            scope(doc, host, 'packages', 'r1-pkg-' + suffix,
+                  [package('r1-pkg-' + suffix, 'openssl', version, True)])
+            scope(doc, host, 'openssl', 'r1-version-' + suffix,
+                  [metadata('r1-lib-' + suffix, 'openssl', version, lib),
+                   runtime('r1-alg-' + suffix, dict(alg('ML-KEM-768', 'KEM_CAPABILITY'),
+                           taxonomy_version=version), True)])
+
+    pub = publish(root, populate_extra=extra)
+    hid = host_id(pub, TARGETS[0])
+    bom, prov = build(root, hid)
+    wire = raw(bom).decode() + raw(prov).decode()
+    assert not any(v in wire for v in unsafe), 'unsafe version copied into generated wire'
+    for i, version in enumerate(versions):
+        allowed = version in safe
+        expected = version if allowed else None
+        state = 'RECORDED' if allowed else 'UNSAFE_OMITTED'
+        for kind, prefix in (('PACKAGE', 'r1-pkg-'), ('LIBRARY_ASSET', 'r1-lib-')):
+            row = _r1_row(pub, hid, prefix + str(i))
+            c, n = _r1_node(bom, prov, kind, row['evidence_id'])
+            assert c.get('version') == expected
+            assert n['version_state'] == _r1_props(c)['pqc:b1:version_state'] == state
+            assert n['version_evidence_ids'] == ([row['evidence_id']] if allowed else [])
+        row = _r1_row(pub, hid, 'r1-alg-' + str(i))
+        eid = row['evidence_id']
+        c, n = _r1_node(bom, prov, 'ALGORITHM', eid)
+        observation = prov['observations'][eid]['algorithm']
+        assert n['taxonomy_version'] == observation['taxonomy_version'] == expected
+        assert _r1_props(c).get('pqc:b1:taxonomy_version') == expected
+        assert n['taxonomy_version_state'] == observation['taxonomy_version_state'] == state
+        assert _r1_props(c)['pqc:b1:taxonomy_version_state'] == state
+        assert n['taxonomy_version_sha256'] == observation['taxonomy_version_sha256'] == hashlib.sha256(version.encode('ascii')).hexdigest()
+
+
+def _r1_library(doc, host, label, metadata_rows):
+    lib = asset(doc, host, 'library', 'r1-library-' + label)
+    scope(doc, host, 'openssl', 'r1-runtime-' + label,
+          [runtime('r1-runtime-' + label, alg('ML-KEM-768', 'KEM_CAPABILITY'), True, lib)])
+    for i, (state, name, version) in enumerate(metadata_rows):
+        key = 'r1-meta-' + label + '-' + str(i)
+        scope(doc, host, 'openssl', key, [metadata(key, name, version, lib)], state)
+
+
+def test_b1_r1_failed_metadata(root):
+    # The same synthetic identity on a second host is not a metadata source.
+    def extra(doc, host, second):
+        _r1_library(doc, host, 'mixed', [('COLLECTED' if second else 'ERROR', 'openssl', '9.9.9')])
+        if not second:
+            _r1_library(doc, host, 'unknown', [('UNKNOWN', 'openssl', '8.8.8')])
+
+    pub = publish(root, populate_extra=extra)
+    idx = portal_indexes.project_crypto_indexes(pub)
+    a, b = [host_id(pub, t) for t in TARGETS[:2]]
+    bom, prov = build(root, a)
+    for label, literal in (('mixed', '9.9.9'), ('unknown', '8.8.8')):
+        runtime_row = _r1_row(pub, a, 'r1-runtime-' + label)
+        failed = _r1_row(pub, a, 'r1-meta-' + label + '-0')
+        c, n = _r1_node(bom, prov, 'LIBRARY_ASSET', runtime_row['evidence_id'])
+        assert 'version' not in c and c['name'] != 'openssl', 'failed metadata promoted via runtime row'
+        assert literal not in raw(bom).decode() + raw(prov).decode()
+        group = next(g for g in idx['libraries']['groups'] if g['id'] == n['portal_group_id'])
+        assert group['metadata_state'] == n['portal_metadata_state'] == 'RECORDED_METADATA'
+        assert n['metadata_state'] == _r1_props(c)['pqc:b1:metadata_state'] == 'METADATA_UNAVAILABLE'
+        assert n['version_state'] == 'UNAVAILABLE'
+        assert n['metadata_evidence_ids'] == n['name_evidence_ids'] == n['version_evidence_ids'] == []
+        assert set(n['seed_evidence_ids']) == set(n['evidence_ids']) == {runtime_row['evidence_id'], failed['evidence_id']}
+        assert n['presence'] == 'UNKNOWN'
+        assert any(o['reason'] == 'LIBRARY_METADATA_UNAVAILABLE' and o['portal_group_id'] == group['id']
+                   and failed['evidence_id'] in o['evidence_ids'] for o in prov['omitted'])
+    other_bom, other = build(root, b)
+    good = _r1_row(pub, b, 'r1-meta-mixed-0')['evidence_id']
+    c, n = _r1_node(other_bom, other, 'LIBRARY_ASSET', good)
+    assert c['version'] == '9.9.9' and c['name'] == 'openssl'
+    assert n['metadata_state'] == 'RECORDED_METADATA'
+    assert n['metadata_evidence_ids'] == n['name_evidence_ids'] == n['version_evidence_ids'] == [good]
+    assert good not in raw(prov).decode()
+
+
+def test_b1_r1_metadata_qualification_controls(root):
+    cases = {
+        'usable': [('COLLECTED', 'openssl', '3.6.1')],
+        'partial': [('PARTIAL', 'openssl', '3.6.2a')],
+        'same': [('ERROR', 'openssl', '3.6.3'), ('COLLECTED', 'openssl', '3.6.3')],
+        'conflict': [('COLLECTED', 'openssl', '3.6.4'), ('PARTIAL', 'openssl', '3.6.5')],
+        'failed-conflict': [('COLLECTED', 'openssl', '3.6.6'), ('ERROR', 'openssl', '3.6.7')],
+        'missing': [],
+        'name-only': [('COLLECTED', 'openssl', None)],
+        'version-only': [('PARTIAL', None, '3.6.8')],
+    }
+
+    def extra(doc, host, second):
+        if not second:
+            for label, rows in cases.items():
+                _r1_library(doc, host, label, rows)
+
+    pub = publish(root, populate_extra=extra)
+    hid = host_id(pub, TARGETS[0])
+    bom, prov = build(root, hid)
+    for label, rows in cases.items():
+        runtime_eid = _r1_row(pub, hid, 'r1-runtime-' + label)['evidence_id']
+        c, n = _r1_node(bom, prov, 'LIBRARY_ASSET', runtime_eid)
+        qualified = sorted(_r1_row(pub, hid, 'r1-meta-' + label + '-' + str(i))['evidence_id']
+                           for i, (state, _, _) in enumerate(rows) if state in ('COLLECTED', 'PARTIAL'))
+        conflict = label in ('conflict', 'failed-conflict')
+        expected_name = None if conflict or not rows else rows[-1][1]
+        expected_version = None if conflict or not rows else rows[-1][2]
+        expected_state = ('CONFLICT' if conflict else 'MISSING_METADATA' if
+                          expected_name is None or expected_version is None else 'RECORDED_METADATA')
+        assert c['name'] == (expected_name or n['portal_group_id'])
+        assert c.get('version') == expected_version
+        assert n['metadata_state'] == n['portal_metadata_state'] == expected_state
+        assert n['metadata_evidence_ids'] == qualified
+        assert n['name_evidence_ids'] == (qualified if expected_name else [])
+        assert n['version_evidence_ids'] == (qualified if expected_version else [])
+        assert n['version_state'] == ('CONFLICT' if conflict else 'RECORDED' if expected_version else 'MISSING')
+        assert runtime_eid not in n['metadata_evidence_ids'] and n['presence'] == 'UNKNOWN'
+
+
+def test_b1_r1_package_runtime_metadata(root):
+    def extra(doc, host, second):
+        lib = asset(doc, host, 'library', 'r1-package-linked')
+        scope(doc, host, 'openssl', 'r1-package-runtime',
+              [runtime('r1-package-runtime', alg('ML-KEM-768', 'KEM_CAPABILITY'), True, lib)])
+        state = 'PARTIAL' if second else 'ERROR'
+        scope(doc, host, 'packages', 'r1-package',
+              [package('r1-package', 'openssl', '7.8.9', True, lib)], state)
+        provider = 'openssl'
+        scope(doc, host, 'openssl', portal_indexes._key('openssl-provider', provider),
+              [metadata('metadata', provider, '7.8.9')], state)
+
+    pub = publish(root, populate_extra=extra)
+    for target in TARGETS[:2]:
+        hid = host_id(pub, target)
+        bom, prov = build(root, hid)
+        pkg = _r1_row(pub, hid, 'r1-package')['evidence_id']
+        meta = _r1_row(pub, hid, 'metadata')['evidence_id']
+        if target == TARGETS[0]:
+            assert '7.8.9' not in raw(bom).decode() + raw(prov).decode()
+            assert not any(pkg in n['seed_evidence_ids'] for n in nodes(prov, 'PACKAGE').values())
+            assert not any(meta in n['seed_evidence_ids'] for n in nodes(prov, 'OPENSSL_PROVIDER').values())
+        else:
+            for kind, eid in (('PACKAGE', pkg), ('OPENSSL_PROVIDER', meta)):
+                c, n = _r1_node(bom, prov, kind, eid)
+                assert c['version'] == '7.8.9'
+                assert n['metadata_evidence_ids'] == n['name_evidence_ids'] == n['version_evidence_ids'] == [eid]

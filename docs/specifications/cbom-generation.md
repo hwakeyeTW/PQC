@@ -77,10 +77,24 @@ publish, a complete inventory or release acceptance.
   component; absence/unknown and failed metadata have explicit omission
   records. Explicit library/CLI/provider/linked-library observations are
   typed metadata, not proof of a library used by a service. Conflicting
-  metadata has no selected winner. Only a small fixed OpenSSL name allowlist
-  and narrow numeric version spellings are exposed; other names use opaque
-  group IDs and unqualified versions are omitted with state. An unknown
-  version is not a positive presence assertion.
+  metadata has no selected winner, including a conflict recorded by #21
+  between usable and unavailable rows. The original group ID and all pivot
+  references are retained; the B1 metadata state is independently qualified.
+  Library asset fields require their own same-host, same-asset ASSET_METADATA
+  rows from COLLECTED/PARTIAL collections. A usable runtime row may retain
+  the asset node, but cannot authorize failed or unknown metadata; such
+  metadata produces an opaque name, omitted version, METADATA_UNAVAILABLE
+  state and LIBRARY_METADATA_UNAVAILABLE omission. Package/runtime metadata
+  groups still require their matching usable seed rows. Provenance retains
+  portal_metadata_state, qualified metadata_evidence_ids and separate
+  name_evidence_ids/version_evidence_ids for emitted fields; pivot/seed IDs
+  alone do not prove a version. Only a small fixed OpenSSL name allowlist
+  and narrow numeric version spellings are exposed. Any four consecutive
+  decimal octets (0-255), including zero padding, suffixes and longer dotted
+  strings, are conservatively omitted even if a legitimate version is
+  ambiguous. Other names use opaque group IDs; unsafe versions are omitted
+  with UNSAFE_OMITTED state. An unknown version is not a positive presence
+  assertion.
 * A service node requires an actual service asset. A protocol node requires
   an original same-host validated negotiation context, or a fixed legacy
   `tls-services` scope with a recognized typed `tls-protocol` observation.
@@ -102,8 +116,12 @@ publish, a complete inventory or release acceptance.
   CFF classification is distinct from #21 grouping classification. Raw
   targets, endpoints, source origin refs, paths, hostvars, raw input values,
   arbitrary names, debug text, key material and external URLs are not copied.
-  Unqualified taxonomy version strings are represented by hash and omitted
-  display version; no untrusted free-text label is promoted to a name.
+  Unqualified taxonomy version strings, including ambiguous dotted octets,
+  are represented by hash and omitted display version. The same version
+  filter and explicit taxonomy_version_state apply to algorithm properties,
+  node provenance and observation provenance without changing the original
+  taxonomy identity or classification. No untrusted free-text label is
+  promoted to a name.
   Missing or conflicted metadata and unproven relationships have fixed
   reason codes. Both BOM metadata and the sidecar distinguish the host/run
   state and B1-only scope. The sidecar retains attempted/recovery state,
