@@ -653,3 +653,379 @@ def test_b1_r1_package_runtime_metadata(root):
                 c, n = _r1_node(bom, prov, kind, eid)
                 assert c['version'] == '7.8.9'
                 assert n['metadata_evidence_ids'] == n['name_evidence_ids'] == n['version_evidence_ids'] == [eid]
+
+
+# B2: use the actual fixed C1/C2 producer, Store and A validator. No synthetic
+# PublishedRun can enter the public generator, even in a negative control.
+def _b2_build(root, hid, rid):
+    with rs.RunStore(root) as store:
+        b, p = generation.build_cbom_bytes(store, rid, hid, include_certificates=True)
+    assert validation.validate_cbom_bytes(b) == validation.ValidationResult()
+    assert raw(json.loads(b)) == b and raw(json.loads(p)) == p
+    assert json.loads(p)['bom_sha256'] == hashlib.sha256(b).hexdigest()
+    return json.loads(b), json.loads(p)
+
+
+def _b2_component(bom, ref, subtype, block):
+    c = next(x for x in bom['components'] if x['bom-ref'] == ref)
+    assert c['type'] == 'cryptographic-asset' and c['cryptoProperties']['assetType'] == subtype
+    return c['cryptoProperties'][block]
+
+
+def test_b2_actual_c2_multihost_role_identity_and_no_writes(root, monkeypatch):
+    import test_run_store_v2_certificate as c1
+    from tools import portal_asset_indexes as ai
+    pub = c1._c2_open(root, ('complete', 'complete'), assessed=True)
+    idx = ai.project_asset_indexes(pub)
+    before = c1._c2_tree(root); original = deepcopy(pub)
+    def deny(*args, **kwargs):
+        pytest.fail('network attempted')
+    monkeypatch.setattr(socket, 'socket', deny)
+    monkeypatch.setattr(urllib.request, 'urlopen', deny)
+    seen_refs = set()
+    for hid in pub.manifest['expected_host_ids']:
+        b, p = _b2_build(root, hid, c1.RID)
+        assert p['coverage']['certificate_key_scope'] == 'B2_CERTIFICATE_KEY'
+        assert p['coverage']['deferred_asset_ids'] == [] and b['dependencies'] == []
+        assert len(nodes(p, 'CERTIFICATE')) == len(nodes(p, 'PUBLIC_KEY')) == 2
+        assert not seen_refs.intersection(p['nodes']); seen_refs.update(p['nodes'])
+        expected = {r['evidence_id'] for r in pub.document['evidence'] if r['host_id'] == hid}
+        assert set(p['observations']) == expected
+        for ref, n in nodes(p, 'CERTIFICATE').items():
+            g = next(g for g in idx['certificates']['groups'] if g['id'] == n['portal_group_id'])
+            occ = {oid: idx['occurrences'][oid] for oid in g['recorded_occurrence_ids']
+                   if idx['occurrences'][oid]['host_id'] == hid}
+            assert n['certificate_fingerprint_sha256'] == g['fingerprint']
+            assert n['identity_basis'] == 'RECORDED_FINGERPRINT'
+            assert set(n['recorded_occurrence_ids']) == set(n['verified_occurrence_ids']) == set(occ)
+            assert len(occ) == (3 if g['fingerprint'] == c1.digest('public-fixture-0') else 1)
+            assert set(n['asset_ids']) == {o['asset_id'] for o in occ.values()}
+            assert set(n['evidence_ids']) == set(g['evidence_ids']) & expected
+            assert set(n['occurrences']) == set(occ)
+            for oid, proof in n['occurrences'].items():
+                assert proof == {k: occ[oid][k] for k in ('asset_id', 'collection_id', 'detail_sha256',
+                                                         'detail_state', 'role_evidence_ids')}
+            cp = _b2_component(b, ref, 'certificate', 'certificateProperties')
+            assert cp['notValidBefore'] == c1.START and cp['notValidAfter'] == '2027-01-01T00:00:00Z'
+            assert n['validity_state'] == 'RECORDED' and set(n['validity_occurrence_ids']) == set(occ)
+            assert 'issuerName' not in cp and 'subjectName' not in cp
+            key_ref = cp['subjectPublicKeyRef']; sig_ref = cp['signatureAlgorithmRef']
+            key = p['nodes'][key_ref]
+            kp = _b2_component(b, key_ref, 'related-crypto-material', 'relatedCryptoMaterialProperties')
+            assert key['identity_basis'] == 'CERTIFICATE_BOUND_SUBJECT_KEY'
+            assert key['certificate_ref'] == ref and key['key_fingerprint_sha256'] is None
+            assert kp['type'] == 'public-key' and kp['size'] == 2048 and 'value' not in kp
+            assert set(key['size_occurrence_ids']) == set(occ)
+            assert p['nodes'][sig_ref]['primitive'] == 'SIGNATURE'
+            assert p['nodes'][kp['algorithmRef']]['primitive'] == 'PUBLIC_KEY'
+            sig_ids = {o['role_evidence_ids']['signature'] for o in occ.values()}
+            key_ids = {o['role_evidence_ids']['public-key'] for o in occ.values()}
+            assert set(n['signature_role']['evidence_ids']) == sig_ids
+            assert set(key['evidence_ids']) == key_ids
+            for fr, to, kind, ids in ((ref, sig_ref, 'CERTIFICATE_SIGNATURE_ALGORITHM', sig_ids),
+                    (ref, key_ref, 'CERTIFICATE_SUBJECT_PUBLIC_KEY', key_ids),
+                    (key_ref, kp['algorithmRef'], 'PUBLIC_KEY_ALGORITHM', key_ids)):
+                assert {r['evidence_id'] for r in p['relationships'] if
+                        (r['from'], r['to'], r['kind']) == (fr, to, kind)} == ids
+        assert {r['kind'] for r in p['relationships']} == {'CERTIFICATE_SIGNATURE_ALGORITHM',
+            'CERTIFICATE_SUBJECT_PUBLIC_KEY', 'PUBLIC_KEY_ALGORITHM'}
+        text = raw(b).decode() + raw(p).decode()
+        assert all(x not in text for x in ('CN=Fixture issuer', 'CN=Fixture certificate', *c1.TARGETS))
+        assert all(o['target_id'] not in text and o['source_id'] not in text
+                   for o in idx['occurrences'].values())
+    hid = pub.manifest['expected_host_ids'][0]
+    first = _b2_build(root, hid, c1.RID)
+    assert _b2_build(root, hid, c1.RID) == first
+    with rs.RunStore(root) as store:
+        assert generation.build_cbom(store, c1.RID, hid, include_certificates=True) == first
+        old = generation.build_cbom_bytes(store, c1.RID, hid)
+        assert generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=False) == old
+        assert json.loads(old[1])['coverage']['certificate_key_scope'] == 'DEFERRED_B2'
+        assert not nodes(json.loads(old[1]), 'CERTIFICATE') and not nodes(json.loads(old[1]), 'PUBLIC_KEY')
+        assert store.open(c1.RID) == pub
+    assert pub == original and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('variant', ['disjoint-dates', 'conflict', 'unknown', 'unknown-role'])
+def test_b2_actual_c2_host_local_metadata_and_gaps(root, monkeypatch, variant):
+    import test_run_store_v2_certificate as c1
+    original = c1.envelope
+    def varied(target, mode='complete', *, large=False):
+        env = original(target, mode, large=large)
+        for value in env['records'][1]['snapshot']['roots'].values():
+            for src in value['sources']:
+                for block in src['blocks']:
+                    cert = block['certificate']
+                    if variant == 'disjoint-dates':
+                        cert['not_after' if target == c1.TARGETS[0] else 'not_before'] = None
+                    elif target == c1.TARGETS[1] and variant == 'conflict':
+                        cert.update(issuer='CN=' + SECRET, public_key_bits=4096,
+                                    signature_outer='sha384WithRSAEncryption', not_before='2028-01-01T00:00:00Z')
+                    elif target == c1.TARGETS[1] and variant == 'unknown-role':
+                        cert.update(public_key_algorithm='opaque-fixture-key',
+                                    signature_inner='opaque-fixture-signature',
+                                    signature_outer='opaque-fixture-signature')
+                    elif target == c1.TARGETS[1]:
+                        cert.update(public_key_algorithm=None, public_key_bits=None,
+                                    signature_inner=None, signature_outer=None)
+                    cert['gaps'] = c1.ca.metadata_gaps(cert)
+                    block['reason'] = 'METADATA_GAP' if cert['gaps'] else 'OK'
+        return env
+    monkeypatch.setattr(c1, 'envelope', varied)
+    pub = c1._c2_open(root, ('complete', 'complete'))
+    for i, target in enumerate(c1.TARGETS[:2]):
+        b, p = _b2_build(root, host_id(pub, target), c1.RID)
+        for ref, n in nodes(p, 'CERTIFICATE').items():
+            cp = _b2_component(b, ref, 'certificate', 'certificateProperties')
+            if variant == 'disjoint-dates':
+                assert n['validity_state'] == 'PARTIAL' and n['validity_occurrence_ids'] == []
+                assert ('notValidBefore' in cp) == (i == 0)
+                assert ('notValidAfter' in cp) == (i == 1)
+                assert n['field_support']['not_before']['state'] == ('RECORDED' if i == 0 else 'UNKNOWN')
+                assert n['field_support']['not_after']['state'] == ('UNKNOWN' if i == 0 else 'RECORDED')
+            elif i == 1 and variant == 'conflict':
+                assert n['validity_state'] == 'CONFLICT' and n['validity_occurrence_ids'] == []
+                assert n['signature_role']['state'] == 'CONFLICT'
+                assert not {'notValidBefore', 'notValidAfter', 'signatureAlgorithmRef'} & cp.keys()
+                assert {'SIGNATURE_CONFLICT', 'VALIDITY_CONFLICT'} <= set(n['metadata_gaps'])
+            else:
+                assert n['validity_state'] == 'RECORDED'
+                assert cp['notValidBefore'] == c1.START and cp['notValidAfter'] == '2027-01-01T00:00:00Z'
+            if variant in ('unknown', 'unknown-role') and i == 1:
+                assert not {'subjectPublicKeyRef', 'signatureAlgorithmRef'} & cp.keys()
+                assert n['public_key_role']['state'] == n['signature_role']['state'] == 'UNKNOWN'
+                if variant == 'unknown':
+                    assert not nodes(p, 'PUBLIC_KEY')
+                else:
+                    kref, key = next((r, k) for r, k in nodes(p, 'PUBLIC_KEY').items()
+                                      if k['certificate_ref'] == ref)
+                    assert key['key_fingerprint_sha256'] is None and key['algorithm_state'] == 'UNKNOWN'
+                    assert _b2_component(b, kref, 'related-crypto-material',
+                        'relatedCryptoMaterialProperties') == {'type': 'public-key', 'size': 2048}
+            else:
+                kp = _b2_component(b, cp['subjectPublicKeyRef'], 'related-crypto-material', 'relatedCryptoMaterialProperties')
+                assert kp['size'] == (4096 if variant == 'conflict' and i == 1 else 2048)
+                if not (variant == 'conflict' and i == 1):
+                    assert 'signatureAlgorithmRef' in cp
+        assert all(v not in raw(b).decode() + raw(p).decode() for v in
+                   (SECRET, 'opaque-fixture-key', 'opaque-fixture-signature'))
+
+
+def test_b2_actual_coverage_disabled_unreachable_missing(root):
+    import test_run_store_v2_certificate as c1
+    pub = c1._c2_open(root, ('complete', 'disabled', 'connection'))
+    for i, target in enumerate(c1.TARGETS):
+        b, p = _b2_build(root, host_id(pub, target), c1.RID)
+        cov = next(r for r in p['coverage']['certificate_collections'] if r['slot'] == 'system_certs')
+        assert cov['detail_slot_state'] == ('VERIFIED_COMPANION', 'NOT_REQUIRED', 'REQUIRED_DETAIL_MISSING')[i]
+        if i:
+            assert not nodes(p, 'CERTIFICATE') and not nodes(p, 'PUBLIC_KEY')
+            assert b['components'] == b['dependencies'] == []
+            assert cov['state'] == ('NOT_SCANNED' if i == 1 else 'UNREACHABLE')
+            assert cov['requested'] is (i == 2)
+
+
+def test_b2_actual_standalone_ssh_and_unqualified_metadata(root):
+    from tools import ssh_posture as ssh
+    rid, target = 'b2-ssh-fixture', TARGETS[0]
+    source = dict(source_kind='SYNTHETIC', producer_id=ssh.PRODUCER, producer_version=ssh.VERSION,
+                  origin_ref='fixture', input_sha256=None)
+    fp = hashlib.sha256(b'fixture-public-key').hexdigest()
+    snapshot = dict(flags=dict(zip(ssh.FLAGS, (False, True))), platform_status='UNVERIFIED',
+                    context_refs=['global-default'], slots={})
+    for slot in ssh.slots(snapshot):
+        snapshot['slots'][slot] = dict(state='NOT_SCANNED', reason='DISABLED_BY_USER', rc=None, rows=[], gaps=[])
+    snapshot['slots']['keys'] = dict(state='PARTIAL', reason='KEY_GAP', rc=None, gaps=['KEY_TYPE_UNKNOWN'], rows=sorted([
+        dict(source_ref=ssh.digest('key', ['fixture', 1]), key_type='ssh-ed25519', bits=256,
+             fingerprint_sha256=fp, grammar='KNOWN'),
+        dict(source_ref=ssh.digest('key', ['fixture', 2]), key_type='ssh-unknown-fixture', bits=None,
+             fingerprint_sha256=hashlib.sha256(b'fixture-unknown-key').hexdigest(), grammar='UNKNOWN_TYPE')],
+        key=lambda r: r['source_ref']))
+    # The original R V2 Store is certificate-only, and S1 binds short IDs.
+    # Generate the exact #17 typed asset/metadata first, then explicitly
+    # publish its synthetic S1 representation, not a fake native handoff.
+    flags = {f: f == 'ssh_host_keys' for f in rs.COLLECTORS}
+    with rs.RunStore(root) as store, store.begin(run_id=rid, run_kind='SYNTHETIC',
+            evidence_schema_version='1.1.0', source=source, started_at=STAMP, recorded_at=END,
+            expected_hosts=[dict(target_id=target, inventory_authority_id=None, identity_key=target)],
+            limits=LIMITS, profile='baseline', requested_flags={target: flags},
+            requirements=dict(assessment=False, cff=False, details=[])) as w:
+        s = w.scope; h = s['hosts'][0]; h.update(host_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION')
+        doc = rs._doc(s, [h], 'PARTIAL', finished_at=END, coverage_reason='INCOMPLETE_COLLECTION')
+        original, detail = ssh.normalize_ssh(doc, h['host_id'], snapshot, source, STAMP, RULES)
+        original_keys = {a['asset_id']: a for a in original['assets']}
+        assert len(original_keys) == 1
+        key_scope = next(c for c in original['collections'] if c['scope_key'] == 'ssh-keys')
+        records = []
+        for r in original['evidence']:
+            if r['collection_id'] != key_scope['collection_id'] or r['evidence_kind'] != 'ASSET_METADATA':
+                continue
+            a = None
+            if r['asset_id'] is not None:
+                a = asset(doc, h, 'public_key', original_keys[r['asset_id']]['identity_key'])
+                assert a['asset_id'] == r['asset_id']
+            records.append((r['observation_key'], r['evidence_kind'], r['data'], r['algorithm'], a))
+        scope(doc, h, 'ssh_host_keys', 'ssh-keys', records, 'PARTIAL')
+        fake = asset(doc, h, 'public_key', 'sha256-' + '9' * 64)
+        scope(doc, h, 'ssh_host_keys', 'failed-keys', [metadata('public-' + '8' * 64, fake['identity_key'], None, fake)], 'ERROR')
+        # A usable generic asset is also not #17's typed source.
+        generic = asset(doc, h, 'public-key', 'sha256-' + '7' * 64)
+        scope(doc, h, 'ssh_host_keys', 'generic-keys', [metadata('other-key', generic['identity_key'], None, generic)])
+        doc = json.loads(e.canonical_bytes(doc))
+        terminal = dict(target_id=target, host_state='PARTIAL', attempted=True,
+            reason_code='INCOMPLETE_COLLECTION', collectors=[dict(collector_id=f,
+                requested=flags[f], state='PARTIAL' if flags[f] else 'NOT_SCANNED',
+                reason_code='INCOMPLETE_COLLECTION' if flags[f] else 'DISABLED',
+                rc=0 if flags[f] else None, collection_ids=sorted(c['collection_id']
+                    for c in doc['collections'] if c['collector_id'] == f)) for f in sorted(flags)])
+        w.dispatch_intent(h['host_id'])
+        w.record_host(rs.host_fragment(doc, h['host_id']), attempted=True, terminal=terminal)
+        batch = raw(dict(batch_manifest_version=1, target_ids=[target], target_count=1,
+            limits=LIMITS, profile='baseline', run_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION',
+            hosts=[terminal]))
+        w.finalize(doc, batch_raw=batch, batch_rc=5)
+    b, p = _b2_build(root, h['host_id'], rid)
+    assert len(nodes(p, 'PUBLIC_KEY')) == 1 and not nodes(p, 'CERTIFICATE')
+    ref, n = next(iter(nodes(p, 'PUBLIC_KEY').items()))
+    assert n['identity_basis'] == 'SYNTHETIC_S1_RECORDED_PUBLIC_KEY_FINGERPRINT'
+    assert n['key_fingerprint_sha256'] == fp
+    assert n['algorithm_state'] == n['size_state'] == 'UNKNOWN'
+    assert _b2_component(b, ref, 'related-crypto-material', 'relatedCryptoMaterialProperties') == {'type': 'public-key'}
+    assert not p['relationships'] and not b['dependencies']
+    assert {aid for o in p['omitted'] if o['reason'] == 'STANDALONE_PUBLIC_KEY_UNAVAILABLE'
+            for aid in o['asset_ids']} == {fake['asset_id'], generic['asset_id']}
+    with rs.RunStore(root) as store:
+        _, old = generation.build_cbom(store, rid, h['host_id'])
+    assert not nodes(old, 'PUBLIC_KEY') and len(old['coverage']['deferred_asset_ids']) == 3
+
+
+def test_b2_actual_legacy_certificate_unknown_and_cff(root):
+    from tools import cff
+    rid, target = 'b2-legacy-fixture', TARGETS[0]
+    legacy_raw = b'{"fixture":"anonymous B2 legacy bytes"}'
+    source = dict(source_kind='LEGACY_IMPORT', producer_id='legacy-per-host', producer_version='1.0.0',
+                  origin_ref='fixture', input_sha256=hashlib.sha256(legacy_raw).hexdigest())
+    with rs.RunStore(root) as store, store.begin(run_id=rid, run_kind='LEGACY_IMPORT',
+            evidence_schema_version='1.0.0', source=source, started_at=STAMP, recorded_at=END,
+            expected_hosts=[dict(target_id=target, inventory_authority_id=None, identity_key=target)],
+            requirements=dict(assessment=True, cff=True, details=[]), legacy_raw=legacy_raw,
+            legacy_provenance=dict(format_version='1.0.0', source=source, original_run_id=None,
+                                   original_generated_at=None, diagnostics=[])) as w:
+        s = w.scope; h = s['hosts'][0]; h.update(host_state='PARTIAL', reason_code='INCOMPLETE_COLLECTION')
+        doc = rs._doc(s, [h], 'PARTIAL', finished_at=END, coverage_reason='INCOMPLETE_COLLECTION')
+        cert = asset(doc, h, 'certificate', 'legacy-opaque-identity')
+        scope(doc, h, 'legacy-import', 'system-certificates', [
+            metadata('legacy-' + 'a' * 64, 'system-certificates', None, cert),
+            ('legacy-key', 'LEGACY_OBSERVATION', dict(field='public-key-algorithm', value='rsaEncryption'),
+             alg('rsaEncryption', 'CERT_PUBLIC_KEY'), cert),
+            ('legacy-key-conflict', 'LEGACY_OBSERVATION', dict(field='public-key-type', value='id-ecPublicKey'),
+             alg('id-ecPublicKey', 'CERT_PUBLIC_KEY'), cert),
+            ('legacy-signature', 'LEGACY_OBSERVATION', dict(field='signature-algorithm', value='sha256WithRSAEncryption'),
+             alg('sha256WithRSAEncryption', 'SIGNATURE'), cert),
+            ('legacy-bits', 'LEGACY_OBSERVATION', dict(field='public-key-bits', value=4096), None, cert)], 'PARTIAL')
+        doc = json.loads(e.canonical_bytes(doc)); assessed = assessment.evaluate_document(doc, RULES)
+        w.record_host(rs.host_fragment(doc, h['host_id']), attempted=None, terminal=None)
+        w.finalize(doc, assessed=assessed, rules_raw=RULES_RAW, cff=cff.project_cff(assessed, RULES))
+    b, p = _b2_build(root, h['host_id'], rid)
+    assert p['coverage']['cff_state'] == 'VERIFIED_SAVED_PAIR'
+    ref, n = next(iter(nodes(p, 'CERTIFICATE').items()))
+    assert n['identity_basis'] == 'LEGACY_RUN_SCOPED' and n['certificate_fingerprint_sha256'] is None
+    assert n['validity_state'] == 'UNKNOWN' and n['verified_occurrence_ids'] == []
+    assert n['public_key_role']['state'] == 'CONFLICT' and n['signature_role']['state'] == 'UNVERIFIED'
+    assert _b2_component(b, ref, 'certificate', 'certificateProperties') == {}
+    ref, n = next(iter(nodes(p, 'PUBLIC_KEY').items()))
+    assert n['key_fingerprint_sha256'] is None and n['size_occurrence_ids'] == []
+    assert _b2_component(b, ref, 'related-crypto-material', 'relatedCryptoMaterialProperties') == {'type': 'public-key'}
+    assert not p['relationships'] and not b['dependencies']
+
+
+def test_b2_actual_foreign_tampered_companion_and_mode(root):
+    import test_run_store_v2_certificate as c1
+    pub = c1._c2_open(root, ('complete', 'complete'))
+    hid, foreign = pub.manifest['expected_host_ids']
+    with rs.RunStore(root) as store:
+        for value in (0, 1, None, 'true', [], {}):
+            with pytest.raises(generation.CBOMGenerationError, match='CBOM_INPUT_TYPE'):
+                generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=value)
+        with pytest.raises(generation.CBOMGenerationError, match='CBOM_INPUT_TYPE'):
+            generation.build_cbom(pub, c1.RID, hid, include_certificates=True)
+        with pytest.raises(generation.CBOMGenerationError, match='CBOM_HOST_NOT_FOUND'):
+            generation.build_cbom_bytes(store, c1.RID, 'h-' + '0' * 64, include_certificates=True)
+    path = root / c1.RID
+    manifest = deepcopy(pub.manifest)
+    relative = f'details/{hid}/{c1.v2.CERTIFICATE}.json'
+    content = json.loads(pub.artifacts[relative]); content['occurrences'][0]['host_id'] = foreign
+    c1.reindex(path, manifest, relative, c1.ca.canonical(content))
+    (path / 'run_manifest.json').write_bytes(raw(manifest))
+    with rs.RunStore(root) as store:
+        with pytest.raises(generation.CBOMGenerationError, match='CBOM_SOURCE_INVALID'):
+            generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=True)
+
+
+def test_b2_actual_validator_typed_reference_and_combined_caps(root, monkeypatch):
+    import test_run_store_v2_certificate as c1
+    pub = c1._c2_open(root, ('complete',))
+    hid = pub.manifest['expected_host_ids'][0]
+    before = c1._c2_tree(root)
+    b, p = _b2_build(root, hid, c1.RID)
+    with rs.RunStore(root) as store:
+        # A cap that permits B1 must still reject the additional B2 work.
+        baseline = generation._Projection(store.open(c1.RID), hid)
+        baseline.finish()
+        with monkeypatch.context() as m:
+            m.setattr(generation, 'MAX_MEMBERSHIPS', baseline.cost)
+            generation.build_cbom_bytes(store, c1.RID, hid)
+            with pytest.raises(generation.CBOMGenerationError, match='CBOM_MEMBERSHIP_LIMIT'):
+                generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=True)
+        for cap, limit, code in (('MAX_BYTES', len(raw(b)) + len(raw(p)) - 1, 'CBOM_SIZE_LIMIT'),
+                                 ('MAX_MEMBERSHIPS', 5, 'CBOM_MEMBERSHIP_LIMIT')):
+            with monkeypatch.context() as m:
+                m.setattr(generation, cap, limit)
+                with pytest.raises(generation.CBOMGenerationError, match=code):
+                    generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=True)
+        original = generation._Projection.finish
+        for field, mode, code in (('signatureAlgorithmRef', 'foreign', 'REFERENCE_DANGLING'),
+                                  ('signatureAlgorithmRef', 'key', 'REFERENCE_TYPE'),
+                                  ('subjectPublicKeyRef', 'algorithm', 'REFERENCE_TYPE'),
+                                  ('algorithmRef', 'certificate', 'REFERENCE_TYPE')):
+            def invalid(self):
+                bom, prov = original(self)
+                cert = next(x for x in bom['components'] if x['cryptoProperties']['assetType'] == 'certificate')
+                cp = cert['cryptoProperties']['certificateProperties']
+                key = next(x for x in bom['components'] if x['bom-ref'] == cp['subjectPublicKeyRef'])
+                targets = {'foreign': 'cbom-' + '0' * 64, 'key': key['bom-ref'],
+                           'algorithm': cp['signatureAlgorithmRef'], 'certificate': cert['bom-ref']}
+                if field == 'algorithmRef':
+                    key['cryptoProperties']['relatedCryptoMaterialProperties'][field] = targets[mode]
+                else:
+                    cp[field] = targets[mode]
+                return bom, prov
+            with monkeypatch.context() as m:
+                m.setattr(generation._Projection, 'finish', invalid)
+                with pytest.raises(generation.CBOMGenerationError, match=code):
+                    generation.build_cbom_bytes(store, c1.RID, hid, include_certificates=True)
+    assert c1._c2_tree(root) == before
+
+
+def test_b2_actual_s1_opaque_certificate_preserves_b1_graph(root):
+    pub = publish(root, cff=True)
+    for target in TARGETS[:2]:
+        hid = host_id(pub, target)
+        old, op = build(root, hid)
+        b, p = _b2_build(root, hid, RID)
+        assert p['coverage']['cff_state'] == op['coverage']['cff_state'] == 'VERIFIED_SAVED_PAIR'
+        assert p['coverage']['cff_sha256'] == op['coverage']['cff_sha256']
+        assert p['claims'] == op['claims'] and p['observations'] == op['observations']
+        assert b['dependencies'] == old['dependencies'] and b['services'] == old['services']
+        assert p['relationships'] == op['relationships']
+        assert all(p['nodes'][ref] == n for ref, n in op['nodes'].items())
+        assert all(x in b['components'] for x in old['components'])
+        ref, n = next(iter(nodes(p, 'CERTIFICATE').items()))
+        assert len(nodes(p, 'CERTIFICATE')) == 1 and not nodes(p, 'PUBLIC_KEY')
+        assert n['identity_basis'] == 'UNVERIFIED_IDENTITY' and n['certificate_fingerprint_sha256'] is None
+        assert n['recorded_occurrence_ids'] == n['verified_occurrence_ids'] == []
+        assert n['validity_state'] == 'UNKNOWN' and n['public_key_role']['state'] == 'UNKNOWN'
+        assert _b2_component(b, ref, 'certificate', 'certificateProperties') == {}
+        assert p['coverage']['deferred_asset_ids'] == []
+        assert op['coverage']['deferred_asset_ids'] == n['asset_ids']
+        assert SECRET not in raw(b).decode() + raw(p).decode()
