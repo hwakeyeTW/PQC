@@ -461,3 +461,171 @@ def render_summary_exports(published):
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('SUMMARY_RENDER_ERROR') from None
     return p, pages, exports
+
+
+# Certificate CSV B is a separate preview contract. Do not add its output to
+# the already published A API or treat an in-memory buffer as a generation.
+_CERT_METADATA_FIELDS = ('public_key_algorithm', 'public_key_bits', 'signature_inner',
+                         'signature_outer', 'issuer', 'subject', 'not_before', 'not_after')
+_CERT_COUNTS = ('host_ids', 'asset_ids', 'evidence_ids', 'claim_ids',
+                'recorded_occurrence_ids', 'verified_occurrence_ids')
+_CERT_COUNT_COLUMNS = tuple(k.removesuffix('_ids') + '_count' for k in _CERT_COUNTS)
+_CERT_JSON_COLUMNS = frozenset((*_CERT_COUNTS, 'asset_identity_scopes', 'role_evidence_ids',
+    'public_key_evidence_ids', 'signature_evidence_ids', 'public_key_bits_evidence_ids',
+    'metadata_gaps', 'validity_occurrence_ids', 'algorithm_group_ids', 'algorithm_links',
+    'service_group_ids', 'collection_ids', 'collection_states',
+    *('metadata_' + k + '_occurrence_ids' for k in _CERT_METADATA_FIELDS)))
+_CERT_NUMERIC_COLUMNS = frozenset((*_CERT_COUNT_COLUMNS, 'block_index', 'public_key_bits',
+                                  'metadata_public_key_bits'))
+_CERT_BOOLEAN_COLUMNS = frozenset(('assessed', 'requested', 'terminal_retained'))
+_CERTIFICATE_COLUMNS = (
+    'run_id', 'row_kind', 'assessed', 'group_id', 'group_kind', 'fingerprint', 'source_kind',
+    'occurrence_id', 'host_id', 'asset_id', 'identity_scope', 'collection_id', 'root',
+    'source_id', 'target_id', 'block_index', 'detail_ref', 'detail_sha256', 'observed_at',
+    'producer_id', 'producer_version', 'origin_ref', 'input_sha256',
+    'detail_state', 'reason_code', 'host_state', 'host_reason_code',
+    *_CERT_COUNT_COLUMNS, *_CERT_COUNTS, 'asset_identity_scopes', 'role_evidence_ids',
+    'public_key_state', 'public_key_evidence_ids', 'signature_state', 'signature_evidence_ids',
+    'public_key_bits', 'public_key_bits_state', 'public_key_bits_evidence_ids',
+    'issuer', 'subject', 'not_before', 'not_after', 'validity_state', 'validity_occurrence_ids',
+    'signature_metadata_state', 'metadata_gaps',
+    *(name for k in _CERT_METADATA_FIELDS for name in ('metadata_' + k,
+        'metadata_' + k + '_state', 'metadata_' + k + '_occurrence_ids')),
+    'algorithm_group_ids', 'algorithm_links', 'service_binding_state', 'service_group_ids',
+    'slot', 'requested', 'state', 'rc', 'basis', 'terminal_retained', 'slot_state',
+    'detail_slot_state', 'collection_ids', 'collection_states')
+
+
+def _certificate_rows(p):
+    """Flatten only the closed C2 certificate/coverage projection, not evidence payloads."""
+    index = p['certificates']
+    groups = sorted(index['groups'], key=lambda g: g['id'])
+    membership = {}
+    for g in groups:
+        for oid in g['recorded_occurrence_ids']:
+            _require(oid not in membership)
+            membership[oid] = g['id']
+        row = dict(row_kind='GROUP', assessed=p['assessed'], group_id=g['id'], group_kind=g['kind'])
+        for k in ('fingerprint', 'source_kind', 'detail_state', 'public_key_bits', 'public_key_bits_state',
+                  'public_key_bits_evidence_ids', 'issuer', 'subject', 'not_before', 'not_after',
+                  'validity_state', 'validity_occurrence_ids', 'signature_metadata_state', 'metadata_gaps',
+                  'algorithm_group_ids', 'algorithm_links', 'service_binding_state', 'service_group_ids',
+                  *_CERT_COUNTS):
+            row[k] = g[k]
+        for field, column in zip(_CERT_COUNTS, _CERT_COUNT_COLUMNS):
+            row[column] = g['counts'][field]
+        row['asset_identity_scopes'] = {aid: p['assets'][aid]['identity_scope'] for aid in g['asset_ids']}
+        for role in ('public_key', 'signature'):
+            row[role + '_state'] = g[role]['state']
+            row[role + '_evidence_ids'] = g[role]['evidence_ids']
+        for field in _CERT_METADATA_FIELDS:
+            meta = g['metadata_fields'][field]
+            row['metadata_' + field] = meta['value']
+            row['metadata_' + field + '_state'] = meta['state']
+            row['metadata_' + field + '_occurrence_ids'] = meta['occurrence_ids']
+        yield row
+    _require(set(membership) == set(p['occurrences']) == set(index['recorded_occurrence_ids']))
+    for oid, r in sorted(p['occurrences'].items()):
+        row = dict(row_kind='OCCURRENCE', assessed=p['assessed'], group_id=membership[oid], occurrence_id=oid,
+                   identity_scope=p['assets'][r['asset_id']]['identity_scope'], **_source(r['source']))
+        for k in ('fingerprint', 'host_id', 'asset_id', 'collection_id', 'root', 'source_id', 'target_id',
+                  'block_index', 'detail_ref', 'detail_sha256', 'observed_at', 'detail_state', 'reason_code',
+                  'evidence_ids', 'role_evidence_ids', 'metadata_gaps'):
+            row[k] = r[k]
+        # Group field states and interval support are not occurrence claims.
+        # The occurrence has its own exact metadata and gap codes (if retained).
+        if r['certificate_metadata'] is not None:
+            for k in _CERT_METADATA_FIELDS:
+                row['metadata_' + k] = r['certificate_metadata'][k]
+        yield row
+    coverage = sorted((c for c in p['coverage'] if c['slot'] in ('system_certs', 'nginx_certs')),
+                      key=lambda c: (c['host_id'], c['slot']))
+    _require([(c['host_id'], c['slot']) for c in coverage] ==
+             [(hid, slot) for hid in sorted(p['hosts']) for slot in ('nginx_certs', 'system_certs')])
+    for c in coverage:
+        host = p['hosts'][c['host_id']]
+        yield dict(row_kind='COVERAGE', assessed=p['assessed'], host_state=host['host_state'],
+                   host_reason_code=host['reason_code'], **{k: c[k] for k in ('host_id', 'slot', 'requested',
+            'state', 'reason_code', 'rc', 'basis', 'terminal_retained', 'slot_state', 'detail_slot_state',
+            'collection_ids', 'collection_states')})
+
+
+def _certificate_json_cell(value, budget, cap):
+    # C2 already validates/bounds the projection. Charge each retained member
+    # again for this export (including repeated references in separate rows).
+    def charge(item):
+        budget.charge()
+        if type(item) is list:
+            for child in item:
+                charge(child)
+        elif type(item) is dict:
+            for key, child in item.items():
+                budget.charge()
+                _require(type(key) is str)
+                charge(child)
+        else:
+            _require(item is None or type(item) in (str, int, bool))
+    _require(type(value) in (list, dict))
+    charge(value)
+    out = _Bytes(cap)
+    for chunk in json.JSONEncoder(ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+                                  allow_nan=False).iterencode(value):
+        out.write(chunk)
+    return _csv_text(out.finish().decode('ascii'))
+
+
+def _certificate_csv_bytes(run_id, rows):
+    cap = min(_MAX_CSV, _MAX_CSV_TOTAL)
+    out, budget = _Bytes(cap), _Budget()
+    out.write('\ufeff')
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator='\r\n')
+    writer.writerow(_CERTIFICATE_COLUMNS)
+    for row in rows:
+        budget.charge()
+        values = {'run_id': run_id, **row}
+        _require(values.keys() <= set(_CERTIFICATE_COLUMNS))
+        _require(values['row_kind'] in ('GROUP', 'OCCURRENCE', 'COVERAGE'))
+        cells = []
+        # Bound the whole row before csv.writer builds the quoted record.
+        remaining = cap - len(out.data) - 2  # CRLF
+        for i, k in enumerate(_CERTIFICATE_COLUMNS):
+            remaining -= 2 + (i != 0)  # quotes and preceding delimiter
+            _require(remaining >= 0, 'SUMMARY_SIZE_LIMIT')
+            value = values.get(k)
+            if value is None:
+                cell = ''
+            elif k in _CERT_JSON_COLUMNS:
+                cell = _certificate_json_cell(value, budget, remaining)
+            elif k in _CERT_NUMERIC_COLUMNS:
+                cell = _csv_number(value)
+            elif k in _CERT_BOOLEAN_COLUMNS:
+                _require(type(value) is bool)
+                cell = 'TRUE' if value else 'FALSE'
+            elif k == 'rc':
+                _require(type(value) is int and -255 <= value <= 255)
+                # Negative terminal rc is a literal, not a formula exemption.
+                cell = _csv_text(str(value))
+            else:
+                _require(type(value) is str)
+                _require(len(value) <= remaining, 'SUMMARY_SIZE_LIMIT')
+                cell = _csv_text(value)
+            remaining -= len(cell.encode('utf-8')) + cell.count('"')
+            _require(remaining >= 0, 'SUMMARY_SIZE_LIMIT')
+            cells.append(cell)
+        writer.writerow(cells)
+    return out.finish()
+
+
+def render_certificate_csv(store, run_id):
+    """Return the fixed certificates.csv UTF-8 bytes from a freshly opened Store.
+
+    No path, external input, fabricated PublishedRun, or publication interface.
+    Store.open owns full retained-byte validation; C2 owns all certificate
+    identity, role, provenance, metadata, conflict and coverage semantics.
+    """
+    _require(type(store) is run_store.RunStore)
+    rid = run_store._rid(run_id)
+    from tools import portal_asset_indexes
+    p = portal_asset_indexes.project_asset_indexes(store.open(rid))
+    _require(p['run_id'] == rid)
+    return _certificate_csv_bytes(rid, _certificate_rows(p))

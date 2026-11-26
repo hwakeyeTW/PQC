@@ -784,3 +784,275 @@ def test_c2_bounds_fail_closed(root, monkeypatch, cap):
     monkeypatch.setattr(ai, cap, 1)
     reject('ASSET_INDEX_SIZE_LIMIT', ai.render_asset_indexes, pub)
     assert _c2_tree(root) == before
+
+
+# #23 B: consume only the original C1/C2 actual publications. Compare CSV
+# with the unchanged C2 HTML projection, not another call to CSV flattening.
+def _csv_b_parse(raw):
+    import csv
+    import io
+    from tools import export_summary as ex
+    assert raw.startswith(b'\xef\xbb\xbf') and raw.endswith(b'\r\n')
+    body = raw[3:]
+    assert b'\r' not in body.replace(b'\r\n', b'')
+    assert b'\n' not in body.replace(b'\r\n', b'')
+    assert all(line.startswith(b'"') and line.endswith(b'"') for line in body.split(b'\r\n')[:-1])
+    reader = csv.DictReader(io.StringIO(raw.decode('utf-8-sig'), newline=''))
+    assert tuple(reader.fieldnames) == ex._CERTIFICATE_COLUMNS
+    assert len(set(reader.fieldnames)) == len(reader.fieldnames)
+    rows = list(reader)
+    assert all(None not in r and None not in r.values() for r in rows)
+    return rows
+
+
+def _csv_b_compare(root, pub):
+    from tools import export_summary as ex, portal_asset_indexes as ai
+    p, pages = ai.render_asset_indexes(pub)
+    page = _c2_html(pages['certificates.html'])
+    before = _c2_tree(root)
+    with store.RunStore(root) as s:
+        raw = ex.render_certificate_csv(s, RID)
+        assert ex.render_certificate_csv(s, RID) == raw
+        assert s.open(RID) == pub
+    assert _c2_tree(root) == before
+    rows = _csv_b_parse(raw)
+    groups = [r for r in rows if r['row_kind'] == 'GROUP']
+    occurrences = [r for r in rows if r['row_kind'] == 'OCCURRENCE']
+    coverage = [r for r in rows if r['row_kind'] == 'COVERAGE']
+    assert rows == groups + occurrences + coverage
+    assert all(r['run_id'] == RID and r['assessed'] == ('TRUE' if p['assessed'] else 'FALSE') for r in rows)
+    expected = sorted(p['certificates']['groups'], key=lambda g: g['id'])
+    assert [r['group_id'] for r in groups] == [g['id'] for g in expected]
+    def scalar(value):
+        return '' if value is None else str(value)
+    for r, g in zip(groups, expected):
+        assert r['group_id'] in page.ids and r['group_kind'] == g['kind']
+        for k in ('fingerprint', 'source_kind', 'detail_state', 'public_key_bits', 'public_key_bits_state',
+                  'issuer', 'subject', 'not_before', 'not_after', 'validity_state',
+                  'signature_metadata_state', 'service_binding_state'):
+            # Formula protection is independently tested below; compare the
+            # exact shared scalar through A's already established escape rule.
+            assert r[k] == ex._csv_text(scalar(g[k]))
+        for k in ('host_ids', 'asset_ids', 'evidence_ids', 'claim_ids', 'recorded_occurrence_ids',
+                  'verified_occurrence_ids'):
+            assert json.loads(r[k]) == g[k]
+            assert int(r[k.removesuffix('_ids') + '_count']) == g['counts'][k]
+        assert json.loads(r['asset_identity_scopes']) == {aid: p['assets'][aid]['identity_scope'] for aid in g['asset_ids']}
+        for k in ('public_key_bits_evidence_ids', 'validity_occurrence_ids', 'metadata_gaps',
+                  'algorithm_group_ids', 'algorithm_links', 'service_group_ids'):
+            assert json.loads(r[k]) == g[k]
+        for role in ('public_key', 'signature'):
+            assert r[role + '_state'] == g[role]['state']
+            assert json.loads(r[role + '_evidence_ids']) == g[role]['evidence_ids']
+        for k, m in g['metadata_fields'].items():
+            assert r['metadata_' + k] == ex._csv_text(scalar(m['value']))
+            assert r['metadata_' + k + '_state'] == m['state']
+            assert json.loads(r['metadata_' + k + '_occurrence_ids']) == m['occurrence_ids']
+    assert [r['occurrence_id'] for r in occurrences] == sorted(p['occurrences'])
+    for r in occurrences:
+        oid = r['occurrence_id']; o = p['occurrences'][oid]
+        assert oid in page.ids
+        assert [g['id'] for g in expected if oid in g['recorded_occurrence_ids']] == [r['group_id']]
+        assert r['identity_scope'] == p['assets'][o['asset_id']]['identity_scope']
+        for k in ('fingerprint', 'host_id', 'asset_id', 'collection_id', 'root', 'source_id', 'target_id',
+                  'block_index', 'detail_ref', 'detail_sha256', 'observed_at', 'detail_state', 'reason_code'):
+            assert r[k] == scalar(o[k])
+        for k, v in o['source'].items():
+            assert r[k] == ex._csv_text(scalar(v))
+        for k in ('evidence_ids', 'role_evidence_ids', 'metadata_gaps'):
+            assert json.loads(r[k]) == o[k]
+        for k, v in (o['certificate_metadata'] or {}).items():
+            assert r['metadata_' + k] == ex._csv_text(scalar(v))
+        assert not r['validity_state'] and not r['metadata_not_before_state']
+    expected = sorted((c for c in p['coverage'] if c['slot'] in ('system_certs', 'nginx_certs')),
+                      key=lambda c: (c['host_id'], c['slot']))
+    assert len(coverage) == 2 * len(pub.manifest['expected_host_ids'])
+    assert [(r['host_id'], r['slot']) for r in coverage] == [(c['host_id'], c['slot']) for c in expected]
+    for r, c in zip(coverage, expected):
+        for k in ('state', 'reason_code', 'rc', 'basis', 'slot_state', 'detail_slot_state'):
+            assert r[k] == ex._csv_text(scalar(c[k]))
+        for k in ('requested', 'terminal_retained'):
+            assert r[k] == ('' if c[k] is None else 'TRUE' if c[k] else 'FALSE')
+        assert r['host_state'] == p['hosts'][c['host_id']]['host_state']
+        assert r['host_reason_code'] == p['hosts'][c['host_id']]['reason_code']
+        for k in ('collection_ids', 'collection_states'):
+            assert json.loads(r[k]) == c[k]
+        assert not r['group_id'] and not r['occurrence_id']
+    assert not any(k in ex._CERTIFICATE_COLUMNS for k in ('path', 'vhost', 'endpoint', 'raw', 'pem'))
+    return raw, groups, occurrences, coverage
+
+
+@pytest.mark.parametrize('assessed', [False, True])
+def test_csv_b_actual_multihost(root, assessed):
+    pub = _c2_open(root, ('complete', 'complete'), assessed=assessed)
+    _, groups, occurrences, coverage = _csv_b_compare(root, pub)
+    assert len(groups) == 2 and len(occurrences) == 8 and len(coverage) == 4
+    assert sum(int(r['asset_count']) for r in groups) == 4
+    assert sum(int(r['verified_occurrence_count']) for r in groups) == 8
+    assert all(r['metadata_public_key_bits'] == '2048' for r in occurrences)
+    assert all(set(json.loads(r['role_evidence_ids'])) == {'certificate', 'public-key', 'signature'} for r in occurrences)
+
+
+@pytest.mark.parametrize('mode', ['partial', 'disabled', 'connection', 'error', 'stopped', 'worker'])
+def test_csv_b_actual_coverage(root, mode):
+    pub = _c2_open(root, ('complete', mode))
+    _, groups, occurrences, coverage = _csv_b_compare(root, pub)
+    host = next(h for h in pub.manifest['hosts'] if h['target_id'] == TARGETS[1])
+    c = next(r for r in coverage if r['host_id'] == host['host_id'] and r['slot'] == 'system_certs')
+    if mode == 'partial':
+        assert c['detail_slot_state'] == 'VERIFIED_COMPANION'
+        assert any(r['metadata_not_after_state'] == 'PARTIAL' for r in groups)
+        assert len(occurrences) == 8
+    else:
+        assert c['detail_slot_state'] == ('NOT_REQUIRED' if mode == 'disabled' else 'REQUIRED_DETAIL_MISSING')
+        assert len(occurrences) == 4 and all(r['host_id'] != host['host_id'] for r in occurrences)
+
+
+def test_csv_b_recovery(root):
+    pub = _c2_open(root, ('complete', 'complete', 'complete'), recovery=True)
+    _, _, occurrences, coverage = _csv_b_compare(root, pub)
+    assert len(coverage) == 6 and len(occurrences) == 4
+    assert sorted(r['detail_slot_state'] for r in coverage if r['slot'] == 'system_certs') == [
+        'REQUIRED_DETAIL_MISSING', 'REQUIRED_DETAIL_MISSING', 'VERIFIED_COMPANION']
+
+
+@pytest.mark.parametrize('variant', ['conflict', 'disjoint-dates', 'unknown', 'formula'])
+def test_csv_b_actual_metadata(root, monkeypatch, variant):
+    original = envelope
+    def varied(target, mode='complete', *, large=False):
+        env = original(target, mode, large=large)
+        for value in env['records'][1]['snapshot']['roots'].values():
+            for src in value['sources']:
+                for block in src['blocks']:
+                    c = block['certificate']
+                    if variant == 'conflict' and target == TARGETS[1]:
+                        c.update(issuer='CN=<img src=x onerror=alert(1)> & issuer',
+                                 subject='CN=Other fixture', public_key_bits=4096,
+                                 signature_outer='sha384WithRSAEncryption', not_before='2028-01-01T00:00:00Z')
+                    elif variant == 'disjoint-dates':
+                        c['not_after' if target == TARGETS[0] else 'not_before'] = None
+                    elif variant == 'unknown':
+                        c['not_before'] = c['not_after'] = c['issuer'] = c['subject'] = None
+                    elif variant == 'formula':
+                        c.update(issuer='=1+1', subject='CN="Fixture, quoted"')
+                    c['gaps'] = ca.metadata_gaps(c)
+                    block['reason'] = 'METADATA_GAP' if c['gaps'] else 'OK'
+        return env
+    monkeypatch.setattr(sys.modules[__name__], 'envelope', varied)
+    pub = _c2_open(root, ('complete', 'complete'))
+    raw, groups, occurrences, _ = _csv_b_compare(root, pub)
+    for g in groups:
+        if variant == 'conflict':
+            assert g['validity_state'] == g['signature_metadata_state'] == 'CONFLICT'
+            assert g['metadata_issuer_state'] == 'CONFLICT' and not g['metadata_issuer']
+            assert not json.loads(g['validity_occurrence_ids'])
+        elif variant == 'disjoint-dates':
+            assert g['validity_state'] == 'PARTIAL' and not g['not_before'] and not g['not_after']
+            assert g['metadata_not_before'] and g['metadata_not_after']
+            assert not set(json.loads(g['metadata_not_before_occurrence_ids'])) & set(json.loads(g['metadata_not_after_occurrence_ids']))
+            assert not json.loads(g['validity_occurrence_ids'])
+        elif variant == 'unknown':
+            assert g['validity_state'] == 'UNKNOWN' and not g['not_before'] and not g['not_after']
+            assert g['metadata_issuer_state'] == 'UNKNOWN' and not g['issuer']
+        else:
+            assert g['issuer'] == "'=1+1" and g['subject'] == 'CN="Fixture, quoted"'
+    if variant == 'conflict':
+        assert any('SIGNATURE_CONFLICT' in json.loads(r['metadata_gaps']) and 'signature' not in json.loads(r['role_evidence_ids']) for r in occurrences)
+    elif variant == 'formula':
+        assert all(r['metadata_issuer'] == "'=1+1" for r in occurrences)
+        assert b'CN=""Fixture, quoted""' in raw
+
+
+def test_csv_b_actual_legacy(root):
+    from tools import import_reports
+    hosts = ['legacy-a.example.invalid', 'legacy-b.example.invalid']
+    cert = dict(path='/fixture/cert.pem', subject='fixture-subject', issuer='fixture-issuer',
+                expires='2028-01-01T00:00:00Z', public_key_algorithm='rsaEncryption',
+                signature_algorithm='sha256WithRSAEncryption', public_key_size=2048,
+                fingerprint=digest('legacy-fingerprint'))
+    old = dict(run_id='fixture-old', generated_at=OBS, selected_hosts=hosts, successful_hosts=hosts[:1],
+               hosts_without_report=hosts[1:], selected_count=2, completed_count=1,
+               reports=[dict(host=hosts[0], collected_at=OBS, system_certificates=[cert, deepcopy(cert)])])
+    path = root.parent / 'legacy.json'; path.write_bytes(json.dumps(old).encode()); path.chmod(0o600)
+    import_reports._publish(import_reports._prepare(path, 'legacy-ol-run-summary', RID, END,
+                                                    'fixture-source', '0.9.1'), root)
+    with store.RunStore(root) as s:
+        pub = s.open(RID)
+    raw, groups, occurrences, coverage = _csv_b_compare(root, pub)
+    assert len(groups) == 1 and not occurrences and len(coverage) == 4
+    g = groups[0]
+    assert g['group_kind'] == 'LEGACY_RUN_SCOPED' and not g['fingerprint'] and g['public_key_bits'] == '2048'
+    assert g['detail_state'] == 'DETAIL_NOT_RETAINED' and g['validity_state'] == 'UNKNOWN'
+    assert set(json.loads(g['asset_identity_scopes']).values()) == {'RUN_SCOPED'}
+    assert all(not r['requested'] for r in coverage)
+    assert all(x not in raw for x in (b'/fixture/cert.pem', b'fixture-subject', b'fixture-issuer', b'2028-01-01', cert['fingerprint'].encode()))
+
+
+@pytest.mark.parametrize('defect', ['hash', 'foreign-host'])
+def test_csv_b_actual_coherent_tamper(root, defect):
+    from tools import export_summary as ex
+    pub = _c2_open(root, ('complete', 'complete'))
+    hid = pub.manifest['expected_host_ids'][0]; path = root / RID
+    cp = f'details/{hid}/{v2.CERTIFICATE}.json'; m = deepcopy(pub.manifest)
+    value = json.loads(pub.artifacts[cp]); item = value['occurrences'][0]
+    if defect == 'hash': item['detail_sha256'] = '0' * 64
+    else: item['host_id'] = pub.manifest['expected_host_ids'][1]
+    reindex(path, m, cp, ca.canonical(value))
+    (path / 'run_manifest.json').write_bytes(store._json_bytes(m)); before = _c2_tree(root)
+    with store.RunStore(root) as s:
+        reject(None, ex.render_certificate_csv, s, RID)
+    assert _c2_tree(root) == before
+
+
+def test_csv_b_authority_and_invalid_id(root):
+    from tools import export_summary as ex
+    pub = _c2_open(root, ('complete',)); before = _c2_tree(root)
+    reject('INVALID_SUMMARY_PUBLICATION', ex.render_certificate_csv, pub, RID)
+    reject('INVALID_SUMMARY_PUBLICATION', ex.render_certificate_csv, root, RID)
+    with store.RunStore(root) as s:
+        for rid in ('../escape', 'https://example.invalid/', 'con', None):
+            reject('INVALID_RUN_ID', ex.render_certificate_csv, s, rid)
+    assert _c2_tree(root) == before
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('=1+1', "'=1+1"), (' \ufeff\u200b+1', "' \\ufeff\\u200b+1"),
+    ('\tordinary', "'\\u0009ordinary"), ('\nline', "'\\u000aline"),
+    ('\u3000\uff1d1', "'\u3000\uff1d1"), ('\uff0b1', "'\uff0b1"),
+    ('\uff0d1', "'\uff0d1"), ('\uff201', "'\uff201"),
+    ('CN="\u6e2c\u8a66, a"\r\nb\x00', 'CN="\u6e2c\u8a66, a"\\u000d\\u000ab\\u0000'),
+])
+def test_csv_b_formula_unicode_control(value, expected):
+    from tools import export_summary as ex
+    raw = ex._certificate_csv_bytes(RID, [dict(row_kind='GROUP', issuer=value,
+                                                metadata_gaps=['a,b', '"quoted"', '\n'])])
+    row = _csv_b_parse(raw)[0]
+    assert row['issuer'] == expected
+    assert json.loads(row['metadata_gaps']) == ['a,b', '"quoted"', '\n']
+
+
+@pytest.mark.parametrize('column,value', [('host_count', True), ('public_key_bits', -1),
+    ('metadata_public_key_bits', '2048'), ('block_index', 1.5), ('rc', True), ('rc', -256)])
+def test_csv_b_numeric_whitelist(column, value):
+    from tools import export_summary as ex
+    reject('INVALID_SUMMARY_PUBLICATION', ex._certificate_csv_bytes, RID, [dict(row_kind='GROUP', **{column: value})])
+
+
+def test_csv_b_negative_rc_literal():
+    from tools import export_summary as ex
+    raw = ex._certificate_csv_bytes(RID, [dict(row_kind='COVERAGE', rc=-1)])
+    assert _csv_b_parse(raw)[0]['rc'] == "'-1"
+
+
+@pytest.mark.parametrize('cap', ['_MAX_CSV', '_MAX_CSV_TOTAL', '_MAX_MEMBERSHIPS'])
+def test_csv_b_actual_bounds(root, monkeypatch, cap):
+    from tools import export_summary as ex
+    _c2_open(root, ('complete',)); before = _c2_tree(root)
+    with store.RunStore(root) as s:
+        raw = ex.render_certificate_csv(s, RID)
+        if cap != '_MAX_MEMBERSHIPS':
+            monkeypatch.setattr(ex, cap, len(raw))
+            assert ex.render_certificate_csv(s, RID) == raw
+        monkeypatch.setattr(ex, cap, 1 if cap == '_MAX_MEMBERSHIPS' else len(raw) - 1)
+        reject('SUMMARY_SIZE_LIMIT', ex.render_certificate_csv, s, RID)
+    assert _c2_tree(root) == before
