@@ -201,3 +201,67 @@ and synthetic literal-root positive harness. No actual managed host or system
 trust-store reads. Actual Controller, OL9.7/9.8/9.9, representative bundle
 completeness, filesystem layout, privileges/load, transport, integrated offline
 report storage/Portal remain NOT_TESTED for #8/#9/#28. No formal support claim.
+
+## Cert S1: fixed native certificate acquisition (#57)
+
+The standalone and collection `pqc_cert_acquire` module mirrors implement the
+same fixed X01/X02 reader, framing and metadata grammar. Only the single
+`stage=system` argument is accepted. The module is read-only, no-log,
+check-mode capable, and does not authorize dispatch or select platform/profile.
+The S2 caller must independently establish the approved P1 OL9 eligibility,
+profile decision and fixed tool slots before dispatch. No service probe, real
+application path, other producer, or new report entry is added by S1.
+
+The native wrapper accepts only the packaged AnsiballZ module and same-archive
+bounded runner; its child uses the trusted installed `/usr/bin/python3` alias
+with `-I -S -B`. The fixed `/usr/bin/openssl` must be a trusted executable
+regular file (not a symlink); both tool checks precede the root reader. No
+caller path, environment, executable or limit overrides exist. The remote
+helper uses the original fixed three roots and two bundle targets, original
+Reader and X.509 grammar, no controller assessment/rules. Code-only synthetic
+root/UID seams are for engineering tests, not runtime options.
+
+The outer runner owns one dedicated session/process group. Every x509 child
+inherits that group, retaining the parent-death signal and parent-race check.
+The acquisition child is single-threaded and a subreaper. It uses bounded
+stdin/out/err, direct-child kill/wait and adopted-child reaping. An unexpected
+residue is sticky fatal even if subsequently reaped. The helper can use its own
+Linux thread children file to signal adopted children; if the kernel does not
+expose that list, a bounded same-group TERM fallback is used only after residue
+has been detected and fatal state latched. The helper never enumerates unrelated
+processes. If any child remains or cleanup is uncertain, the unchanged outer
+runner performs its same-group TERM/KILL/reap; this does not turn inner cleanup
+failure into successful acquisition. No nested session, process-group escape,
+or remote termination claim. Work <=23s, alarm 25s, outer <=29s inclusive of
+cleanup reserve, each x509 I/O/wait <=3.5s and cleanup <=1s, combined child
+stdout/stderr <=16 KiB. A final work-deadline check is required before output.
+
+Native child output is a strict canonical compact ASCII JSON object and LF,
+with exactly `system_python_available` (bool) and `roots` (X03 snapshot).
+The native receipt has exactly `format=1`, `stage=system`, `reason_code`, `rc`,
+`cleanup_confirmed`, `payload`. Only actual rc0, confirmed cleanup and three
+attempted roots with true interpreter availability admit COMMAND_OK; legitimate
+root-level gaps remain visible. The sole interpreter-unavailable preflight
+receipt is TOOL_UNAVAILABLE, rc=null, clean=true, false interpreter availability,
+three skipped roots with zero counts and TOOL_UNAVAILABLE gaps. No child/reader
+is invoked. Other tool failures have no payload, not a false interpreter result.
+A fixed child exit 70 is REMOTE_CLEANUP_UNCONFIRMED, clean=false, payload=null,
+even if the outer runner later proves its group absent. Positive snapshots
+containing CLEANUP_FAILED are rejected. No raw diagnostics are returned.
+
+S1 native payload cap (including bool/roots) is 192 KiB (196608 bytes), with a
+128 KiB retained source metadata soft budget. Excess retained metadata produces
+PROJECTION_LIMIT gaps and preserves identified counts/failed blocks; a final
+cap overflow falls back to an explicit all-root PROJECTION_LIMIT error, not a
+truncated successful snapshot. Original X03 256 KiB snapshot and 2 MiB paired
+details limits remain unchanged. The child frame cap is 196609 bytes including
+LF, compact receipt 196707 bytes, and conservative normal AnsiballZ result
+frame 393411 bytes including invocation and line framing. These are Cert S1
+bounds, not proof of combined five-producer wire capacity; no handoff/lease/
+collector registry or Controller bridge/Store/Schema changes are made here.
+
+Engineering uses synthetic public certificates, actual OpenSSL, native short
+and FQCN AnsiballZ packaging, original typed oracle, capacity boundaries,
+closed receipts and actual local owned-process cleanup. Product deployment,
+OL9 versions, actual Controller/inventory/transport and trust-store load remain
+release QA, not certified by these synthetic tests. S2 and C3 remain separate.
