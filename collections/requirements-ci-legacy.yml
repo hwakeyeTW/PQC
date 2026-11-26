@@ -1,0 +1,15 @@
+---
+# CI only: shared pins for the 2.17 and 2.18 regression lanes.
+collections:
+  - name: community.crypto
+    version: '2.26.0'
+    source: https://galaxy.ansible.com/
+  - name: ansible.posix
+    version: '1.6.2'
+    source: https://galaxy.ansible.com/
+  - name: community.general
+    version: '10.7.0'
+    source: https://galaxy.ansible.com/
+  - name: community.hashi_vault
+    version: '6.2.0'
+    source: https://galaxy.ansible.com/
