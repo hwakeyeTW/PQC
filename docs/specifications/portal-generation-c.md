@@ -130,3 +130,48 @@ publication, receipt, catalog admission and CLI integration. No portal-v5
 activation, new publication API, Store change or complete standalone key
 support is provided here. Formal browser, capacity and deployment acceptance
 remains in #28.
+
+## C-B2a: private complete render buffers
+
+The B1 entry point and its default, explicit false and true payloads remain
+unchanged. `_assemble_v5_render_payload` is an additional **private** entry
+for the same unmodified verified publication. It does not open Store again.
+The B1 work path retains its one asset projection, two crypto projections
+(including C2 membership validation), one summary projection and the actual
+per-host B2 schema/reference validation. The same second crypto projection
+feeds the two core crypto pages, crypto JSON and explicit backlinks; there
+is no third crypto projection or new assessment.
+
+Only the private V5 renderer derives the Producer V2 slot grammar from the
+verified manifest. The run and host views link only present verified slots,
+with detail ownership confined to its expected host; producer rules are
+batch-wide and have their own label, saved version and SHA-256. Required
+missing artifacts stay status text. The private signature branch pins the
+closed slot directory chain and file identity, checks the verified bytes,
+and includes the manifest and journal signatures. It is not a new public
+trust witness or a publication lock/recheck protocol.
+
+The fixed result contains run ID, root index and CSS buffers, sorted nested
+file mapping and sorted size/SHA-256 entries. Root entry names are `index.html`
+and `portal.css`; nested entry names have the fixed `portal-v5/` prefix. The
+nested mapping uses basenames only: the original 9+2*h B1 files plus
+`hosts.html`, `algorithms.html`, `libraries.html`, `crypto_indexes.json` and
+one `h-<64 lowercase hex>.html` for each expected host (13+3*h nested files,
+15+3*h total). The original B1 bytes remain exact. The root index targets
+these actual buffers, not a V4 generation. No marker, receipt, catalog,
+write or publication is produced. History remains an external prerequisite.
+The unchanged host/crypto templates retain existing links and anchors;
+reverse/download pivots and seven-section navigation are B2b responsibilities.
+
+After charging the B1 actual bytes, the bounded canonical crypto JSON and
+CSS read (256 KiB maximum) consume the remaining bundle budget. The crypto
+pages and root/host pages stream UTF-8 against the minimum of page, remaining
+HTML and remaining bundle limits before extending each output buffer. Each
+page charges actual bytes, including root index. The final fixed set and
+category/total checks remain; no partial result, truncation or raw diagnostic
+escapes. Original 16/128 MiB HTML, 32 MiB each JSON, 16/32 MiB CSV,
+32/256 MiB CBOM pair, 512 MiB total and 1000 expected host limits are unchanged.
+Old public rendering, CSS, receipts, errors and publication are not extended
+to Producer V2 or V5 by this private branch. C-C owns formal marker/receipt,
+lock/recheck, catalog admission and atomic publication. Formal environment,
+full capacity and browser acceptance remain #28.

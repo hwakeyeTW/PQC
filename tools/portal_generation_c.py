@@ -8,7 +8,7 @@ import hashlib
 from typing import NamedTuple
 
 from tools import cbom_generation, cbom_validation, export_summary, portal_asset_indexes
-from tools import portal_indexes, run_store
+from tools import portal_indexes, render_portal, run_store
 
 _MAX_HTML = 16 * 1024 * 1024
 _MAX_HTML_TOTAL = 128 * 1024 * 1024
@@ -21,6 +21,14 @@ _MAX_BUNDLE = 512 * 1024 * 1024
 _HTML = ('certificates.html', 'coverage.html', 'findings.html', 'services.html')
 _JSON = ('asset_indexes.json', 'scan_summary.json')
 _CSV = ('algorithms.csv', 'certificates.csv', 'summary.csv')
+
+
+class _RenderPayload(NamedTuple):
+    run_id: str
+    index: bytes
+    css: bytes
+    files: dict
+    entries: tuple
 
 
 class _Payload(NamedTuple):
@@ -71,8 +79,9 @@ class _Buffers:
         self.cbom += size
 
 
-def _assemble(published, *, portal_v5=False):
-    _require(type(portal_v5) is bool and type(published) is run_store.PublishedRun)
+def _assemble(published, *, portal_v5=False, complete=False):
+    _require(type(portal_v5) is bool and type(complete) is bool and (not complete or portal_v5)
+             and type(published) is run_store.PublishedRun)
     m, doc, _, _ = published
     rid = run_store._rid(m['run_id'])
     ids = m['expected_host_ids']
@@ -131,10 +140,31 @@ def _assemble(published, *, portal_v5=False):
             published, hid, include_certificates=True, batch=batch, limit=out.pair_limit())
         out.pair(hid, bom, provenance)
     _require(out.files.keys() == expected)
+    if complete:
+        index, css, core = render_portal._render_v5_core(
+            published, crypto, page_limit=_MAX_HTML, html_limit=_MAX_HTML_TOTAL - out.html,
+            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON)
+        core_html = {'hosts.html', 'algorithms.html', 'libraries.html'} | {hid + '.html' for hid in ids}
+        _require(set(core) == core_html | {'crypto_indexes.json'} and not (set(core) & expected))
+        out.add('portal.css', css, render_portal._MAX_CSS)
+        out.add('crypto_indexes.json', core['crypto_indexes.json'], _MAX_JSON)
+        for name, raw in [('index.html', index)] + [(name, core[name]) for name in sorted(core_html)]:
+            out.add(name, raw, min(_MAX_HTML, _MAX_HTML_TOTAL - out.html))
+            out.html += len(raw)
+        _require(set(out.files) == expected | set(core) | {'index.html', 'portal.css'})
+        files = dict(sorted((name, raw) for name, raw in out.files.items()
+                            if name not in ('index.html', 'portal.css')))
+        _require(len(files) == 13 + 3 * len(ids))
+        entries = _entries({'index.html': index, 'portal.css': css,
+                            **{'portal-v5/' + name: raw for name, raw in files.items()}})
+        return _RenderPayload(rid, index, css, files, entries)
     files = dict(sorted(out.files.items()))
-    entries = tuple(dict(name=name, size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
-                    for name, raw in files.items())
-    return _Payload(rid, files, entries)
+    return _Payload(rid, files, _entries(files))
+
+
+def _entries(files):
+    return tuple(dict(name=name, size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                 for name, raw in sorted(files.items()))
 
 
 def _assemble_payload(published, *, portal_v5=False):
@@ -145,11 +175,23 @@ def _assemble_payload(published, *, portal_v5=False):
     publication and catalog admission; these buffers are not a generation.
     The private exact boolean selects only the four V5 asset and summary HTML pages.
     """
+    return _checked_assemble(published, portal_v5=portal_v5)
+
+
+def _assemble_v5_render_payload(published):
+    """Internal complete render buffers for a pinned verified publication.
+
+    No generation marker, receipt, catalog operation or file write.
+    """
+    return _checked_assemble(published, portal_v5=True, complete=True)
+
+
+def _checked_assemble(published, *, portal_v5, complete=False):
     try:
-        return _assemble(published, portal_v5=portal_v5)
+        return _assemble(published, portal_v5=portal_v5, complete=complete)
     except (run_store.StoreError, cbom_generation.CBOMGenerationError) as exc:
         if exc.code in ('PORTAL_PAYLOAD_SIZE_LIMIT', 'SUMMARY_SIZE_LIMIT', 'ASSET_INDEX_SIZE_LIMIT',
-                        'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT'):
+                        'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT', 'PORTAL_SIZE_LIMIT'):
             code = 'PORTAL_PAYLOAD_SIZE_LIMIT'
         else:
             code = 'PORTAL_PAYLOAD_INVALID'

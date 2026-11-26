@@ -60,9 +60,33 @@ def _observations(document, kind, field, states):
             for (family, primitive), counts in sorted(groups.items())]
 
 
-def _view(published):
+def _v5_producer(published, portal_v5):
+    run_store.require(type(portal_v5) is bool and type(published) is run_store.PublishedRun,
+                      'INVALID_PUBLICATION')
+    return portal_v5 and run_store._is_producer_v2(published.manifest)
+
+
+def _artifact_parts(published, item, *, portal_v5, producer_v2):
+    parts, cap = run_store._slot(item['kind'], item['host_id'], item['slot'], producer_v2=producer_v2)
+    path = '/'.join(parts)
+    run_store.require(path == item['path'] and path in published.artifacts, 'INVALID_ARTIFACT_LINK')
+    if portal_v5:
+        if item['kind'] == 'detail':
+            run_store.require(item['host_id'] in published.manifest['expected_host_ids'],
+                              'INVALID_ARTIFACT_LINK')
+        run_store.require(type(published.artifacts[path]) is bytes and
+                          len(published.artifacts[path]) == item['size'] <= cap,
+                          'INVALID_ARTIFACT_LINK')
+    return parts, cap
+
+
+def _artifact_label(kind, producer_v2):
+    return 'Producer rules' if producer_v2 and kind == 'producer-rules' else _LABELS[kind]
+
+
+def _view(published, *, portal_v5=False):
     """Project only a validated PublishedRun; callers cannot supply raw JSON."""
-    run_store.require(type(published) is run_store.PublishedRun, 'INVALID_PUBLICATION')
+    producer_v2 = _v5_producer(published, portal_v5)
     m, doc, assessed, artifacts = published
     by_host = Counter(c['host_id'] for c in doc['collections'])
     hosts = []
@@ -89,10 +113,9 @@ def _view(published):
     for item in m['artifacts']:
         # Only validated, present slots; construct the relative href from the
         # closed Store slot grammar, never an Evidence/metadata URL.
-        parts, _ = run_store._slot(item['kind'], item['host_id'], item['slot'])
+        parts, _ = _artifact_parts(published, item, portal_v5=portal_v5, producer_v2=producer_v2)
         path = '/'.join(parts)
-        run_store.require(path == item['path'] and path in artifacts, 'INVALID_ARTIFACT_LINK')
-        label = _LABELS[item['kind']]
+        label = _artifact_label(item['kind'], producer_v2)
         links.append({'path': path, 'label': label, 'size': item['size'],
                       'version': item['format_version']})
     gaps = Counter((c['collection_state'], c['reason_code']) for c in doc['collections']
@@ -101,7 +124,7 @@ def _view(published):
                                for row in doc['evidence'] if row['algorithm'] is not None)
     claims = [] if assessed is None else assessed['claims']
     claim_counts = Counter((c['level'], c['assessment_state']) for c in claims)
-    return {'run': {k: m[k] for k in ('run_id', 'run_kind', 'publication_state', 'run_state',
+    result = {'run': {k: m[k] for k in ('run_id', 'run_kind', 'publication_state', 'run_state',
                     'reason_code', 'recovery', 'source', 'started_at', 'finished_at', 'recorded_at',
                     'profile', 'evidence_schema_version', 'rule_version', 'rules_sha256',
                     'batch_contract', 'batch_rc', 'batch_missing_reason')},
@@ -130,6 +153,12 @@ def _view(published):
             'optional_missing': [_LABELS[k] for k, (name, _) in run_store.FILES.items()
                                  if k in ('assessed', 'rules', 'cff') and name not in artifacts
                                  and not any(x['path'] == name for x in m['missing_artifacts'])]}
+    if portal_v5:
+        result['producer_v2'] = producer_v2
+        if producer_v2:
+            result['run'].update(producer_rules_sha256=m['producer_rules_sha256'],
+                                 producer_rules_version=m['producer_rules_version'])
+    return result
 
 
 def _render(published):
@@ -146,13 +175,15 @@ def _render(published):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
 
 
-def _render_css():
+def _render_css(*, limit=None):
     # CSS is common to all three versions, so v3 verification does not need
     # to render an unrelated legacy index (or apply its HTML limits).
     try:
+        cap = _MAX_CSS if limit is None else min(_MAX_CSS, limit)
+        run_store.require(cap > 0, 'PORTAL_SIZE_LIMIT')
         with (_TEMPLATES / 'portal.css').open('rb') as f:
-            css = f.read(_MAX_CSS + 1)
-        run_store.require(0 < len(css) <= _MAX_CSS, 'PORTAL_SIZE_LIMIT')
+            css = f.read(cap + 1)
+        run_store.require(0 < len(css) <= cap, 'PORTAL_SIZE_LIMIT')
         css.decode('utf-8')
         return css
     except (OSError, UnicodeError):
@@ -238,7 +269,8 @@ def _facts(row, collection):
     return facts
 
 
-def _host_views(published, overview):
+def _host_views(published, overview, *, portal_v5=False):
+    producer_v2 = _v5_producer(published, portal_v5)
     m, doc, assessed, artifacts = published
     ids = m['expected_host_ids']
     run_store.require(len(ids) <= 1000 and ids == sorted(set(ids)) and
@@ -256,10 +288,9 @@ def _host_views(published, overview):
         by_host[row['host_id']]['collectors'].append(row)
     run_links, run_missing = [], []
     for item in m['artifacts']:
-        parts, _ = run_store._slot(item['kind'], item['host_id'], item['slot'])
+        parts, _ = _artifact_parts(published, item, portal_v5=portal_v5, producer_v2=producer_v2)
         path = '/'.join(parts)
-        run_store.require(path == item['path'] and path in artifacts, 'INVALID_ARTIFACT_LINK')
-        link = {'path': '../' + path, 'label': _LABELS[item['kind']], 'slot': item['slot']}
+        link = {'path': '../' + path, 'label': _artifact_label(item['kind'], producer_v2), 'slot': item['slot']}
         (run_links if item['host_id'] is None else by_host[item['host_id']]['links']).append(link)
     for item in m['missing_artifacts']:
         parts = item['path'].split('/')
@@ -400,6 +431,68 @@ def _render_pages(published, marker, css, *, history, crypto=False):
             'pages': [{'name': name, 'size': len(raw), 'sha256': _digest(raw)}
                       for name, raw in sorted(pages.items())]}, _MAX_RECEIPT)
         return index, pages, receipt
+    except (OSError, TemplateError, UnicodeError):
+        raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
+
+
+def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_limit, json_limit):
+    """Fixed private root/nested buffers, no receipt, marker, or publication.
+
+    Only the trusted assembler supplies the existing verified projection and
+    remaining byte budgets. No path, additional Store.open or reassessment.
+    """
+    from tools import portal_indexes as indexes
+    try:
+        v = _view(published, portal_v5=True)
+        hosts, views = _host_views(published, v, portal_v5=True)
+        run_store.require(projection['run_id'] == v['run']['run_id'] and
+                          set(projection['hosts']) <= set(published.manifest['expected_host_ids']),
+                          'INVALID_CRYPTO_INDEX_PUBLICATION')
+        expected_hosts = {h['host_id']: h for h in hosts}
+        for hid, row in projection['hosts'].items():
+            h = expected_hosts[hid]
+            run_store.require(row['host_id'] == hid and row['href'] == indexes._href(hid) and
+                              row['target_id'] == h['target_id'] and row['host_state'] == h['host_state'],
+                              'INVALID_CRYPTO_INDEX_PUBLICATION')
+        raw = indexes._bounded_bytes(projection, limit=min(json_limit, _MAX_CRYPTO_JSON, bundle_limit))
+        remaining = bundle_limit - len(raw)
+        css = _render_css(limit=remaining)
+        remaining -= len(css)
+        html = min(html_limit, _MAX_TOTAL_HTML)
+        page_cap = min(page_limit, _MAX_HTML)
+        pages = {_CRYPTO_JSON: raw}
+        crypto_pages = indexes._render_crypto_projection(projection, page_limit=page_cap,
+                                                       total_limit=min(html, remaining))
+        run_store.require(set(crypto_pages) == set(_CRYPTO_PAGES), 'INVALID_CRYPTO_INDEX_PUBLICATION')
+        for name in _CRYPTO_PAGES:
+            raw = crypto_pages[name]
+            run_store.require(len(raw) <= min(page_cap, html, remaining), 'PORTAL_SIZE_LIMIT')
+            pages[name] = raw
+            html -= len(raw)
+            remaining -= len(raw)
+        backlinks = _crypto_backlinks(projection)
+        env = Environment(loader=FileSystemLoader(str(_TEMPLATES)), autoescape=True,
+                          undefined=StrictUndefined, keep_trailing_newline=True)
+
+        def page(template, **context):
+            nonlocal html, remaining
+            limit = min(page_cap, html, remaining)
+            out = bytearray()
+            for chunk in env.get_template(template).generate(
+                    v=v, portal_v2=True, portal_v3=True, portal_v4=True, portal_v5=True,
+                    crypto_backlinks=backlinks, **context):
+                raw = chunk.encode('utf-8')
+                run_store.require(len(raw) <= limit - len(out), 'PORTAL_SIZE_LIMIT')
+                out.extend(raw)
+            html -= len(out)
+            remaining -= len(out)
+            return bytes(out)
+
+        index = page('run_index.html.j2')
+        pages['hosts.html'] = page('hosts.html.j2', nested=True, hosts=hosts)
+        for host in views:
+            pages[host['host_id'] + '.html'] = page('host.html.j2', nested=True, host=host)
+        return index, css, pages
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
 
@@ -601,15 +694,55 @@ def _entry_identity(fd, name):
     return st.st_dev, st.st_ino
 
 
-def _core_signatures(fd, device, published):
+def _core_signatures(fd, device, published, *, portal_v5=False):
+    if type(portal_v5) is not bool:
+        raise run_store.StoreError('INVALID_PUBLICATION')
+    if portal_v5:
+        try:
+            return _slot_signatures(fd, device, published, portal_v5=True)
+        except OSError:
+            raise run_store.StoreError('ARTIFACT_CHANGED') from None
+    return _slot_signatures(fd, device, published)
+
+
+def _slot_signatures(fd, device, published, *, portal_v5=False):
     # Only validated fixed Store slots. Include each detail directory identity
     # as well as its file metadata; no recursive walk or arbitrary path read.
+    producer_v2 = _v5_producer(published, portal_v5)
     result = {name: _file_signature(fd, name, device)
               for name in ('run_manifest.json', 'journal.json')}
+    if portal_v5:
+        run_store.require(run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
+                          == run_store._json_bytes(published.manifest), 'ARTIFACT_CHANGED')
     for row in published.manifest['artifacts']:
-        parts, _ = run_store._slot(row['kind'], row['host_id'], row['slot'])
-        with run_store._directory(fd, parts[:-1], device) as parent:
-            result['/'.join(parts)] = (_identity(parent), _file_signature(parent, parts[-1], device))
+        if not portal_v5:
+            parts, _ = run_store._slot(row['kind'], row['host_id'], row['slot'])
+            with run_store._directory(fd, parts[:-1], device) as parent:
+                result['/'.join(parts)] = (_identity(parent), _file_signature(parent, parts[-1], device))
+            continue
+        parts, cap = _artifact_parts(published, row, portal_v5=True, producer_v2=producer_v2)
+        path = '/'.join(parts)
+        # Capture every pinned directory in the closed slot, not just the
+        # immediate parent. No traversal outside the validated slot grammar.
+        chain = [_identity(fd)]
+        current = os.dup(fd)
+        try:
+            for part in parts[:-1]:
+                nxt = run_store._open_dir(current, part, device)
+                os.close(current)
+                current = nxt
+                chain.append(_identity(current))
+            sig = _file_signature(current, parts[-1], device)
+            raw = run_store._read(current, parts[-1], device, cap, row['size'])
+            run_store.require(raw == published.artifacts[path] and
+                              _digest(raw) == row['sha256'] and
+                              _file_signature(current, parts[-1], device) == sig, 'ARTIFACT_CHANGED')
+            result[path] = (tuple(chain), sig)
+        finally:
+            os.close(current)
+    if portal_v5:
+        for name in ('run_manifest.json', 'journal.json'):
+            run_store.require(_file_signature(fd, name, device) == result[name], 'ARTIFACT_CHANGED')
     return result
 
 
