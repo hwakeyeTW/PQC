@@ -83,3 +83,50 @@ CSS and receipt. The final 128 MiB HTML aggregate, 32 MiB crypto JSON,
 C-B/C-C responsibilities, not additional outputs or features of C-A.
 No report files are written or published. Formal environment and maximum
 capacity/load acceptance remains in release QA #28.
+
+## C-B1: private four-page V5 mode
+
+C-B1a integrated the Certificate and Service pages; C-B1b integrates the
+Findings and Coverage pages. The private `_assemble_payload(published, *,
+portal_v5=False)` parameter accepts an exact boolean only. The original
+public previews and the omitted/False mode retain their successful bytes,
+fixed errors and signatures. The True mode changes only the four fixed HTML
+buffers and their size/hash records; in particular, the C-B1a V5 asset
+pages are byte-identical across C-B1b. The file set, projection JSON, CSV,
+per-host B2 CBOM/provenance pairs and membership limits are unchanged.
+
+The fixed relative run-section navigation is Hosts, Algorithms, Libraries,
+Certificates, Services, Findings and Coverage. Existing breadcrumbs,
+styles, skip links, section IDs and evidence/asset/claim references remain.
+Each saved finding links to the Coverage row for its own validated subject
+host. The expected host IDs and registry must agree, and Coverage renders
+one row for every expected ID. No new finding or inferred binding is created.
+Unknown and missing data, absent assessments and saved empty findings retain
+their original meaning. Required missing artifact paths remain status text,
+not downloadable links. The templates remain fixed, strictly undefined and
+autoescaped; no extra projection, evaluation, Store.open or preview render
+is introduced.
+
+In True mode the two asset pages first consume their actual HTML and bundle
+bytes. The summary renderer consumes the actual summary JSON and two CSV
+export sizes from the remaining bundle budget, then streams each of its two
+HTML pages against the minimum of the original page limit, the private page
+cap and remaining HTML/bundle bytes. Each completed page reduces both
+remaining budgets. The original final `_Buffers` checks still apply to
+all files; no partial payload is returned. These caps are private, bounded
+caller inputs, not new configuration or public authority.
+
+Focused tests retain the fixed Q-to-R historical two-page oracle, using
+independently hash-checked old assemblers, asset and summary renderers and
+templates. They additionally check R-to-candidate summary-only differences,
+all four V5 changes relative to default, actual Store inputs, saved finding
+ownership, coverage anchors, safe markup and capacity boundaries, plus the
+original actual per-host official schema and typed reference validators.
+
+C-B1 is only the internal page integration. C-B2 still owns the actual C1
+V2 run/host/crypto Renderer: its producer-rules label and three `_slot()`
+call sites, complete navigation, downloads and reverse links. C-C owns
+publication, receipt, catalog admission and CLI integration. No portal-v5
+activation, new publication API, Store change or complete standalone key
+support is provided here. Formal browser, capacity and deployment acceptance
+remains in #28.
