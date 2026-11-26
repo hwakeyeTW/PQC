@@ -1228,6 +1228,12 @@ def _openssl_budget():
 
 def _policy_budget():
     return 2 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
+
+
+def _ssh_budget():
+    return 2 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
+
+
 _COLLECTORS = tuple(sorted(_scope.FLAGS))
 _PASSIVE = frozenset(_COLLECTORS) - {'pqc_collect_tls_services'}
 _VALID = frozenset(('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL'))
@@ -1636,7 +1642,10 @@ class _PlatformWorker:
         self.platform_proof = None
         self.openssl_plan = b._openssl_plan(flags)
         self.policy_requested = flags[b.POLICY_FLAG]
+        self.ssh_flags = {f: flags[f] for f in (b.SSHD, b.KEYS)}
         self.openssl_completed = False
+        self.openssl_gap_completed = False
+        self.policy_completed = False
 
     def limit(self, end):
         end = min(end, self.host_end, self.lease.limit(self.name))
@@ -1693,6 +1702,21 @@ class _PlatformWorker:
         self.limit(self.producer_end)
         self.openssl_completed = True
 
+    def note_openssl_gap(self, row, flags, platform_snapshot):
+        from tools import scan_collectors as b
+        require(self.producer == b.PLATFORM and self.platform_proof is platform_snapshot
+                and self.platform_proof is not None and self.openssl_plan
+                and b._openssl_plan(flags) == self.openssl_plan
+                and not self.openssl_completed and not self.openssl_gap_completed
+                and row['producer_id'] == b.OPENSSL and row['reason_code'] == 'PLATFORM_GAP'
+                and row['cleanup_confirmed'] is True and not self.lease.pending(self.name),
+                3, 'INVALID_NATIVE_RESULT')
+        status = self.validate(b._platform_status, platform_snapshot)
+        require(status != 'UNVERIFIED' and row['snapshot'] == b._gap_snapshot(b.OPENSSL, flags, status),
+                3, 'INVALID_NATIVE_RESULT')
+        self.limit(self.producer_end)
+        self.openssl_gap_completed = True
+
     def start_policy(self, run_id, flags, platform_snapshot):
         from tools import scan_collectors as b
         require(self.producer in (b.PLATFORM, b.OPENSSL) and self.run_id == run_id
@@ -1714,6 +1738,48 @@ class _PlatformWorker:
             require(previous == b.PLATFORM and not self.openssl_completed, 3, 'INVALID_NATIVE_RESULT')
         self.plan = self.validate(b._policy_plan, flags, platform_snapshot)
 
+    def note_policy(self, row):
+        from tools import scan_collectors as b
+        require(self.producer == b.POLICY and not self.policy_completed
+                and row['producer_id'] == b.POLICY and row['reason_code'] in ('COMMAND_OK', 'PLATFORM_GAP')
+                and row['cleanup_confirmed'] is True and row['snapshot'] is not None
+                and not b.record_stop(row) and self.ordinal == len(self.plan)
+                and not self.lease.pending(self.name), 3, 'INVALID_NATIVE_RESULT')
+        self.limit(self.producer_end)
+        self.policy_completed = True
+
+    def start_ssh(self, run_id, flags, platform_snapshot):
+        from tools import scan_collectors as b
+        require(self.run_id == run_id and self.platform_proof is not None
+                and self.platform_proof is platform_snapshot and any(self.ssh_flags.values())
+                and {f: flags[f] for f in self.ssh_flags} == self.ssh_flags
+                and b._openssl_plan(flags) == self.openssl_plan
+                and flags[b.POLICY_FLAG] is self.policy_requested
+                and not self.lease.pending(self.name), 3, 'INVALID_NATIVE_RESULT')
+        previous = self.producer
+        self.producer_end = min(self.limit(self.host_end), time.monotonic() + _ssh_budget())
+        self.validation_left = _GUARD_SECONDS
+        status = self.validate(b._platform_status, platform_snapshot)
+        require((not self.openssl_plan or (self.openssl_completed if status == 'UNVERIFIED'
+                                         else self.openssl_gap_completed))
+                and (previous == b.POLICY and self.policy_completed if self.policy_requested else
+                     previous == (b.OPENSSL if self.openssl_plan and status == 'UNVERIFIED' else b.PLATFORM)),
+                3, 'INVALID_NATIVE_RESULT')
+        self.producer = b.SSH
+        self.ordinal = 0
+        self.plan = self.validate(b._ssh_plan, flags, platform_snapshot)
+
+    def note_ssh(self, row):
+        from tools import scan_collectors as b
+        require(self.producer == b.SSH and row['producer_id'] == b.SSH
+                and row['cleanup_confirmed'] is True and row['snapshot'] is not None
+                and not b.record_stop(row, staged_ssh=True) and not self.lease.pending(self.name),
+                3, 'INVALID_NATIVE_RESULT')
+        expected = sum(row['snapshot']['slots'][stage]['reason'] != 'ACQUISITION_STOPPED'
+                       for _, stage in self.plan)
+        require(self.ordinal == expected, 3, 'INVALID_NATIVE_RESULT')
+        self.limit(self.producer_end)
+
     def validate(self, fn, *args, **kwargs):
         # Cumulative per-producer 30s validation, not 30s for each stage.
         start = time.monotonic()
@@ -1732,7 +1798,9 @@ class _PlatformWorker:
                  or (self.producer == b.OPENSSL and type(binding) is b._OpenSSLStageBinding
                      and binding.producer_id == b.OPENSSL)
                  or (self.producer == b.POLICY and type(binding) is b._PolicyStageBinding
-                     and binding.producer_id == b.POLICY))
+                     and binding.producer_id == b.POLICY)
+                 or (self.producer == b.SSH and type(binding) is b._SSHStageBinding
+                     and binding.producer_id == b.SSH))
                 and binding.run_id == self.run_id and binding.target_id == self.name
                 and binding.task_uuid == self.task_uuid and type(binding.ordinal) is int
                 and self.ordinal < len(self.plan)
@@ -1746,7 +1814,7 @@ class _PlatformWorker:
             start = time.monotonic()
             stage_end = self.limit(min(self.producer_end,
                                       start + _GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1))
-            if self.producer == b.POLICY and stage_end - start < _COMMAND_SECONDS + 1:
+            if self.producer in (b.POLICY, b.SSH) and stage_end - start < _COMMAND_SECONDS + 1:
                 raise _Deadline()
             # Packaging and both guard checks share one G budget. No launch
             # inside prepare. Recheck the actual consumed binding immediately
@@ -1799,14 +1867,14 @@ class _PlatformWorker:
             self.limit(command_end)
             return receipt
         except b._StageFailure as exc:
-            if self.producer == b.POLICY:
+            if self.producer in (b.POLICY, b.SSH):
                 # Only a matching completion, not a launcher exception,
                 # can prove clean termination of an active native stage.
                 if used and not trusted_clean:
                     raise b._StageFailure('REMOTE_CLEANUP_UNCONFIRMED') from None
                 if not used and exc.clean:
                     raise b._StageFailure('INVALID_ADAPTER_RESULT', clean=True) from None
-            if self.producer in (b.OPENSSL, b.POLICY) and used and trusted_clean:
+            if self.producer in (b.OPENSSL, b.POLICY, b.SSH) and used and trusted_clean:
                 try:
                     self.limit(command_end)
                 except _Deadline:
@@ -2642,7 +2710,8 @@ def _v2_base_row(row):
     result['collectors'] = [{**c, 'collection_ids': [],
         'reason_code': ('COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else
                         'INVALID_ADAPTER_RESULT' if c['state'] == 'ERROR'
-                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
+                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy',
+                                                  'pqc_collect_sshd', 'pqc_collect_ssh_host_keys')
                         and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')
                         else c['reason_code'])}
         for c in row['collectors']]
@@ -2665,7 +2734,8 @@ def _valid_v2_outcome(row, flag, requested, cap):
         reduced['reason_code'] = 'COMMAND_IO_FAILED'
     if (reduced.get('state') == 'ERROR'
             and reduced.get('reason_code') in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')):
-        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
+        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy',
+                         'pqc_collect_sshd', 'pqc_collect_ssh_host_keys')
                 or reduced.get('rc') is not None or ids):
             return False
         reduced['reason_code'] = 'INVALID_ADAPTER_RESULT'
@@ -2728,6 +2798,33 @@ def validate_producer_manifest(manifest, rc):
                     and all(c['state'] == 'NOT_SCANNED' and not c['collection_ids']
                             for c in row['collectors'] if c['collector_id'] in (bridge.SSHD, bridge.KEYS, bridge.CERT_FLAG)),
                     3, 'INVALID_TERMINAL_MANIFEST')
+        # Only the new SSH guard/deadline terminal extension: prior selected
+        # producers must have completed, not merely have a plausible state.
+        # Existing generic V2 fatal outcomes and V1 retain their grammar.
+        ssh_rows = [c for c in row['collectors'] if c['requested']
+                    and c['collector_id'] in (bridge.SSHD, bridge.KEYS)]
+        ssh_fatal = [c for c in ssh_rows if c['state'] == 'ERROR'
+                     and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')]
+        if ssh_fatal:
+            def projected(c):
+                return bool(c['collection_ids']) and (c['state'] in (
+                    'COLLECTED', 'NOT_APPLICABLE', 'PARTIAL', 'UNKNOWN', 'PERMISSION_DENIED')
+                    or (c['state'], c['reason_code']) in (('ERROR', 'COLLECTION_ERROR'),
+                                                          ('NOT_SCANNED', 'ADAPTER_NOT_AVAILABLE')))
+            ssl_complete = all(projected(c) and (len(c['collection_ids']) == 2 if c['collector_id'] == bridge.PACKAGES
+                                                else len(c['collection_ids']) >= 5) for c in ssl_rows)
+            ssl_ordinary = bool(ssl_rows) and all(
+                c['state'] == 'ERROR' and c['reason_code'] in bridge._STAGE_RPM_FAILURES
+                and not c['collection_ids'] and (c['reason_code'], c['rc']) ==
+                (ssl_rows[0]['reason_code'], ssl_rows[0]['rc']) for c in ssl_rows)
+            require(row['attempted'] and row['reason_code'] in _FATAL
+                    and projected(row['platform']) and len(row['platform']['collection_ids']) == 10
+                    and (ssl_complete or ssl_ordinary)
+                    and (not policy_row['requested'] or (projected(policy_row) and len(policy_row['collection_ids']) == 9))
+                    and len(ssh_fatal) == len(ssh_rows) and len({c['reason_code'] for c in ssh_fatal}) == 1
+                    and all(c['state'] == 'NOT_SCANNED' and not c['collection_ids']
+                            for c in row['collectors'] if c['collector_id'] in (bridge.SSHD, bridge.KEYS, bridge.CERT_FLAG)
+                            and c not in ssh_fatal), 3, 'INVALID_TERMINAL_MANIFEST')
         ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
         require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)
                 and (row['attempted'] or (not ids and row['platform']['state'] == 'NOT_SCANNED')),
@@ -2774,6 +2871,8 @@ class _ProducerLedger(_Ledger):
             context = {'staged_openssl': True} if self.session.openssl_staged else {}
             if self.session.policy_staged and self.flags[n][self.session.bridge.POLICY_FLAG]:
                 context['staged_policy'] = True
+            if self.session.ssh_staged and any(self.flags[n][f] for f in (self.session.bridge.SSHD, self.session.bridge.KEYS)):
+                context['staged_ssh'] = True
             projection = self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
                                                                 self.session.started_at, self.session.rules, **context)
         except Exception:
@@ -2837,6 +2936,7 @@ class _ProducerSession:
         self.staged = False
         self.openssl_staged = False
         self.policy_staged = False
+        self.ssh_staged = False
 
     def _identity(self, ctx):
         import uuid
@@ -2852,13 +2952,16 @@ class _ProducerSession:
                         (k == self.bridge.OPENSSL and callable(v.prepare))
                         if type(v) is self.bridge._OpenSSLStageAdapter else
                         (k == self.bridge.POLICY and callable(v.prepare))
-                        if type(v) is self.bridge._PolicyStageAdapter else callable(v)
+                        if type(v) is self.bridge._PolicyStageAdapter else
+                        (k == self.bridge.SSH and callable(v.prepare))
+                        if type(v) is self.bridge._SSHStageAdapter else callable(v)
                         for k, v in registry.items()),
                 3, 'INVALID_ADAPTER_REGISTRY')
         self.staged = type(registry.get(self.bridge.PLATFORM)) is self.bridge._PlatformStageAdapter
         self.openssl_staged = type(registry.get(self.bridge.OPENSSL)) is self.bridge._OpenSSLStageAdapter
         self.policy_staged = type(registry.get(self.bridge.POLICY)) is self.bridge._PolicyStageAdapter
-        require(not (self.openssl_staged or self.policy_staged) or self.staged,
+        self.ssh_staged = type(registry.get(self.bridge.SSH)) is self.bridge._SSHStageAdapter
+        require(not (self.openssl_staged or self.policy_staged or self.ssh_staged) or self.staged,
                 3, 'INVALID_ADAPTER_REGISTRY')
         try:
             eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
@@ -2870,6 +2973,10 @@ class _ProducerSession:
         require(not self.policy_staged or self.openssl_staged or
                 all(not {self.bridge.POLICY, self.bridge.OPENSSL} <= set(v)
                     for v in eligible.values()), 3, 'INVALID_ADAPTER_REGISTRY')
+        require(not self.ssh_staged or all(
+            self.bridge.SSH not in v or ((self.bridge.OPENSSL not in v or self.openssl_staged)
+                                         and (self.bridge.POLICY not in v or self.policy_staged))
+            for v in eligible.values()), 3, 'INVALID_ADAPTER_REGISTRY')
         ledger = _ProducerLedger(ctx, self, eligible)
         targets = [n for n in ctx._targets if eligible[n]]
         if targets:
@@ -2885,6 +2992,7 @@ class _ProducerSession:
         return sum(_platform_budget() if self.staged and p == self.bridge.PLATFORM else
                    _openssl_budget() if self.openssl_staged and p == self.bridge.OPENSSL else
                    _policy_budget() if self.policy_staged and p == self.bridge.POLICY else
+                   _ssh_budget() if self.ssh_staged and p == self.bridge.SSH else
                    _COMMAND_SECONDS + 1 for p in producers)
 
     def collect(self, name, flags, registry):
@@ -2905,11 +3013,13 @@ class _ProducerSession:
             connected = 'INVALID_ADAPTER_RESULT'
         if connected == 'CONNECTED':
             platform_snapshot = None
+            ssh_requested = self.ssh_staged and any(flags[f] for f in (b.SSHD, b.KEYS))
             for producer in b.requested(flags):
                 value = None
                 staged_producer = ((self.staged and producer == b.PLATFORM) or
                                    (self.openssl_staged and producer == b.OPENSSL) or
-                                   (self.policy_staged and producer == b.POLICY))
+                                   (self.policy_staged and producer == b.POLICY) or
+                                   (ssh_requested and producer == b.SSH))
                 try:
                     if self.staged and producer == b.PLATFORM:
                         worker.start(self.run_id)
@@ -2917,7 +3027,7 @@ class _ProducerSession:
                                                            worker.invoke, worker.validate)
                         row = worker.validate(b.record, producer, value, flags, platform_snapshot, self.run_id, name)
                         if (((self.openssl_staged and b.OPENSSL in b.requested(flags))
-                             or (self.policy_staged and flags[b.POLICY_FLAG]))
+                             or (self.policy_staged and flags[b.POLICY_FLAG]) or ssh_requested)
                                 and row['snapshot'] is not None and not b.record_stop(row)):
                             worker.note_platform(row)
                     elif (self.openssl_staged and producer == b.OPENSSL
@@ -2929,7 +3039,7 @@ class _ProducerSession:
                                               self.run_id, name, staged_openssl=True)
                         require(row['snapshot'] is None or worker.ordinal == len(worker.plan),
                                 3, 'INVALID_NATIVE_RESULT')
-                        if self.policy_staged and flags[b.POLICY_FLAG] and not b.record_stop(row):
+                        if ((self.policy_staged and flags[b.POLICY_FLAG]) or ssh_requested) and not b.record_stop(row):
                             worker.note_openssl(row)
                     elif self.policy_staged and producer == b.POLICY:
                         worker.start_policy(self.run_id, flags, platform_snapshot)
@@ -2941,6 +3051,18 @@ class _ProducerSession:
                         require(row['snapshot'] is None or
                                 (worker.ordinal == len(worker.plan) and not worker.lease.pending(name)),
                                 3, 'INVALID_NATIVE_RESULT')
+                        worker.limit(worker.producer_end)
+                        if ssh_requested and not b.record_stop(row):
+                            worker.note_policy(row)
+                    elif ssh_requested and producer == b.SSH:
+                        worker.start_ssh(self.run_id, flags, platform_snapshot)
+                        value = registry[producer].collect(self.run_id, name, worker.task_uuid, flags,
+                                                           platform_snapshot, worker.invoke, worker.validate)
+                        row = worker.validate(b.record, producer, value, flags, platform_snapshot,
+                                              self.run_id, name, gap=value['reason_code'] == 'PLATFORM_GAP',
+                                              staged_ssh=True)
+                        if row['snapshot'] is not None:
+                            worker.note_ssh(row)
                         worker.limit(worker.producer_end)
                     else:
                         # Legacy single-call surrogate budget unchanged. A
@@ -2958,6 +3080,10 @@ class _ProducerSession:
                             row = b.record(producer, value, flags, platform_snapshot, self.run_id, name, gap=gap)
                         if worker is not None:
                             worker.limit(worker.host_end)
+                        if ssh_requested and producer == b.OPENSSL:
+                            # A selected noneligible O2 is an exact typed gap,
+                            # not authorization to invoke a generic callable.
+                            worker.note_openssl_gap(row, flags, platform_snapshot)
                 except _Deadline:
                     clean = (staged_producer and not worker.lease.pending(name))
                     row = b.failed_record(producer, 'CONTROLLER_TIMEOUT' if clean else 'REMOTE_CLEANUP_UNCONFIRMED', cleanup=clean)
@@ -2973,7 +3099,7 @@ class _ProducerSession:
                     platform_snapshot = row['snapshot']
                     if platform_snapshot is None:
                         break
-                if b.record_stop(row):
+                if b.record_stop(row, staged_ssh=ssh_requested) or b._host_local_stop(row, staged_ssh=ssh_requested):
                     break
         if worker is not None:
             worker.limit(worker.host_end)

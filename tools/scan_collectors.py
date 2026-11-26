@@ -99,6 +99,19 @@ _POLICY_READER_SCOPES = tuple(s for s in crypto_policy.SCOPES if s != 'profile-s
 _POLICY_PAYLOAD_BYTES = 64 * 1024
 _POLICY_RECEIPT_BYTES = 66 * 1024
 _POLICY_FRAME_BYTES = 128 * 1024
+_SSH_STAGES = ('config', 'keys')
+_SSH_SLOT_BYTES = 262144
+_SSH_CHILD_BYTES = 262145
+_SSH_RECEIPT_BYTES = 262243
+_SSH_FRAME_BYTES = 524483
+_SSH_STRUCTURE_RESERVE = 16384
+_SSH_STAGED_PAYLOAD_BUDGET = 819200
+_SSH_STAGED_WIRE_BUDGET = _SSH_STAGED_PAYLOAD_BUDGET + _SSH_STRUCTURE_RESERVE
+_SSH_ORDINARY_FAILURES = MappingProxyType({
+    'COMMAND_OUTPUT_LIMIT': 'OUTPUT_LIMIT', 'COMMAND_TIMEOUT': 'TIMEOUT',
+    'COMMAND_START_FAILED': 'EXECUTION_ERROR', 'COMMAND_FAILED': 'EXECUTION_ERROR',
+    'COMMAND_IO_FAILED': 'EXECUTION_ERROR', 'RESIDUAL_PROCESS': 'EXECUTION_ERROR',
+})
 _STAGE_FRAME_BYTES = 32 * 1024
 _STAGE_RECEIPT_BYTES = 16 * 1024
 _STAGE_RPM_FAILURES = MappingProxyType({
@@ -134,12 +147,21 @@ class _PolicyStageBinding(NamedTuple):
     ordinal: int
 
 
+class _SSHStageBinding(NamedTuple):
+    run_id: str
+    target_id: str
+    task_uuid: str
+    producer_id: str
+    stage: str
+    ordinal: int
+
+
 class _StageCompletion(NamedTuple):
     # The binding is the actual controller-issued object, not fields taken
     # from remote output. clean is the trusted driver's independent lifecycle
     # receipt, never copied from an unchecked frame. started=False requires
     # proof that no stage process was launched.
-    binding: _StageBinding | _OpenSSLStageBinding | _PolicyStageBinding
+    binding: _StageBinding | _OpenSSLStageBinding | _PolicyStageBinding | _SSHStageBinding
     stdout: bytes
     stderr: bytes
     wrapper_rc: int | None
@@ -195,6 +217,83 @@ def _bound_policy_stage_validator():
             and pqc_policy_acquire.WRAPPER_BYTES == _POLICY_FRAME_BYTES,
             'INVALID_STAGE_VALIDATOR')
     return pqc_policy_acquire.validate_receipt
+
+
+def _bound_ssh_stage_validator():
+    # Only the canonical S1 module can validate the fixed acquisition frame.
+    from ansible_collections.security.compliance_pqc_readiness.plugins.modules import pqc_ssh_acquire
+    expected = (Path(__file__).resolve().parents[1] / 'ansible_collections/security/'
+                'compliance_pqc_readiness/plugins/modules/pqc_ssh_acquire.py')
+    require(Path(pqc_ssh_acquire.__file__).resolve() == expected
+            and pqc_ssh_acquire.STAGES == _SSH_STAGES
+            and pqc_ssh_acquire.SLOT_BYTES == _SSH_SLOT_BYTES
+            and pqc_ssh_acquire.CHILD_BYTES == _SSH_CHILD_BYTES
+            and pqc_ssh_acquire.RECEIPT_BYTES == _SSH_RECEIPT_BYTES
+            and pqc_ssh_acquire.WRAPPER_BYTES == _SSH_FRAME_BYTES
+            and pqc_ssh_acquire.WIRE_BYTES == MAX_WIRE
+            and pqc_ssh_acquire.NATIVE_Q_QUALIFIED is False
+            and pqc_ssh_acquire.NATIVE_T_QUALIFIED is False
+            and ssh_posture.NATIVE_Q_QUALIFIED is False
+            and ssh_posture.NATIVE_T_QUALIFIED is False,
+            'INVALID_STAGE_VALIDATOR')
+    return pqc_ssh_acquire.validate_receipt
+
+
+def _ssh_plan(flags, snapshot):
+    require(all(type(flags[f]) is bool for f in (SSHD, KEYS)))
+    if _platform_status(snapshot) != 'UNVERIFIED':
+        return ()
+    return tuple((i, stage) for i, (stage, flag) in enumerate(zip(_SSH_STAGES, (SSHD, KEYS)))
+                 if flags[flag])
+
+
+def _ssh_slot(state, reason):
+    return dict(state=state, reason=reason, rc=None, rows=[], gaps=[])
+
+
+def _ssh_fixed_gap(flags, slot, halted=False):
+    # Only for an eligible platform. Disabled and native key-flag conditions
+    # have priority over a host-local halt, exactly as in #17's validator.
+    if not flags[KEYS if slot == 'keys' else SSHD]:
+        return _ssh_slot('NOT_SCANNED', 'DISABLED_BY_USER')
+    if slot == 'native-0' and not flags[KEYS]:
+        return _ssh_slot('UNKNOWN', 'KEY_FLAG_REQUIRED')
+    if halted:
+        return _ssh_slot('UNKNOWN', 'ACQUISITION_STOPPED')
+    if slot not in _SSH_STAGES:
+        return _ssh_slot('UNKNOWN', 'NATIVE_SAFETY_UNPROVEN')
+    return None
+
+
+def _ssh_host_stop(snapshot):
+    # Called only on a closed staged snapshot revalidated by the trusted
+    # worker/parent. No generic uncertainty is downgraded to a host-local stop.
+    return any(snapshot['slots'][s]['reason'] in ('TIMEOUT', 'EXECUTION_ERROR') for s in _SSH_STAGES)
+
+
+def _validate_staged_ssh(snapshot, flags, platform_snapshot):
+    require(platform_snapshot is not None and any(flags[f] for f in (SSHD, KEYS)))
+    ssh_posture.validate_snapshot(snapshot)
+    status = _platform_status(platform_snapshot)
+    if status != 'UNVERIFIED':
+        require(snapshot == _gap_snapshot(SSH, flags, status))
+        return
+    require(snapshot['flags'] == {f: flags[f] for f in (SSHD, KEYS)}
+            and snapshot['platform_status'] == status and snapshot['context_refs'] == ['global-default'])
+    validator = _bound_ssh_stage_validator()
+    halted = False
+    for slot in (*ssh_posture.BASE_SLOTS, 'native-0'):
+        value = snapshot['slots'][slot]
+        gap = _ssh_fixed_gap(flags, slot, halted)
+        if gap is not None:
+            require(value == gap)
+        else:
+            # Revalidate the S1 payload grammar as well as the original whole
+            # snapshot grammar. This reconstructed receipt is schema checking,
+            # not a cleanup or launch witness. The caller owns that authority.
+            validator(dict(format=1, stage=slot, reason_code='COMMAND_OK', rc=0,
+                           cleanup_confirmed=True, payload=value), slot)
+            halted = value['reason'] in ('TIMEOUT', 'EXECUTION_ERROR')
 
 
 def _openssl_plan(flags):
@@ -263,7 +362,12 @@ def _stage_receipt(completion, binding):
         raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
     try:
         out, err, rc = completion.stdout, completion.stderr, completion.wrapper_rc
-        if type(binding) is _PolicyStageBinding:
+        if type(binding) is _SSHStageBinding:
+            require(binding.producer_id == SSH and type(binding.ordinal) is int
+                    and 0 <= binding.ordinal < len(_SSH_STAGES)
+                    and binding.stage == _SSH_STAGES[binding.ordinal])
+            frame_bytes = _SSH_FRAME_BYTES
+        elif type(binding) is _PolicyStageBinding:
             require(binding.producer_id == POLICY and type(binding.ordinal) is int
                     and 0 <= binding.ordinal < len(_POLICY_STAGES)
                     and binding.stage == _POLICY_STAGES[binding.ordinal])
@@ -286,6 +390,8 @@ def _stage_receipt(completion, binding):
             validator = _bound_stage_validator()
         elif type(binding) is _PolicyStageBinding:
             validator = _bound_policy_stage_validator()
+        elif type(binding) is _SSHStageBinding:
+            validator = _bound_ssh_stage_validator()
         else:
             require(type(binding) is _OpenSSLStageBinding and binding.producer_id == OPENSSL
                     and type(binding.ordinal) is int and 0 <= binding.ordinal < len(_OPENSSL_STAGES)
@@ -433,6 +539,46 @@ class _PolicyStageAdapter:
             require(not slots.keys() & rows.keys())
             slots.update(copy.deepcopy(rows))
         snapshot = {scope: slots[scope] for scope in crypto_policy.SCOPES}
+        return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
+
+
+class _SSHStageAdapter:
+    """Private S1 config/keys only; the native worker owns plan and gate."""
+    def __init__(self, prepare):
+        require(callable(prepare), 'INVALID_STAGE_DRIVER')
+        self.prepare = prepare
+
+    def collect(self, run_id, target, task_uuid, flags, platform_snapshot, invoke, validate):
+        require(any(flags[f] for f in (SSHD, KEYS)))
+        plan = validate(_ssh_plan, flags, platform_snapshot)
+        status = validate(_platform_status, platform_snapshot)
+        if status != 'UNVERIFIED':
+            return dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                        snapshot=_gap_snapshot(SSH, flags, status))
+        slots = {}
+        halted = False
+        for slot in (*ssh_posture.BASE_SLOTS, 'native-0'):
+            gap = _ssh_fixed_gap(flags, slot, halted)
+            if gap is not None:
+                slots[slot] = gap
+                continue
+            ordinal = _SSH_STAGES.index(slot)
+            require((ordinal, slot) in plan)
+            binding = _SSHStageBinding(run_id, target, task_uuid, SSH, slot, ordinal)
+            try:
+                receipt = invoke(self.prepare, binding)
+                if receipt['reason_code'] != 'COMMAND_OK':
+                    raise _StageFailure(receipt['reason_code'], receipt['rc'], receipt['cleanup_confirmed'])
+            except _StageFailure as exc:
+                if exc.clean is not True or exc.reason not in _SSH_ORDINARY_FAILURES:
+                    return exc.value()
+                value = _ssh_slot('ERROR', _SSH_ORDINARY_FAILURES[exc.reason])
+            else:
+                value = receipt['payload']
+            slots[slot] = copy.deepcopy(value)
+            halted = value['reason'] in ('TIMEOUT', 'EXECUTION_ERROR')
+        snapshot = dict(flags={f: flags[f] for f in (SSHD, KEYS)}, platform_status=status,
+                        context_refs=['global-default'], slots=slots)
         return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
 
 
@@ -745,10 +891,13 @@ def precheck(producer, snapshot, flags, platform_snapshot, run_id, target, obser
 
 
 def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False,
-           staged_openssl=False, staged_policy=False):
+           staged_openssl=False, staged_policy=False, staged_ssh=False):
     """Validate one trusted adapter return and bind its observed time."""
     require(type(staged_openssl) is bool and (not staged_openssl or producer == OPENSSL)
-            and type(staged_policy) is bool and (not staged_policy or producer == POLICY))
+            and type(staged_policy) is bool and (not staged_policy or producer == POLICY)
+            and type(staged_ssh) is bool and (not staged_ssh or producer == SSH))
+    if staged_ssh:
+        require(platform_snapshot is not None and any(flags[f] for f in (SSHD, KEYS)))
     if staged_policy:
         require(platform_snapshot is not None and flags[POLICY_FLAG] is True)
     if staged_openssl and not gap:
@@ -764,15 +913,18 @@ def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=Fal
         if staged_policy:
             require(gap == (_platform_status(platform_snapshot) != 'UNVERIFIED'))
             _validate_staged_policy(snapshot, flags, platform_snapshot)
+        if staged_ssh:
+            require(gap == (_platform_status(platform_snapshot) != 'UNVERIFIED'))
+            _validate_staged_ssh(snapshot, flags, platform_snapshot)
         precheck(producer, snapshot, flags, platform_snapshot, run_id, target, now)
     else:
         require(reason in FAILURES and snapshot is None and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0)
                 and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
                      or producer == PLATFORM or (staged_openssl and producer == OPENSSL)
-                     or (staged_policy and producer == POLICY))
+                     or (staged_policy and producer == POLICY) or (staged_ssh and producer == SSH))
                 and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                 and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean))
-        require(not staged_policy or reason in FATAL)
+        require(not (staged_policy or staged_ssh) or reason in FATAL)
     return dict(producer_id=producer, observed_at=now, **copy.deepcopy(value))
 
 
@@ -781,12 +933,21 @@ def failed_record(producer, reason, rc=None, cleanup=False):
                 cleanup_confirmed=cleanup, snapshot=None)
 
 
-def record_stop(row):
+def record_stop(row, *, staged_ssh=False):
     if row['reason_code'] in FATAL:
         return row['reason_code']
     if row['snapshot'] is not None and _uncertain(row['snapshot']):
-        return 'REMOTE_CLEANUP_UNCONFIRMED'
+        # Only the exact staged SSH grammar, already checked at record/parent
+        # boundaries, admits a confirmed EXECUTION_ERROR as a local halt.
+        if not (staged_ssh and row['producer_id'] == SSH and row['cleanup_confirmed'] is True
+                and _ssh_host_stop(row['snapshot'])):
+            return 'REMOTE_CLEANUP_UNCONFIRMED'
     return None
+
+
+def _host_local_stop(row, *, staged_ssh=False):
+    return (staged_ssh and row['producer_id'] == SSH and row['cleanup_confirmed'] is True
+            and row['snapshot'] is not None and _ssh_host_stop(row['snapshot']))
 
 
 def _partition(producer, snapshot):
@@ -906,14 +1067,17 @@ class HostProjection:
 
 
 def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
-                      staged_openssl=False, staged_policy=False):
+                      staged_openssl=False, staged_policy=False, staged_ssh=False):
     """Bind actual typed snapshots to one frozen target, in fixed producer order.
 
     The optional private context comes only from the trusted staged session,
     never the handoff itself. The legacy synthetic contract is unchanged.
     """
-    require(type(staged_openssl) is bool and type(staged_policy) is bool)
+    require(type(staged_openssl) is bool and type(staged_policy) is bool and type(staged_ssh) is bool)
     require(not staged_policy or flags[POLICY_FLAG] is True)
+    require(not staged_ssh or (any(flags[f] for f in (SSHD, KEYS))
+            and (staged_openssl or not any(flags[f] for f in (PACKAGES, SSL)))
+            and (staged_policy or not flags[POLICY_FLAG])))
     shape(envelope, ('handoff_version', 'run_id', 'target_id', 'connection', 'records'))
     require(type(envelope['handoff_version']) is int and envelope['handoff_version'] == WIRE_VERSION
             and envelope['run_id'] == run_id and envelope['target_id'] == target)
@@ -963,6 +1127,8 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
             require(not (staged_openssl and producer == OPENSSL and _uncertain(snapshot)))
             if staged_policy and producer == POLICY:
                 _validate_staged_policy(snapshot, flags, platform_snapshot)
+            if staged_ssh and producer == SSH:
+                _validate_staged_ssh(snapshot, flags, platform_snapshot)
             precheck(producer, snapshot, flags, platform_snapshot, run_id, target, observed_at)
             source = _source(producer, snapshot)
             doc, detail = _normalize(doc, host, producer, snapshot, source, observed_at, rules, flags, platform_snapshot)
@@ -977,12 +1143,12 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
         else:
             if staged_openssl and producer == OPENSSL:
                 require(platform_snapshot is not None and _platform_status(platform_snapshot) == 'UNVERIFIED')
-            if staged_policy and producer == POLICY:
-                require(reason in FATAL)
+            if (staged_policy and producer == POLICY) or (staged_ssh and producer == SSH):
+                require(platform_snapshot is not None and reason in FATAL)
             require(reason in FAILURES and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                     and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
                      or producer == PLATFORM or (staged_openssl and producer == OPENSSL)
-                     or (staged_policy and producer == POLICY))
+                     or (staged_policy and producer == POLICY) or (staged_ssh and producer == SSH))
                     and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean)
                     and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0))
             for f in fset:
@@ -990,8 +1156,8 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
                     outcomes[f] = outcome(f, True, 'ERROR', reason, rc)
             if producer == PLATFORM:
                 stopped = True
-        special = record_stop(row)
-        stopped = stopped or special is not None
+        special = record_stop(row, staged_ssh=staged_ssh)
+        stopped = stopped or special is not None or _host_local_stop(row, staged_ssh=staged_ssh)
     require(stopped or len(records) == len(required), 'MISSING_PRODUCER_RESULT')
     refs = [cid for r in outcomes.values() for cid in r['collection_ids']]
     require(len(refs) == len(set(refs)) == len(doc['collections']) and set(refs) == {c['collection_id'] for c in doc['collections']})
