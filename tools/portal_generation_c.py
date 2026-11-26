@@ -71,8 +71,8 @@ class _Buffers:
         self.cbom += size
 
 
-def _assemble(published):
-    _require(type(published) is run_store.PublishedRun)
+def _assemble(published, *, portal_v5=False):
+    _require(type(portal_v5) is bool and type(published) is run_store.PublishedRun)
     m, doc, _, _ = published
     rid = run_store._rid(m['run_id'])
     ids = m['expected_host_ids']
@@ -87,7 +87,12 @@ def _assemble(published):
 
     # C2 has its own #21 membership validation. Compute that projection once,
     # then share one additional #21 projection across A and all host BOMs.
-    assets, asset_pages = portal_asset_indexes.render_asset_indexes(published)
+    if portal_v5:
+        assets, asset_pages = portal_asset_indexes._render_asset_indexes(
+            published, portal_v5=True, page_limit=_MAX_HTML,
+            total_limit=min(_MAX_HTML_TOTAL, _MAX_BUNDLE))
+    else:
+        assets, asset_pages = portal_asset_indexes.render_asset_indexes(published)
     crypto = portal_indexes.project_crypto_indexes(published)
     summary, summary_pages, exports = export_summary._render_summary_projection(
         export_summary._project_scan_summary(published, crypto=crypto))
@@ -121,15 +126,16 @@ def _assemble(published):
     return _Payload(rid, files, entries)
 
 
-def _assemble_payload(published):
+def _assemble_payload(published, *, portal_v5=False):
     """Return all fixed payload bytes and sorted metadata, or a fixed error.
 
     No partial result escapes on failure. Existing preview/public APIs and
     their error contracts are unchanged. C-B/C-C own navigation, receipt,
     publication and catalog admission; these buffers are not a generation.
+    The private exact boolean selects only the two V5 asset HTML pages.
     """
     try:
-        return _assemble(published)
+        return _assemble(published, portal_v5=portal_v5)
     except (run_store.StoreError, cbom_generation.CBOMGenerationError) as exc:
         if exc.code in ('PORTAL_PAYLOAD_SIZE_LIMIT', 'SUMMARY_SIZE_LIMIT', 'ASSET_INDEX_SIZE_LIMIT',
                         'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT'):

@@ -678,18 +678,35 @@ def project_asset_indexes(published):
 
 def render_asset_indexes(published):
     """Return (projection, two fixed preview page buffers), with no writes."""
+    return _render_asset_indexes(published)
+
+
+def _render_asset_indexes(published, *, portal_v5=False, page_limit=None, total_limit=None):
+    """Fixed private renderer; V5 changes HTML only, not the verified projection."""
+    _require(type(portal_v5) is bool)
     result = project_asset_indexes(published)
+    if portal_v5:
+        for row in result['coverage']:
+            hid = _id(row['host_id'], 'h-')
+            _require(hid in result['hosts'] and result['hosts'][hid]['host_id'] == hid)
     pages = {}
+    remaining = total_limit
     try:
         env = Environment(loader=FileSystemLoader(str(_TEMPLATES)), autoescape=True,
                           undefined=StrictUndefined, keep_trailing_newline=True)
         for name in ('certificates', 'services'):
+            cap = min(_MAX_HTML, page_limit) if page_limit is not None else _MAX_HTML
+            if remaining is not None:
+                cap = min(cap, remaining)
             out = bytearray()
-            for chunk in env.get_template(name + '.html.j2').generate(p=result, index=result[name]):
+            for chunk in env.get_template(name + '.html.j2').generate(
+                    p=result, index=result[name], portal_v5=portal_v5):
                 raw = chunk.encode('utf-8')
-                _require(len(raw) <= _MAX_HTML - len(out), 'ASSET_INDEX_SIZE_LIMIT')
+                _require(len(raw) <= cap - len(out), 'ASSET_INDEX_SIZE_LIMIT')
                 out.extend(raw)
             pages[name + '.html'] = bytes(out)
+            if remaining is not None:
+                remaining -= len(out)
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('ASSET_INDEX_RENDER_ERROR') from None
     return result, pages

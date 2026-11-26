@@ -275,3 +275,336 @@ def test_ca_actual_validator_failure(root, monkeypatch):
     with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
         ca._assemble_payload(pub)
     assert c1._c2_tree(root) == before
+
+
+# Historical oracle: fixed, independently hashed Q source, not a second call
+# to the implementation being tested. A private exact-Q checkout may be
+# supplied for local focused testing without obtaining unrelated Repo files.
+_CB1A_Q = '03785660e59831917e1db68d43b61aeadf8c021a'
+_CB1A_Q_FILES = {
+    'tools/portal_asset_indexes.py': 'f840eb62b3ac3dc977f9958c0f29fb70f8f354e6',
+    'tools/portal_generation_c.py': '26c3d4ae60cdc2fc055577062092bc9271ab8d32',
+    'templates/portal/certificates.html.j2': '805bf42152bc28b4adadbf499c2370b58c9f7587',
+    'templates/portal/services.html.j2': 'f30f7afda70886ca5ade735b1db6199791b031a9',
+}
+
+
+def _cb1a_original(tmp_path, *, assembler=True):
+    import os
+    import subprocess
+    from types import ModuleType
+
+    original = tmp_path / 'fixed-q'
+    original.mkdir(mode=0o700)
+    for name, oid in _CB1A_Q_FILES.items():
+        if not assembler and name == 'tools/portal_generation_c.py':
+            continue
+        source = os.environ.get('PQC_CB1A_Q_ROOT')
+        if source:
+            data = (Path(source) / name).read_bytes()
+        else:
+            data = subprocess.run(['git', 'show', f'{_CB1A_Q}:{name}'], cwd=ROOT,
+                                  check=True, capture_output=True, timeout=10).stdout
+        assert hashlib.sha1(f'blob {len(data)}\0'.encode('ascii') + data).hexdigest() == oid
+        path = original / name
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(data)
+        path.chmod(0o600)
+
+    def load(name):
+        module = ModuleType('_cb1a_q_' + name)
+        path = original / 'tools' / (name + '.py')
+        module.__file__ = str(path)
+        exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        return module
+
+    old_assets = load('portal_asset_indexes')
+    old_ca = load('portal_generation_c') if assembler else None
+    if old_ca is not None:
+        old_ca.portal_asset_indexes = old_assets
+    return old_assets, old_ca
+
+
+def _cb1a_parse(raw):
+    from html.parser import HTMLParser
+    from urllib.parse import urlsplit
+
+    class Page(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.ids = set()
+            self.links = []
+            self.sections = []
+            self.coverage_rows = []
+            self.in_coverage = False
+            self.in_sections = False
+            self.row = None
+            self.item = None
+
+        def handle_starttag(self, tag, attrs):
+            assert tag not in {'script', 'iframe', 'object', 'embed', 'base', 'form', 'img'}
+            attrs = dict(attrs)
+            assert not any(k.startswith('on') or k in ('src', 'srcset', 'action', 'style') for k in attrs)
+            if 'id' in attrs:
+                assert attrs['id'] not in self.ids
+                self.ids.add(attrs['id'])
+            if tag == 'section' and attrs.get('id') == 'coverage':
+                self.in_coverage = True
+            if tag == 'tr' and self.in_coverage:
+                self.row = []
+            if tag == 'nav' and attrs.get('aria-label') == 'Run sections':
+                self.in_sections = True
+            if self.in_sections and tag in ('a', 'span'):
+                self.item = [tag, attrs.get('href'), attrs.get('aria-current'), '']
+            if 'href' in attrs:
+                href = attrs['href']; parsed = urlsplit(href)
+                assert not parsed.scheme and not parsed.netloc and not parsed.query
+                assert not parsed.path.startswith('/') and '\\' not in href and '%' not in href
+                assert '..' not in parsed.path or href in ('../portal.css', '../index.html', '../../index.html')
+                self.links.append(href)
+                if self.row is not None:
+                    self.row.append(href)
+
+        def handle_data(self, data):
+            if self.item is not None:
+                self.item[3] += data
+
+        def handle_endtag(self, tag):
+            if self.item is not None and tag == self.item[0]:
+                self.sections.append(tuple(self.item))
+                self.item = None
+            if tag == 'nav':
+                self.in_sections = False
+            if tag == 'tr' and self.row is not None:
+                if self.row:
+                    self.coverage_rows.append(self.row)
+                self.row = None
+            if tag == 'section':
+                self.in_coverage = False
+
+    page = Page()
+    page.feed(raw.decode('utf-8'))
+    page.close()
+    return page
+
+
+def _cb1a_asset_links(projection, files, *, check_coverage=True):
+    sections = ('Hosts', 'Algorithms', 'Libraries', 'Certificates', 'Services', 'Findings', 'Coverage')
+    names = ('certificates', 'services')
+    pages = {name: _cb1a_parse(files[name + '.html']) for name in names}
+    coverage = _cb1a_parse(files['coverage.html']) if check_coverage else None
+    known_refs = {v['href'] for key in ('hosts', 'assets', 'evidence', 'claims')
+                  for v in projection[key].values()}
+    known_refs |= {link['href'] for name in names for group in projection[name]['groups']
+                   for link in group['algorithm_links']}
+    for name, slots in zip(names, (('system_certs', 'nginx_certs'), ('sshd', 'tls_services'))):
+        page = pages[name]
+        assert page.sections == [('span', None, 'page', title) if title.lower() == name else
+                                 ('a', title.lower() + '.html', None, title) for title in sections]
+        assert {'#main', '../portal.css', '../index.html', '../../index.html'} <= set(page.links)
+        rows = [row for row in projection['coverage'] if row['slot'] in slots]
+        expected = [[projection['hosts'][row['host_id']]['href'], 'coverage.html#' + row['host_id']]
+                    for row in rows]
+        assert page.coverage_rows == expected
+        if coverage is not None:
+            assert all(row['host_id'] in coverage.ids for row in rows)
+        for group in projection[name]['groups']:
+            assert group['id'] in page.ids
+            for ids, registry in (('host_ids', 'hosts'), ('asset_ids', 'assets'),
+                                  ('evidence_ids', 'evidence'), ('claim_ids', 'claims')):
+                assert all(projection[registry][ref]['href'] in page.links for ref in group[ids])
+            assert all(link['href'] in page.links for link in group['algorithm_links'])
+        for href in page.links:
+            target, _, fragment = href.partition('#')
+            if not target:
+                assert fragment in page.ids
+            elif target in {key + '.html' for key in names} and fragment:
+                assert fragment in pages[target[:-5]].ids
+            elif target == 'coverage.html' and fragment:
+                assert fragment in projection['hosts']
+            elif fragment:
+                assert href in known_refs
+            else:
+                assert href in ('../portal.css', '../index.html', '../../index.html',
+                                *(title.lower() + '.html' for title in sections))
+    return pages
+
+
+@pytest.mark.parametrize('kind', ['c1', 'v1', 's1', 'legacy', 'zero'])
+def test_cb1a_actual_q_oracle(root, tmp_path, kind):
+    if kind == 'c1':
+        pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    elif kind == 'v1':
+        pub = a.publish(root, native=True)
+    elif kind == 's1':
+        from test_portal_asset_index import publish_assets
+        pub = publish_assets(root)
+    elif kind == 'legacy':
+        raw = json.loads((ROOT / 'tests/fixtures/legacy_report.json').read_bytes())['legacy-per-host']
+        path = tmp_path / 'legacy.json'
+        path.write_text(json.dumps(raw)); path.chmod(0o600)
+        prepared = import_reports._prepare(path, 'legacy-per-host', a.RID, a.END, 'fixture', '1.0.0')
+        import_reports._publish(prepared, root)
+        with rs.RunStore(root) as store:
+            pub = store.open(a.RID)
+    else:
+        pub = a.publish(root, assessed=False, empty=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old_assets, old_ca = _cb1a_original(tmp_path)
+    original_projection, original_pages = old_assets.render_asset_indexes(pub)
+    assert assets.render_asset_indexes(pub) == (original_projection, original_pages)
+    original = old_ca._assemble_payload(pub)
+    default = ca._assemble_payload(pub)
+    assert (default.run_id, default.files, default.entries) == (original.run_id, original.files, original.entries)
+    assert ca._assemble_payload(pub, portal_v5=False) == default
+    v5 = ca._assemble_payload(pub, portal_v5=True)
+    assert v5.run_id == default.run_id and list(v5.files) == list(default.files)
+    changed = {'certificates.html', 'services.html'}
+    assert {name for name in default.files if default.files[name] != v5.files[name]} == changed
+    assert {new['name'] for old, new in zip(default.entries, v5.entries) if old != new} == changed
+    assert v5.entries == tuple(dict(name=name, size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                               for name, raw in sorted(v5.files.items()))
+    assert json.loads(v5.files['asset_indexes.json']) == original_projection
+    _cb1a_asset_links(original_projection, v5.files)
+    if kind == 's1':
+        assert b'&lt;img src=x onerror=alert(1)&gt;' in v5.files['services.html']
+    assert all(a.SENTINEL.encode() not in raw for raw in v5.files.values())
+    for hid in pub.manifest['expected_host_ids']:
+        assert validator.validate_cbom_bytes(v5.files[hid + '.cbom.json']) == validator.ValidationResult()
+    assert ca._assemble_payload(pub, portal_v5=True) == v5
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('kind', ['s1', 'legacy'])
+def test_cb1a_actual_v4_external_links(root, tmp_path, kind):
+    from test_portal_asset_index import publish_assets, catalog, portal, Page
+    if kind == 's1':
+        pub = publish_assets(root)
+    else:
+        raw = json.loads((ROOT / 'tests/fixtures/legacy_report.json').read_bytes())['legacy-per-host']
+        path = tmp_path / 'legacy-v4.json'
+        path.write_text(json.dumps(raw)); path.chmod(0o600)
+        prepared = import_reports._prepare(path, 'legacy-per-host', a.RID, a.END, 'fixture', '1.0.0')
+        import_reports._publish(prepared, root)
+        with rs.RunStore(root) as store:
+            pub = store.open(a.RID)
+    rid = pub.manifest['run_id']
+    catalog.build_catalog(root)
+    portal.render_run(root, rid, with_crypto_indexes=True)
+    before = c1._c2_tree(root)
+    payload = ca._assemble_payload(pub, portal_v5=True)
+    projection = json.loads(payload.files['asset_indexes.json'])
+    pages = _cb1a_asset_links(projection, payload.files)
+    generation = root / rid / 'portal-v4'
+    for page in pages.values():
+        for href in page.links:
+            target, _, fragment = href.partition('#')
+            if target in ('certificates.html', 'services.html', 'findings.html', 'coverage.html', ''):
+                continue
+            if target in ('../portal.css', '../index.html', '../../index.html'):
+                assert (generation / target).is_file()
+            else:
+                actual = generation / target
+                assert actual.is_file()
+                if fragment:
+                    # Existing V4 host pages legitimately link back to
+                    # ../index.html#host-id. Keep the strict V5 parser on
+                    # the new pages; use the original unique-ID oracle for
+                    # these unchanged external targets, not fake V2 pages.
+                    assert fragment in Page(actual).ids
+    assert c1._c2_tree(root) == before
+
+
+def test_cb1a_actual_shared_validation(root, monkeypatch):
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    counts = Counter()
+    for module, name in ((rs.RunStore, 'open'), (crypto, 'project_crypto_indexes'),
+                         (assets, 'project_asset_indexes'), (validator, 'validate_cbom_bytes'),
+                         (gen, '_verified_taxonomy')):
+        original = getattr(module, name)
+        def call(*args, _name=name, _original=original, **kwargs):
+            counts[_name] += 1
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(module, name, call)
+    before = c1._c2_tree(root)
+    ca._assemble_payload(pub, portal_v5=True)
+    assert counts == {'project_asset_indexes': 1, 'project_crypto_indexes': 2,
+                      'validate_cbom_bytes': 3, '_verified_taxonomy': 1}
+    assert c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('value', [None, 0, 1, 'true', [], {}])
+def test_cb1a_strict_mode(root, value):
+    pub = a.publish(root, assessed=False, empty=True)
+    before = c1._c2_tree(root)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_payload(pub, portal_v5=value)
+    assert c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('cap', ['_MAX_HTML', '_MAX_HTML_TOTAL', '_MAX_BUNDLE'])
+def test_cb1a_exact_capacity(root, monkeypatch, cap):
+    pub = a.publish(root, assessed=False, empty=True)
+    payload = ca._assemble_payload(pub, portal_v5=True)
+    limit = {'_MAX_HTML': max(len(payload.files[name]) for name in ca._HTML),
+             '_MAX_HTML_TOTAL': sum(len(payload.files[name]) for name in ca._HTML),
+             '_MAX_BUNDLE': sum(len(raw) for raw in payload.files.values())}[cap]
+    before = c1._c2_tree(root)
+    monkeypatch.setattr(ca, cap, limit)
+    assert ca._assemble_payload(pub, portal_v5=True) == payload
+    monkeypatch.setattr(ca, cap, limit - 1)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+        ca._assemble_payload(pub, portal_v5=True)
+    assert c1._c2_tree(root) == before
+
+
+def test_cb1a_missing_template(root, tmp_path, monkeypatch):
+    pub = a.publish(root, assessed=False, empty=True)
+    before = c1._c2_tree(root)
+    only = tmp_path / 'one-template'
+    only.mkdir(mode=0o700)
+    (only / 'certificates.html.j2').write_bytes((assets._TEMPLATES / 'certificates.html.j2').read_bytes())
+    monkeypatch.setattr(assets, '_TEMPLATES', only)
+    with pytest.raises(rs.StoreError, match='^ASSET_INDEX_RENDER_ERROR$'):
+        assets.render_asset_indexes(pub)
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_payload(pub, portal_v5=True)
+    assert c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('modes', [('complete', 'partial', 'connection'), ('disabled',)])
+def test_cb1a_actual_asset_only(root, tmp_path, monkeypatch, modes):
+    original = c1.cert_snapshot
+    sentinel = '<img src=x onerror=alert(1)>'
+    def public_metadata(partial=False, large=False):
+        snapshot = original(partial, large)
+        for value in snapshot.values():
+            for source in value['sources']:
+                for block in source['blocks']:
+                    cert = block['certificate']
+                    cert['issuer'] = 'CN=' + sentinel
+                    cert['gaps'] = c1.ca.metadata_gaps(cert)
+                    block['reason'] = 'METADATA_GAP' if cert['gaps'] else 'OK'
+        return snapshot
+    monkeypatch.setattr(c1, 'cert_snapshot', public_metadata)
+    pub = c1._c2_open(root, modes, assessed=len(modes) > 1)
+    old_assets, _ = _cb1a_original(tmp_path, assembler=False)
+    before, saved = c1._c2_tree(root), deepcopy(pub)
+    projection, preview = old_assets.render_asset_indexes(pub)
+    assert assets.render_asset_indexes(pub) == (projection, preview)
+    projected, pages = assets._render_asset_indexes(pub, portal_v5=True)
+    assert projected == projection
+    _cb1a_asset_links(projected, pages, check_coverage=False)
+    if len(modes) > 1:
+        assert b'&lt;img src=x onerror=alert(1)&gt;' in pages['certificates.html']
+        assert sentinel.encode() not in pages['certificates.html']
+    else:
+        assert not projected['occurrences'] and not projected['services']['groups']
+        assert all(row['state'] != 'COLLECTED' for row in projected['coverage'])
+    maximum, total = max(map(len, pages.values())), sum(map(len, pages.values()))
+    assert assets._render_asset_indexes(pub, portal_v5=True, page_limit=maximum,
+                                        total_limit=total) == (projected, pages)
+    for limits in (dict(page_limit=maximum - 1), dict(total_limit=total - 1)):
+        with pytest.raises(rs.StoreError, match='^ASSET_INDEX_SIZE_LIMIT$'):
+            assets._render_asset_indexes(pub, portal_v5=True, **limits)
+    assert pub == saved and c1._c2_tree(root) == before
