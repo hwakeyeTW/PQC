@@ -4,16 +4,11 @@ name: Collection Tests
 on:
   push:
     branches: [main]
-    paths:
-      - 'ansible_collections/**'
-      - 'plugins/**'
-      - 'roles/**'
   pull_request:
     branches: [main]
-    paths:
-      - 'ansible_collections/**'
-      - 'plugins/**'
-      - 'roles/**'
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,33 +16,519 @@ concurrency:
 
 jobs:
   tests:
-    name: "Tests (ansible-core ${{ matrix.ansible }})"
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.lane }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        ansible: ['2.17', '2.18']
+        include:
+          - lane: legacy-217
+            python: '3.11.15'
+            python_minor: '3.11'
+            core: '2.17.14'
+            pytest: '9.0.2'
+            lint: ''
+            requirements: collections/requirements-ci-legacy.yml
+          - lane: legacy-218
+            python: '3.11.15'
+            python_minor: '3.11'
+            core: '2.18.15'
+            pytest: '9.0.2'
+            lint: ''
+            requirements: collections/requirements-ci-legacy.yml
+          - lane: maintained-221
+            python: '3.12.14'
+            python_minor: '3.12'
+            core: '2.21.5'
+            pytest: '9.0.2'
+            lint: '26.8.0'
+            requirements: collections/requirements-ci.yml
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_PYTHON: ${{ matrix.python }}
+      CI_PYTHON_MINOR: ${{ matrix.python_minor }}
+      CI_CORE: ${{ matrix.core }}
+      CI_PYTEST: ${{ matrix.pytest }}
+      CI_LINT: ${{ matrix.lint }}
+      CI_REQUIREMENTS: ${{ github.workspace }}/${{ matrix.requirements }}
+      CI_COLLECTION: ansible_collections/security/compliance_pqc_readiness
+      PYTHONNOUSERSITE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install ansible-core and test deps
+      - name: Acquire verified source projection
+        id: acquisition
+        env:
+          PQC_CI_TOKEN: ${{ github.token }}
         run: |
-          pip install "ansible-core~=${{ matrix.ansible }}.0" pytest community.crypto
-          pip install ansible-lint
+          set -euo pipefail
+          umask 077
+          # No checkout action, upstream Git fetch, archive endpoint or fallback.
+          # The shared prefix below must match tools/ci_bootstrap.py byte-for-byte.
+          timeout --kill-after=5s 480s python3 -I -B - <<'PY'
+          """Metadata-first CI acquisition; only public, verified source is projected.
 
-      - name: Run ansible-test sanity
-        working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-test sanity --docker --python 3.11 plugins/ 2>&1 || true
+          The prefix through END INLINE COMMON is copied verbatim into the workflow.
+          The inline caller uses it before any candidate Python is executed.
+          """
+          import base64
+          import hashlib
+          import http.client
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import ssl
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+          import time
 
-      - name: Run unit tests
-        working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-test units --docker --python 3.11 2>&1 || pytest tests/unit/ -v
+          REPO = "hwakeyeTW/PQC"
+          REPO_ID = 1469533358
+          HOST = "api.github.com"
+          COLLECTION = "ansible_collections/security/compliance_pqc_readiness"
+          HELPER = "tools/ci_bootstrap.py"
+          WORKFLOW = ".github/workflows/collection-tests.yml"
+          MAX_BLOBS, MAX_REQUESTS = 200, 220
+          MAX_BLOB, MAX_TOTAL = 2 * 1024**2, 16 * 1024**2
+          MAX_RESPONSE = 4 * 1024**2
+          MAX_SECONDS, REQUEST_SECONDS = 480, 20
+          EXACT = frozenset({WORKFLOW, ".gitignore", "README.md", "ansible.cfg",
+                             "reports/.gitignore", "collections/requirements-ci-legacy.yml",
+                             "collections/requirements-ci.yml"})
+          PREFIXES = ("roles/", "plugins/", "playbooks/", COLLECTION + "/", "tools/",
+                      "tests/", "schema/", "schemas/", "docs/development/")
+          REQUIRED = EXACT | {"docs/development/qa.md", HELPER, "tests/test_ci_bootstrap.py",
+                              "playbooks/crypto_posture_snapshot.yml", "playbooks/pqc_pipeline.yml",
+                              COLLECTION + "/playbooks/pqc_pipeline.yml", COLLECTION + "/galaxy.yml",
+                              COLLECTION + "/meta/runtime.yml"}
+          DOMAINS = ("roles/", "plugins/", COLLECTION + "/roles/",
+                     COLLECTION + "/plugins/", COLLECTION + "/tests/unit/")
 
-      - name: Run ansible-lint
-        working-directory: ansible_collections/security/compliance_pqc_readiness
-        run: ansible-lint playbooks/ roles/ 2>&1 || true
+
+          class BoundaryError(RuntimeError):
+              """Sanitized, fail-closed boundary error."""
+
+
+          def require(condition, message):
+              if not condition:
+                  raise BoundaryError(message)
+
+
+          def oid(value):
+              require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value), "invalid Git OID")
+              return value
+
+
+          def git_hash(kind, data):
+              return hashlib.sha1(f"{kind} {len(data)}\0".encode() + data).hexdigest()
+
+
+          def unique_json(raw):
+              def pairs(items):
+                  result = {}
+                  for key, value in items:
+                      require(key not in result, "duplicate JSON member")
+                      result[key] = value
+                  return result
+              try:
+                  return json.loads(raw, object_pairs_hook=pairs,
+                                    parse_constant=lambda _: require(False, "invalid JSON constant"))
+              except (ValueError, UnicodeError, RecursionError) as exc:
+                  raise BoundaryError("invalid JSON response") from exc
+
+
+          def repo_identity(obj):
+              require(type(obj.get("id")) is int and obj["id"] == REPO_ID and
+                      obj.get("full_name") == REPO and obj.get("private") is False,
+                      "repository identity mismatch")
+
+
+          def event_identity(env, event):
+              require(env.get("GITHUB_REPOSITORY") == REPO and
+                      env.get("GITHUB_REPOSITORY_ID") == str(REPO_ID) and
+                      env.get("GITHUB_API_URL") == "https://" + HOST, "runner identity mismatch")
+              repo_identity(event["repository"])
+              tested = oid(env["GITHUB_SHA"])
+              name = env["GITHUB_EVENT_NAME"]
+              if name == "pull_request":
+                  pr = event["pull_request"]
+                  repo_identity(pr["base"]["repo"])
+                  require(pr["base"]["ref"] == "main" and pr.get("merge_commit_sha") == tested and
+                          event.get("action") in {"opened", "synchronize", "reopened"} and
+                          type(event.get("number")) is int and event["number"] > 0 and
+                          env.get("GITHUB_REF") == f"refs/pull/{event['number']}/merge", "PR event mismatch")
+                  base, head = oid(pr["base"]["sha"]), oid(pr["head"]["sha"])
+                  require(base != head and tested not in {base, head}, "PR requires tested merge commit")
+              elif name == "push":
+                  require(event.get("ref") == env.get("GITHUB_REF") == "refs/heads/main" and
+                          event.get("after") == tested and event.get("deleted") is False,
+                          "push event mismatch")
+                  base, head = oid(event["before"]), tested
+              else:
+                  raise BoundaryError("unsupported event")
+              return {"repo": REPO, "repo_id": REPO_ID, "event": name, "tested": tested,
+                      "base": base, "head": head}
+
+
+          def safe_path(path):
+              # Intentionally narrow portable ASCII namespace, including hidden files.
+              require(isinstance(path, str) and len(path) <= 512, "unsafe path")
+              for part in path.split("/"):
+                  require(re.fullmatch(r"[A-Za-z0-9._-]{1,160}", part) and
+                          part not in {".", ".."} and part.casefold() != ".git" and
+                          not part.endswith(".") and
+                          part.split(".")[0].upper() not in {"CON", "PRN", "AUX", "NUL",
+                              *[f"COM{i}" for i in range(1, 10)], *[f"LPT{i}" for i in range(1, 10)]},
+                          "unsafe path component")
+              return path
+
+
+          def allowed(path):
+              if path == "reports/.gitignore":
+                  return True
+              if path.casefold().startswith((COLLECTION + "/tests/output/").casefold()):
+                  return False
+              parts = path.casefold().split("/")
+              deny = {"reports", "inventory", ".local", "secrets", ".ansible", "logs", "tmp",
+                      ".venv", ".pytest_cache", "__pycache__", ".gitmodules", ".gitattributes"}
+              if (any(p in deny or p == ".env" or p.startswith((".env.", ".vault_pass", "vault-password"))
+                      for p in parts) or parts[-1].endswith((".retry", ".pyc", ".pyo", ".pyd", ".log"))
+                      or parts[-1].endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
+                                             ".tar.bz2", ".tbz2", ".zip", ".7z"))):
+                  return False
+              return path in EXACT or path.startswith(PREFIXES)
+
+
+          def tree_manifest(identity, tree_oid, response):
+              """Verify every directory's Git tree object from complete recursive metadata."""
+              require(response.get("sha") == oid(tree_oid) and response.get("truncated") is False,
+                      "wrong or truncated recursive tree")
+              rows = response.get("tree")
+              require(isinstance(rows, list) and 0 < len(rows) <= 10000, "invalid tree size")
+              entries, folded = {}, set()
+              for row in rows:
+                  path = safe_path(row["path"])
+                  require(path.casefold() not in folded, "duplicate or case-ambiguous path")
+                  folded.add(path.casefold())
+                  kind, mode, sha = row["type"], row["mode"], oid(row["sha"])
+                  require((kind == "tree" and mode == "040000") or
+                          (kind == "blob" and mode in {"100644", "100755"}), "unsupported type or mode")
+                  size = row.get("size")
+                  require(kind == "tree" or (type(size) is int and size >= 0), "invalid blob size")
+                  entries[path] = {"path": path, "mode": mode, "type": kind, "sha": sha, "size": size}
+              children = {"": []}
+              for path, row in entries.items():
+                  parent, _, name = path.rpartition("/")
+                  require(not parent or (parent in entries and entries[parent]["type"] == "tree"),
+                          "missing directory or ancestor conflict")
+                  children.setdefault(parent, []).append((name, row))
+                  if row["type"] == "tree":
+                      children.setdefault(path, [])
+              for path, items in children.items():
+                  data = b"".join((r["mode"].lstrip("0") + " " + name).encode() + b"\0" + bytes.fromhex(r["sha"])
+                                  for name, r in sorted(items, key=lambda x: x[0] + ("/" if x[1]["type"] == "tree" else "")))
+                  require(git_hash("tree", data) == (entries[path]["sha"] if path else tree_oid),
+                          "recursive tree identity mismatch")
+              leaves = [row for row in entries.values() if row["type"] == "blob"]
+              selected = sorted((r for r in leaves if allowed(r["path"])), key=lambda r: r["path"])
+              paths = {r["path"] for r in selected}
+              require(REQUIRED <= paths and all(any(p.startswith(d) for p in paths) for d in DOMAINS),
+                      "required source missing")
+              approved = {}
+              for row in selected:
+                  sha, size = row["sha"], row["size"]
+                  require(size <= MAX_BLOB and approved.get(sha, size) == size, "blob size budget or conflict")
+                  approved[sha] = size
+              excluded = {r["sha"] for r in leaves if r["path"] not in paths}
+              require(not excluded.intersection(approved), "allowed/excluded OID overlap")
+              require(len(approved) <= MAX_BLOBS and sum(r["size"] for r in selected) <= MAX_TOTAL,
+                      "source acquisition budget exceeded")
+              return {**identity, "tree": tree_oid, "allowed": selected, "excluded_oids": sorted(excluded)}
+
+
+          class Api:
+              """Bounded, exact-endpoint HTTPS GET. No redirect, proxy, retry or archive API."""
+              def __init__(self, token):
+                  require(isinstance(token, str) and bool(token), "missing scoped read token")
+                  self.token, self.deadline = token, time.monotonic() + MAX_SECONDS
+                  self.requests, self.remaining = 0, None
+                  self.approved, self.fetched = None, set()
+
+              def get(self, kind, sha=None):
+                  prefix = "/repos/" + REPO
+                  if kind == "repo":
+                      require(sha is None, "invalid repository endpoint")
+                      path = prefix
+                  elif kind == "commit":
+                      path = prefix + "/git/commits/" + oid(sha)
+                  elif kind == "tree":
+                      path = prefix + "/git/trees/" + oid(sha) + "?recursive=1"
+                  elif kind == "blob":
+                      require(self.approved is not None and sha in self.approved and sha not in self.fetched,
+                              "unapproved or duplicate blob request")
+                      self.fetched.add(sha)
+                      path = prefix + "/git/blobs/" + oid(sha)
+                  else:
+                      raise BoundaryError("unsupported API endpoint")
+                  require(self.requests < MAX_REQUESTS and (self.remaining is None or self.remaining > 0),
+                          "API request budget exhausted")
+                  remaining_time = self.deadline - time.monotonic()
+                  require(remaining_time > 0, "acquisition deadline exceeded")
+                  self.requests += 1
+                  conn = http.client.HTTPSConnection(HOST, 443, timeout=min(REQUEST_SECONDS, remaining_time),
+                                                     context=ssl.create_default_context())
+                  try:
+                      conn.request("GET", path, headers={"Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "PQC-CI-bootstrap",
+                                   "Authorization": "Bearer " + self.token, "Accept-Encoding": "identity"})
+                      response = conn.getresponse()
+                      require(response.status == 200, "API non-200 response (no retry or redirect)")
+                      require(response.getheader("Content-Type", "").split(";")[0].strip() == "application/json" and
+                              response.getheader("Content-Encoding", "identity") == "identity", "unexpected API response type")
+                      rate = response.getheader("X-RateLimit-Remaining", "")
+                      require(re.fullmatch(r"[0-9]+", rate), "rate limit metadata missing")
+                      self.remaining = int(rate)
+                      length = response.getheader("Content-Length")
+                      require(length is None or (re.fullmatch(r"[0-9]+", length) and int(length) <= MAX_RESPONSE),
+                              "response length budget exceeded")
+                      raw = response.read(MAX_RESPONSE + 1)
+                      require(len(raw) <= MAX_RESPONSE and (length is None or len(raw) == int(length)) and
+                              time.monotonic() < self.deadline, "response budget or length mismatch")
+                      result = unique_json(raw)
+                      require(isinstance(result, dict), "API object expected")
+                      return result
+                  except (OSError, http.client.HTTPException) as exc:
+                      raise BoundaryError("API transport failed") from exc
+                  finally:
+                      conn.close()
+
+              def authorize(self, manifest):
+                  require(self.approved is None and not self.fetched, "API already authorized")
+                  pins = {r["sha"]: r["size"] for r in manifest["allowed"]}
+                  require(not set(pins).intersection(manifest["excluded_oids"]) and len(pins) <= MAX_BLOBS and
+                          self.requests + len(pins) <= MAX_REQUESTS and self.remaining is not None and
+                          self.remaining >= len(pins), "insufficient safe acquisition budget")
+                  self.approved = pins
+
+              def blob(self, sha):
+                  data = self.get("blob", sha)
+                  size = self.approved[sha]
+                  require(data.get("sha") == sha and type(data.get("size")) is int and data["size"] == size and
+                          data.get("encoding") == "base64" and isinstance(data.get("content"), str), "blob metadata mismatch")
+                  try:
+                      raw = base64.b64decode(data["content"].replace("\n", ""), validate=True)
+                  except ValueError as exc:
+                      raise BoundaryError("invalid blob base64") from exc
+                  require(len(raw) == size and git_hash("blob", raw) == sha, "blob size or hash mismatch")
+                  require(not raw.startswith(b"version https://git-lfs.github.com/spec/"), "LFS pointer forbidden")
+                  return raw
+
+
+          def acquire_manifest(api, env, event):
+              identity = event_identity(env, event)
+              repo_identity(api.get("repo"))
+              commit = api.get("commit", identity["tested"])
+              require(commit.get("sha") == identity["tested"], "tested commit mismatch")
+              parents = [oid(p["sha"]) for p in commit["parents"]]
+              if identity["event"] == "pull_request":
+                  require(parents == [identity["base"], identity["head"]], "merge parents mismatch")
+              tree_oid = oid(commit["tree"]["sha"])
+              manifest = tree_manifest({**identity, "parents": parents}, tree_oid, api.get("tree", tree_oid))
+              api.authorize(manifest)
+              return manifest
+
+
+          def directory(path):
+              path = Path(path)
+              require(path.is_absolute() and ".." not in path.parts, "unsafe directory path")
+              for node in reversed((path, *path.parents)):
+                  st = node.lstat()
+                  require(stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode), "non-directory ancestor")
+              return path
+
+
+          def isolated_env(scratch, path=None):
+              return {"PATH": path or os.defpath, "HOME": str(scratch / "home"),
+                      "XDG_CONFIG_HOME": str(scratch / "xdg-config"), "XDG_CACHE_HOME": str(scratch / "xdg-cache"),
+                      "TMPDIR": str(scratch / "tmp"), "LC_ALL": "C", "LANG": "C",
+                      "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                      "GIT_CONFIG_SYSTEM": os.devnull, "GIT_ATTR_NOSYSTEM": "1",
+                      "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+                      "GIT_LFS_SKIP_SMUDGE": "1", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+
+
+          def git_call(root, env, *args, data=None):
+              git = shutil.which("git", path=env["PATH"])
+              require(git is not None, "Git unavailable")
+              # Never inherit GIT_* or configure hooks, remotes, filters or alternates.
+              proc = subprocess.run([git, "--no-lazy-fetch", "-c", "core.hooksPath=/dev/null", *args],
+                                    cwd=root, env=env, input=data, capture_output=True, timeout=30)
+              require(proc.returncode == 0, "isolated Git command failed")
+              return proc.stdout
+
+
+          def prepare(root, scratch, env):
+              directory(root)
+              directory(scratch)
+              require(root != scratch and root not in scratch.parents and scratch not in root.parents,
+                      "scratch/workspace overlap")
+              require(not any(root.iterdir()), "workspace not empty")
+              require(not any(scratch.iterdir()), "scratch not empty")
+              for name in ("home", "xdg-config", "xdg-cache", "tmp"):
+                  (scratch / name).mkdir(mode=0o700)
+              clean = isolated_env(scratch, env.get("PATH"))
+              git_call(root, clean, "--version")
+              git_call(root, clean, "init", "-q", "--template=", "--object-format=sha1", "-b", "projection")
+              return clean
+
+
+          # END INLINE COMMON
+
+          COMMON_SHA256 = "68f6ee2fd815cc88a6f35357d3de064127385aa219e83df5c1933b98ff710d00"
+
+
+          def inline_main():
+              env = dict(os.environ)
+              token = os.environ.pop("PQC_CI_TOKEN", "")
+              env.pop("PQC_CI_TOKEN", None)
+              root = directory(Path(env["GITHUB_WORKSPACE"]))
+              scratch = Path(tempfile.mkdtemp(prefix="pqc-ci.", dir=directory(Path(env["RUNNER_TEMP"]))))
+              clean = prepare(root, scratch, env)
+              event = unique_json(Path(env["GITHUB_EVENT_PATH"]).read_bytes())
+              api = Api(token)
+              manifest = acquire_manifest(api, env, event)
+              helper = next(row for row in manifest["allowed"] if row["path"] == HELPER)
+              code = api.blob(helper["sha"])
+              marker = b"# END INLINE COMMON\n"
+              common, sep, _ = code.partition(marker)
+              require(sep and hashlib.sha256(common + sep).hexdigest() == COMMON_SHA256,
+                      "inline/helper common prefix mismatch")
+              namespace = {"__name__": "pqc_verified_bootstrap", "__file__": str(scratch / "guard.py")}
+              exec(compile(code, "verified-ci-bootstrap", "exec"), namespace)
+              namespace["materialize"](api, manifest, root, scratch, clean, code)
+              api.token = ""
+              exports = {"CI_ROOT": str(scratch), "HOME": clean["HOME"],
+                         "XDG_CONFIG_HOME": clean["XDG_CONFIG_HOME"], "XDG_CACHE_HOME": clean["XDG_CACHE_HOME"],
+                         "CI_MANIFEST_SHA256": hashlib.sha256((scratch / "manifest.json").read_bytes()).hexdigest(),
+                         "CI_PROJECTION_SHA256": hashlib.sha256((scratch / "projection.json").read_bytes()).hexdigest(),
+                         "CI_GUARD_SHA256": hashlib.sha256(code).hexdigest()}
+              with open(env["GITHUB_ENV"], "a", encoding="utf-8") as out:
+                  for key, value in exports.items():
+                      require("\n" not in value and "\r" not in value, "unsafe environment export")
+                      out.write(f"{key}={value}\n")
+              print(f"image={env.get('ImageOS', 'unknown')} {env.get('ImageVersion', 'unknown')}")
+
+
+          if __name__ == "__main__":
+              try:
+                  inline_main()
+              except (BoundaryError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                  print(str(exc) if isinstance(exc, BoundaryError) else type(exc).__name__, file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+
+      # setup-python v6.2.0; exact patch, no cache.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python }}
+          check-latest: false
+
+      - name: Create isolated test environment
+        id: environment
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" verify --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT"
+          python -c 'import os, platform; v = platform.python_version(); print(v); raise SystemExit(v != os.environ["CI_PYTHON"])'
+          python -I -B "$CI_ROOT/guard.py" locale --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT"
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label venv -- python -m venv "$CI_ROOT/venv"
+          mkdir "$CI_ROOT/collections" "$CI_ROOT/ansible-tmp" "$CI_ROOT/ansible-home" "$CI_ROOT/lint-cache"
+          printf '[pqc_targets]\nlocalhost ansible_connection=local\n' > "$CI_ROOT/inventory.ini"
+          printf '%s\n' "$CI_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install and verify pinned CI dependencies
+        id: install
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label install -- python -I -B "$CI_ROOT/guard.py" install
+
+      - name: CI bootstrap regression
+        id: bootstrap
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label bootstrap --junit "$CI_ROOT/bootstrap.xml" -- python -m pytest -q -rs -p no:cacheprovider --basetemp "$CI_ROOT/bootstrap-pytest" --junitxml="$CI_ROOT/bootstrap.xml" tests/test_ci_bootstrap.py
+
+      - name: Synthetic syntax and lint failure-oracle checks
+        id: controls
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label controls -- python -I -B "$CI_ROOT/guard.py" controls
+
+      - name: Collection unit tests
+        id: unit
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label unit --junit "$CI_ROOT/collection-unit.xml" -- python -m pytest -q -rs -p no:cacheprovider --basetemp "$CI_ROOT/collection-pytest" --junitxml="$CI_ROOT/collection-unit.xml" "$CI_COLLECTION/tests/unit/"
+
+      - name: Standalone snapshot syntax
+        id: snapshot
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label snapshot -- ansible-playbook -i "$CI_ROOT/inventory.ini" --syntax-check playbooks/crypto_posture_snapshot.yml
+
+      - name: Standalone pipeline syntax
+        id: pipeline
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label pipeline -- ansible-playbook -i "$CI_ROOT/inventory.ini" --syntax-check playbooks/pqc_pipeline.yml
+
+      - name: Collection pipeline syntax
+        id: collection_pipeline
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label collection-pipeline -- ansible-playbook -i "$CI_ROOT/inventory.ini" --syntax-check ansible_collections/security/compliance_pqc_readiness/playbooks/pqc_pipeline.yml
+
+      - name: Collection plugin sanity
+        id: sanity
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label sanity --cwd collection --sanity -- python -I -B "$CI_ROOT/guard.py" sanity
+
+      - name: Collection lint
+        id: lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.lane == 'maintained-221' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" run --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT" --label lint --cwd collection -- ansible-lint --offline playbooks/ roles/
+
+      - name: Recheck data boundary
+        if: ${{ !cancelled() && steps.acquisition.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$CI_GUARD_SHA256" "$CI_ROOT/guard.py" | sha256sum -c -
+          python -I -B "$CI_ROOT/guard.py" verify --root "$GITHUB_WORKSPACE" --scratch "$CI_ROOT"
