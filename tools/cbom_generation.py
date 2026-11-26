@@ -18,6 +18,7 @@ except ImportError:
 
 MAX_BYTES = cbom_validation.MAX_INPUT
 MAX_MEMBERSHIPS = evidence.MAX_BYTES // 66
+_MAX_BATCH_MEMBERSHIPS = (256 * 1024 * 1024) // 66
 VERSION = 1
 _USABLE = frozenset(('COLLECTED', 'PARTIAL'))
 _DEFERRED = frozenset(('certificate', 'public-key', 'public_key'))
@@ -110,24 +111,138 @@ def _primitive(group, verified):
     return 'unknown'
 
 
+class _BatchInputs:
+    """Private, read-only partitions of one already verified publication.
+
+    The C-A assembler owns both projections. This is not an authenticator or
+    a public substitute for Store.open. Copy only local membership lists and
+    registry references, not full documents or global group payloads per host.
+    """
+    def __init__(self, published, crypto, asset_index):
+        self.published = published
+        m, doc = published.manifest, published.document
+        ids = m['expected_host_ids']
+        _require(crypto['run_id'] == asset_index['run_id'] == m['run_id']
+                 and 0 < len(ids) <= 1000 and set(asset_index['hosts']) == set(ids))
+        self.hosts = {h['host_id']: h for h in m['hosts']}
+        _require(set(self.hosts) == set(ids))
+        self.cost = 0
+        self.charge(len(ids))
+        self.local = {hid: dict(rows={}, assets={}, collections={}, claims={}) for hid in ids}
+        owners = {}
+        for field, key, name, rows in (
+                ('evidence_ids', 'evidence_id', 'rows', doc['evidence']),
+                ('asset_ids', 'asset_id', 'assets', doc['assets']),
+                ('collection_ids', 'collection_id', 'collections', doc['collections']),
+                ('claim_ids', 'claim_id', 'claims', (published.assessed or doc)['claims'])):
+            owner = owners[field] = {}
+            for row in rows:
+                hid = row['subject']['host_id'] if name == 'claims' else row['host_id']
+                ref = row[key]
+                self.charge(2)
+                _require(hid in self.local and ref not in owner)
+                owner[ref] = hid
+                self.local[hid][name][ref] = row
+        occurrences = {hid: {} for hid in ids}
+        owners['recorded_occurrence_ids'] = {}
+        for oid, occurrence in asset_index['occurrences'].items():
+            hid = occurrence['host_id']
+            self.charge(2)
+            _require(hid in occurrences)
+            owners['recorded_occurrence_ids'][oid] = hid
+            occurrences[hid][oid] = occurrence
+        self.crypto = {hid: {'algorithms': {'groups': []}, 'libraries': {'groups': []},
+                             'relations': []} for hid in ids}
+        self.certificates = {hid: {'run_id': m['run_id'], 'hosts': {hid: asset_index['hosts'][hid]},
+            'certificates': {'groups': []}, 'occurrences': occurrences[hid], 'coverage': []} for hid in ids}
+
+        def split(refs, field):
+            local = defaultdict(list)
+            for ref in refs:
+                self.charge()
+                _require(ref in owners[field])
+                local[owners[field][ref]].append(ref)
+            return local
+
+        def groups(rows, destination, *, certificates=False):
+            fields = ('evidence_ids', 'asset_ids', 'claim_ids')
+            if certificates:
+                fields += ('recorded_occurrence_ids',)
+            for group in rows:
+                parts = {key: split(group[key], key) for key in fields}
+                hosts = set().union(*(part.keys() for part in parts.values()))
+                roles = {role: split(group[role]['evidence_ids'], 'evidence_ids')
+                         for role in ('public_key', 'signature')} if certificates else {}
+                for hid in hosts:
+                    # Shallow view; global metadata/identity/qualification
+                    # stays exactly as in B1/B2, while references are local.
+                    self.charge(len(group) + len(fields))
+                    local = {**group, **{key: part.get(hid, []) for key, part in parts.items()}}
+                    for role, part in roles.items():
+                        local[role] = {**group[role], 'evidence_ids': part.get(hid, [])}
+                    destination(hid).append(local)
+
+        for name in ('algorithms', 'libraries'):
+            groups(crypto[name]['groups'], lambda hid: self.crypto[hid][name]['groups'])
+        for relation in crypto['relations']:
+            for hid, refs in split(relation['evidence_ids'], 'evidence_ids').items():
+                self.charge()
+                self.crypto[hid]['relations'].append({**relation, 'evidence_ids': refs})
+        groups(asset_index['certificates']['groups'],
+               lambda hid: self.certificates[hid]['certificates']['groups'], certificates=True)
+        for row in asset_index['coverage']:
+            if row['slot'] in ('system_certs', 'nginx_certs'):
+                self.charge()
+                self.certificates[row['host_id']]['coverage'].append(row)
+        self.taxonomy = _verified_taxonomy(published)
+        self.evidence_sha256 = hashlib.sha256(published.artifacts['evidence.json']).hexdigest()
+        cff = published.artifacts.get('cff_projection.json')
+        self.cff_sha256 = None if cff is None else hashlib.sha256(cff).hexdigest()
+        self.cff_entries = {}
+        self.findings = {hid: {} for hid in ids}
+        if cff is not None:
+            _require(published.assessed is not None)
+            for entry in run_store._loads(cff, run_store.MAX_CFF)['per_host']:
+                hid = entry['host_id']; self.charge()
+                _require(hid in self.local and hid not in self.cff_entries, 'CBOM_CFF_MISMATCH')
+                self.cff_entries[hid] = entry['companion']
+            _require(set(self.cff_entries) == set(ids), 'CBOM_CFF_MISMATCH')
+            for finding in published.assessed['findings']:
+                self.charge()
+                self.findings[finding['subject']['host_id']][finding['finding_id']] = finding
+        self.missing_reasons = sorted({a['reason_code'] for a in m['missing_artifacts']})
+
+    def charge(self, n=1):
+        self.cost += n
+        _require(self.cost <= _MAX_BATCH_MEMBERSHIPS, 'CBOM_MEMBERSHIP_LIMIT')
+
+
 class _Projection:
-    def __init__(self, published, host_id, *, include_certificates=False):
+    def __init__(self, published, host_id, *, include_certificates=False, batch=None):
         self.include_certificates = include_certificates
         self.pub = published
         m, doc = published.manifest, published.document
         self.hid, self.rid = host_id, m['run_id']
         _require(m['publication_state'] == 'PUBLISHED' and self.rid == doc['run']['run_id']
                  and host_id in m['expected_host_ids'], 'CBOM_HOST_NOT_FOUND')
-        self.host = next(h for h in m['hosts'] if h['host_id'] == host_id)
-        self.rows = {r['evidence_id']: r for r in doc['evidence'] if r['host_id'] == host_id}
-        self.assets = {a['asset_id']: a for a in doc['assets'] if a['host_id'] == host_id}
-        self.collections = {c['collection_id']: c for c in doc['collections'] if c['host_id'] == host_id}
-        self.claims = {c['claim_id']: c for c in (published.assessed or doc)['claims']
-                       if c['subject']['host_id'] == host_id}
+        self._batch = batch
+        if batch is None:
+            self.host = next(h for h in m['hosts'] if h['host_id'] == host_id)
+            self.rows = {r['evidence_id']: r for r in doc['evidence'] if r['host_id'] == host_id}
+            self.assets = {a['asset_id']: a for a in doc['assets'] if a['host_id'] == host_id}
+            self.collections = {c['collection_id']: c for c in doc['collections'] if c['host_id'] == host_id}
+            self.claims = {c['claim_id']: c for c in (published.assessed or doc)['claims']
+                           if c['subject']['host_id'] == host_id}
+        else:
+            _require(batch.published is published)
+            self.host = batch.hosts[host_id]
+            local = batch.local[host_id]
+            self.rows, self.assets = local['rows'], local['assets']
+            self.collections, self.claims = local['collections'], local['claims']
         self.cost = 0
         self.charge(4 * len(self.rows) + 3 * len(self.assets) + 2 * len(self.collections) + len(self.claims))
-        self.index = portal_indexes.project_crypto_indexes(published)
-        self.taxonomy = _verified_taxonomy(published)
+        self.index = portal_indexes.project_crypto_indexes(published) if batch is None else batch.crypto[host_id]
+        self.taxonomy = _verified_taxonomy(published) if batch is None else batch.taxonomy
         self.asset_claims = defaultdict(list)
         self.evidence_claims = defaultdict(list)
         for cid, claim in self.claims.items():
@@ -417,8 +532,11 @@ class _Projection:
         return {'state': state, 'evidence_ids': ids, 'algorithm_ref': ref}
 
     def certificate_nodes(self):
-        from tools import portal_asset_indexes
-        index = portal_asset_indexes.project_asset_indexes(self.pub)
+        if self._batch is None:
+            from tools import portal_asset_indexes
+            index = portal_asset_indexes.project_asset_indexes(self.pub)
+        else:
+            index = self._batch.certificates[self.hid]
         _require(index['run_id'] == self.rid and self.hid in index['hosts'])
         seen = set()
         for g in index['certificates']['groups']:
@@ -574,10 +692,13 @@ class _Projection:
     def cff_consistency(self, raw, observations, claims):
         # Actual Store.open already verified the saved pair. Compare the
         # shared IDs/recorded classification again, without reclassification.
-        pair = run_store._loads(raw, run_store.MAX_CFF)
-        entries = [x for x in pair['per_host'] if x['host_id'] == self.hid]
-        _require(len(entries) == 1, 'CBOM_CFF_MISMATCH')
-        comp = entries[0]['companion']
+        if self._batch is None:
+            pair = run_store._loads(raw, run_store.MAX_CFF)
+            entries = [x for x in pair['per_host'] if x['host_id'] == self.hid]
+            _require(len(entries) == 1, 'CBOM_CFF_MISMATCH')
+            comp = entries[0]['companion']
+        else:
+            comp = self._batch.cff_entries[self.hid]
         if self.pub.manifest['run_kind'] == 'LEGACY_IMPORT':
             _require({x['collection_id'] for x in comp['collections']} == self.collections.keys()
                      and {x['asset_id'] for x in comp['assets']} == self.assets.keys()
@@ -595,8 +716,9 @@ class _Projection:
                 _require(c['level'] == x['level'] and c['assessment_state'] == x['assessment_state']
                          and c['evidence_ids'] == sorted(x['evidence_ids']), 'CBOM_CFF_MISMATCH')
         # Both existing pair formats contain the actual saved findings.
-        expected = {f['finding_id']: f for f in self.pub.assessed['findings']
-                    if f['subject']['host_id'] == self.hid}
+        expected = ({f['finding_id']: f for f in self.pub.assessed['findings']
+                     if f['subject']['host_id'] == self.hid} if self._batch is None
+                    else self._batch.findings[self.hid])
         _require({f['finding_id'] for f in comp['findings']} == expected.keys(), 'CBOM_CFF_MISMATCH')
         for f in comp['findings']:
             actual = expected[f['finding_id']]
@@ -664,10 +786,12 @@ class _Projection:
                 {'collector_id': c['collector_id'], 'state': c['state'], 'requested': c['requested']}
                 for c in terminal['collectors']],
             'missing_artifact_count': len(m['missing_artifacts']),
-            'missing_artifact_reasons': sorted({a['reason_code'] for a in m['missing_artifacts']}),
+            'missing_artifact_reasons': (sorted({a['reason_code'] for a in m['missing_artifacts']})
+                                         if self._batch is None else self._batch.missing_reasons),
             'assessment_saved': self.pub.assessed is not None,
             'cff_state': 'VERIFIED_SAVED_PAIR' if cff is not None else 'NOT_AVAILABLE',
-            'cff_sha256': None if cff is None else hashlib.sha256(cff).hexdigest(),
+            'cff_sha256': (None if cff is None else hashlib.sha256(cff).hexdigest())
+                          if self._batch is None else self._batch.cff_sha256,
             'certificate_key_scope': 'DEFERRED_B2', 'deferred_asset_ids': deferred,
             'evidence_count': len(self.rows), 'projected_evidence_count': len(self.covered)}
         if self.include_certificates:
@@ -685,7 +809,8 @@ class _Projection:
                                 for r, targets in sorted(self.dependencies.items())]}
         provenance = {'version': VERSION, 'run_id': self.rid, 'host_id': self.hid,
             'evidence_schema_version': m['evidence_schema_version'], 'source_kind': m['source']['source_kind'],
-            'evidence_sha256': hashlib.sha256(self.pub.artifacts['evidence.json']).hexdigest(),
+            'evidence_sha256': (hashlib.sha256(self.pub.artifacts['evidence.json']).hexdigest()
+                                if self._batch is None else self._batch.evidence_sha256),
             'coverage': coverage, 'nodes': self.nodes, 'observations': observations, 'claims': claims,
             'relationships': sorted(self.edges, key=_serial), 'omitted': sorted(self.omitted, key=_serial)}
         return bom, provenance
@@ -707,13 +832,7 @@ def build_cbom_bytes(store, run_id, host_id, *, include_certificates=False):
     try:
         published = run_store.RunStore.open(store, run_id)
         _require(host_id in published.manifest['expected_host_ids'], 'CBOM_HOST_NOT_FOUND')
-        bom, provenance = _Projection(published, host_id, include_certificates=include_certificates).finish()
-        raw = _bytes(bom, MAX_BYTES)
-        provenance['bom_sha256'] = hashlib.sha256(raw).hexdigest()
-        sidecar = _bytes(provenance, MAX_BYTES - len(raw))
-        result = cbom_validation.validate_cbom_bytes(raw)
-        _require(result.schema_status == result.reference_status == 'PASS', 'CBOM_VALIDATION_FAILED')
-        return raw, sidecar
+        return _build_cbom_projection_bytes(published, host_id, include_certificates=include_certificates)
     except CBOMGenerationError:
         raise
     except cbom_validation.CBOMValidationError as exc:
@@ -724,6 +843,20 @@ def build_cbom_bytes(store, run_id, host_id, *, include_certificates=False):
             ValueError, TypeError, KeyError, OverflowError, RecursionError):
         code = 'CBOM_SOURCE_INVALID'
     raise CBOMGenerationError(code)
+
+
+def _build_cbom_projection_bytes(published, host_id, *, include_certificates, batch=None, limit=None):
+    # Shared serializer/validator only for a caller-owned verified publication.
+    # The public API still performs its original exact-type and open checks.
+    cap = MAX_BYTES if limit is None else min(MAX_BYTES, limit)
+    bom, provenance = _Projection(published, host_id, include_certificates=include_certificates,
+                                  batch=batch).finish()
+    raw = _bytes(bom, cap)
+    provenance['bom_sha256'] = hashlib.sha256(raw).hexdigest()
+    sidecar = _bytes(provenance, cap - len(raw))
+    result = cbom_validation.validate_cbom_bytes(raw)
+    _require(result.schema_status == result.reference_status == 'PASS', 'CBOM_VALIDATION_FAILED')
+    return raw, sidecar
 
 
 def build_cbom(store, run_id, host_id, *, include_certificates=False):
