@@ -41,6 +41,13 @@ COLLECTORS = ('packages', 'openssl', 'sshd', 'ssh_host_keys', 'system_certs',
               'crypto_policy', 'nginx_certs', 'tls_services')
 S1_BATCH_CONTRACT = 'B04_S1_CONTRACT_ONLY'
 NATIVE_BATCH_CONTRACT = 'B04_NATIVE_V1'
+PRODUCER_V2_BATCH_CONTRACT = 'B04_PRODUCER_V2'
+_PRODUCER_RULES_KIND = 'producer-rules'
+_PRODUCER_RULES_FILE = 'producer_rules.json'
+_PRODUCER_RULES_FROZEN = 'producer_rules.frozen.json'
+_PRODUCER_SCOPE_FIELDS = 'producer_rules_sha256 producer_rules_version'
+_MAX_PRODUCER_RULES = 64 * 1024
+_NO_PRODUCER_RULES = object()
 NATIVE_COLLECTORS = {
     'pqc_collect_packages': 'packages', 'pqc_collect_openssl': 'openssl',
     'pqc_collect_sshd': 'sshd', 'pqc_collect_ssh_host_keys': 'ssh_host_keys',
@@ -566,7 +573,7 @@ def _new_hosts(rid, inputs):
     return sorted(hosts, key=lambda h: h['host_id'])
 
 
-def _requirements(value, hosts, kind):
+def _requirements(value, hosts, kind, *, producer_v2=False):
     _keys(value, 'assessment cff details')
     _bool(value['assessment']); _bool(value['cff'])
     require(not value['cff'] or value['assessment'], 'MISSING_ASSESSMENT_PAIR')
@@ -576,7 +583,7 @@ def _requirements(value, hosts, kind):
     for item in value['details']:
         _keys(item, 'host_id slot')
         _id(item['host_id'])
-        _enum(item['slot'], DETAIL_SLOTS)
+        _enum(item['slot'], _v2_api().SLOTS if producer_v2 else DETAIL_SLOTS)
         key = (item['host_id'], item['slot'])
         require(key[0] in hosts and key not in slots, 'INVALID_DETAIL_REQUIREMENT')
         slots.add(key)
@@ -603,15 +610,38 @@ def _is_native(s):
     return s.get('batch_contract') == NATIVE_BATCH_CONTRACT
 
 
+def _is_producer_v2(s):
+    return s.get('batch_contract') == PRODUCER_V2_BATCH_CONTRACT
+
+
+def _v2_api():
+    # The historical minimal Store/I3 installation has no V2 module. Do
+    # not import it until the new explicit contract is selected.
+    try:
+        from tools import run_store_v2
+    except ImportError:
+        raise StoreError('PRODUCER_V2_UNAVAILABLE') from None
+    return run_store_v2
+
+
+def _frozen_rules(fd, device, s):
+    if _is_producer_v2(s):
+        return _v2_api().read_frozen(fd, device, s)
+    require(not _exists(fd, _PRODUCER_RULES_FROZEN) and not _exists(fd, _PRODUCER_RULES_FILE),
+            'BATCH_CONTRACT')
+    return None
+
+
 def _scope(s):
     fields = 'run_id run_kind evidence_schema_version source started_at recorded_at hosts limits profile flags requirements'
     if type(s) is dict and 'batch_contract' in s:
         fields += ' batch_contract'
-        require(_is_native(s), 'BATCH_CONTRACT')
+        require(_is_native(s) or _is_producer_v2(s), 'BATCH_CONTRACT')
+        if _is_producer_v2(s): fields += ' ' + _PRODUCER_SCOPE_FIELDS
     _keys(s, fields)
     _rid(s['run_id']); _enum(s['run_kind'], KINDS)
     _enum(s['evidence_schema_version'], ('1.0.0', '1.1.0'))
-    if _is_native(s):
+    if _is_native(s) or _is_producer_v2(s):
         require(s['run_kind'] == 'SYNTHETIC' and s['evidence_schema_version'] == '1.1.0',
                 'UNVERIFIED_PRODUCER_FORMAT')
         api = _native_api()
@@ -625,7 +655,7 @@ def _scope(s):
     ids = _ids([h['host_id'] for h in hs], limit=1000)
     targets = [h['target_id'] for h in hs if h['target_id'] is not None]
     require(len(set(targets)) == len(targets), 'DUPLICATE_TARGET')
-    if _is_native(s):
+    if _is_native(s) or _is_producer_v2(s):
         require(len(targets) == len(hs) and all(api._scope.HOST.fullmatch(n) and
                 n.lower() not in api._scope.RESERVED and not api._scope.loopback(n)
                 for n in targets), 'INVALID_TARGET')
@@ -653,7 +683,8 @@ def _scope(s):
             for v in flags.values(): _bool(v)
             require(not flags['tls_services'] and (s['profile'] == 'extended' or
                     not flags['nginx_certs']), 'PROFILE_FLAGS')
-    _requirements(s['requirements'], ids, s['run_kind'])
+    _requirements(s['requirements'], ids, s['run_kind'], producer_v2=_is_producer_v2(s))
+    if _is_producer_v2(s): _v2_api().scope(s)
     if s['run_kind'] == 'LEGACY_IMPORT' and s['requirements']['cff']:
         require(s['evidence_schema_version'] == '1.0.0', 'UNVERIFIED_PRODUCER_FORMAT')
     return s
@@ -685,6 +716,10 @@ def _match_doc(s, doc, *, fragment=False):
     if s['run_kind'] == 'LEGACY_IMPORT':
         require(all(x['source'] == s['source'] for x in doc['collections'] + doc['evidence']),
                 'LEGACY_SOURCE')
+    if _is_producer_v2(s):
+        # V2 Platform is a prerequisite, not a requested collector. The
+        # original V2 terminal and replay own host coverage semantics.
+        return doc
     good = {c['host_id'] for c in doc['collections'] if c['collection_state'] in GOOD}
     gaps = {c['host_id'] for c in doc['collections'] if c['collection_state'] not in
             ('COLLECTED', 'NOT_APPLICABLE', 'NOT_SCANNED')}
@@ -779,6 +814,7 @@ def _detail(s, doc, value):
 
 def _terminal(s, doc, h, row, attempted):
     """Bind one terminal to its frozen flags, host and actual Evidence refs."""
+    if _is_producer_v2(s): return _v2_api().terminal(s, doc, h, row, attempted)
     native = _is_native(s)
     if native:
         api = _native_api()
@@ -839,6 +875,7 @@ def _terminal(s, doc, h, row, attempted):
 
 def _batch(s, doc, batch, rc, attempts):
     """Validate the explicitly selected contract, never infer it from shape."""
+    if _is_producer_v2(s): return _v2_api().batch(s, doc, batch, rc, attempts)
     require(s['run_kind'] != 'LEGACY_IMPORT', 'LEGACY_BATCH')
     native = _is_native(s)
     if native:
@@ -934,10 +971,13 @@ def _cff(s, assessed, digest, value, *, rules=None):
     return value
 
 
-def _slot(kind, host=None, slot=None):
+def _slot(kind, host=None, slot=None, *, producer_v2=False):
     if kind == 'detail':
-        _id(host); _enum(slot, DETAIL_SLOTS)
-        return ('details', host, slot + '.json'), MAX_DETAIL
+        _id(host); _enum(slot, _v2_api().SLOTS if producer_v2 else DETAIL_SLOTS)
+        return ('details', host, slot + '.json'), _v2_api().SLOTS[slot] if producer_v2 else MAX_DETAIL
+    if producer_v2 and kind == _PRODUCER_RULES_KIND:
+        require(host is None and slot is None, 'INVALID_SLOT')
+        return (_PRODUCER_RULES_FILE,), _MAX_PRODUCER_RULES
     require(type(kind) is str and kind in FILES and host is None and slot is None,
             'INVALID_SLOT')
     name, limit = FILES[kind]
@@ -945,8 +985,8 @@ def _slot(kind, host=None, slot=None):
 
 
 def _artifact(kind, raw, *, version=VERSION, host=None, slot=None,
-              refs=None, required=True):
-    parts, limit = _slot(kind, host, slot)
+              refs=None, required=True, producer_v2=False):
+    parts, limit = _slot(kind, host, slot, producer_v2=producer_v2)
     require(type(raw) is bytes and 0 < len(raw) <= limit, 'ARTIFACT_SIZE')
     return {'kind': kind, 'format_version': version, 'host_id': host, 'slot': slot,
             'path': '/'.join(parts), 'size': len(raw), 'sha256': _digest(raw),
@@ -977,16 +1017,22 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
     are fixed (kind, host_id, slot) tuples, not caller-provided paths.
     """
     _scope(s); _bool(recovery)
+    producer_v2 = _is_producer_v2(s)
     require(type(payloads) is dict and 0 < len(payloads) <= MAX_SLOTS, 'SLOT_LIMIT')
     require(sum(len(raw) for raw in payloads.values()) <= MAX_CORE, 'CORE_SIZE_LIMIT')
     for (kind, host, slot), raw in payloads.items():
-        _, cap = _slot(kind, host, slot)
+        _, cap = _slot(kind, host, slot, producer_v2=producer_v2)
         require(type(raw) is bytes and 0 < len(raw) <= cap, 'ARTIFACT_SIZE')
     def get(kind): return payloads.get((kind, None, None))
     raw = get('evidence'); require(raw is not None, 'MISSING_EVIDENCE')
     doc = _match_doc(s, _evidence_bytes(raw))
     run = doc['run']; state = run['run_state']
     _enum(state, RUN_STATES)
+    if producer_v2:
+        require(run['finished_at'] == (None if recovery else s['recorded_at']), 'PRODUCER_TIME_MISMATCH')
+        frozen_rules_raw = get(_PRODUCER_RULES_KIND)
+        require(frozen_rules_raw is not None, 'PRODUCER_RULES_MISSING')
+        frozen_rules = _v2_api().load_rules(s, frozen_rules_raw)
     hs = {h['host_id']: h for h in doc['hosts']}
     require(type(attempts) is dict and set(attempts) == set(hs), 'HOST_MANIFEST')
     rows = []
@@ -1002,9 +1048,15 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
         else:
             require(recovery and entry['attempted'] is not True and
                     h['host_state'] in ('ERROR', 'NOT_ATTEMPTED'), 'MISSING_TERMINAL_CHECKPOINT')
-            if _is_native(s):
+            if _is_native(s) or producer_v2:
                 require(not any(x['host_id'] == hid for k in ('collections', 'assets', 'evidence')
                                 for x in doc[k]), 'MISSING_TERMINAL_CHECKPOINT')
+            if producer_v2:
+                frozen = next(x for x in s['hosts'] if x['host_id'] == hid)
+                expected = ({**frozen, 'host_state': 'ERROR', 'reason_code': 'OUTCOME_UNKNOWN'}
+                            if entry['dispatch_intent'] else frozen)
+                require(_same(h, expected) and entry['attempted'] is (None if entry['dispatch_intent'] else False),
+                        'CHECKPOINT_MISMATCH')
         require(recovery or entry['attempt_status'] != 'UNKNOWN', 'UNKNOWN_ATTEMPT')
         rows.append({**h, **entry})
     batch_raw, legacy_raw = get('batch'), get('legacy')
@@ -1024,10 +1076,13 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
             require(batch_raw is not None, 'MISSING_BATCH')
             batch = _batch(s, doc, _loads(batch_raw), batch_rc, attempts)
             batch_hash = _digest(_json_bytes(batch))
-            batch_contract = NATIVE_BATCH_CONTRACT if _is_native(s) else S1_BATCH_CONTRACT
+            batch_contract = PRODUCER_V2_BATCH_CONTRACT if producer_v2 else (NATIVE_BATCH_CONTRACT if _is_native(s) else S1_BATCH_CONTRACT)
             run_reason = batch['reason_code']
     assessed_raw, rules_raw, cff_raw = get('assessed'), get('rules'), get('cff')
     require((assessed_raw is None) == (rules_raw is None), 'MISSING_ASSESSMENT_PAIR')
+    if producer_v2:
+        require(cff_raw is None, 'UNVERIFIED_PRODUCER_FORMAT')
+        require(rules_raw is None or rules_raw == frozen_rules_raw, 'PRODUCER_RULES_MISMATCH')
     assessed = None; rule_version = None; rules_sha = None
     if assessed_raw is not None:
         assessed = _evidence_bytes(assessed_raw)
@@ -1045,19 +1100,33 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
             cap = min(cap, projection.MAX_BYTES)
             require(len(cff_raw) <= cap, 'CFF_PROJECTION_LIMIT')
         _cff(s, assessed, _digest(assessed_raw), _loads(cff_raw, cap), rules=rules)
-    required_details = _requirements(s['requirements'], set(hs), s['run_kind'])
+    required_details = _requirements(s['requirements'], set(hs), s['run_kind'], producer_v2=producer_v2)
+    v2_refs = {}
+    if producer_v2:
+        by_host = {hid: [] for hid in hs}
+        for (kind, host, slot), data in payloads.items():
+            if kind == 'detail':
+                require(host in by_host, 'FOREIGN_HOST')
+                by_host[host].append(_v2_api().parse_detail(host, slot, data))
+        for hid, h in hs.items():
+            for slot, refs in _v2_api().verify_host(s, doc, h, attempts[hid]['terminal'],
+                                             by_host[hid], frozen_rules).items():
+                v2_refs[hid, slot] = refs
     have_details = set(); entries = []
     for (kind, host, slot), data in payloads.items():
         if kind == 'detail':
-            detail = _detail(s, doc, _loads(data, MAX_DETAIL))
-            require(detail['host_id'] == host and detail['slot'] == slot, 'INVALID_SLOT')
+            if producer_v2:
+                detail = v2_refs[host, slot]
+            else:
+                detail = _detail(s, doc, _loads(data, MAX_DETAIL))
+                require(detail['host_id'] == host and detail['slot'] == slot, 'INVALID_SLOT')
             have_details.add((host, slot))
             entries.append(_artifact(kind, data, host=host, slot=slot, refs=detail,
-                                     required=(host, slot) in required_details))
+                                     required=(host, slot) in required_details, producer_v2=producer_v2))
         else:
             version = doc['schema_version'] if kind in ('evidence', 'assessed') else (
-                rule_version if kind == 'rules' else VERSION)
-            entries.append(_artifact(kind, data, version=version))
+                rule_version if kind == 'rules' else (s['producer_rules_version'] if kind == _PRODUCER_RULES_KIND else VERSION))
+            entries.append(_artifact(kind, data, version=version, producer_v2=producer_v2))
     missing = []
     if recovery and s['run_kind'] != 'LEGACY_IMPORT':
         missing.append({'path': FILES['batch'][0], 'reason_code': 'BATCH_MANIFEST_UNAVAILABLE'})
@@ -1068,7 +1137,7 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
         missing.append({'path': FILES['cff'][0], 'reason_code': 'REQUIRED_ARTIFACT_MISSING'})
     for hid, slot in sorted(required_details - have_details):
         require(hs[hid]['host_state'] != 'COMPLETE', 'REQUIRED_DETAIL_MISSING')
-        missing.append({'path': '/'.join(_slot('detail', hid, slot)[0]), 'reason_code': 'REQUIRED_DETAIL_MISSING'})
+        missing.append({'path': '/'.join(_slot('detail', hid, slot, producer_v2=producer_v2)[0]), 'reason_code': 'REQUIRED_DETAIL_MISSING'})
     # A normally finalized I3 import needs its complete derived pair even
     # when the historical scan itself was partial or failed. Recovery may
     # retain only what was durably acquired and reports missing artifacts.
@@ -1090,8 +1159,10 @@ def _assemble(s, payloads, attempts, *, recovery, batch_rc):
                 'batch_canonical_sha256': batch_hash, 'batch_missing_reason': batch_missing_reason,
                 'artifacts': sorted(entries, key=lambda x: x['path']),
                 'missing_artifacts': sorted(missing, key=lambda x: x['path'])}
+    if producer_v2:
+        manifest.update({k: s[k] for k in _PRODUCER_SCOPE_FIELDS.split()})
     _json_bytes(manifest)
-    return PublishedRun(manifest, doc, assessed, {'/'.join(_slot(*key)[0]): value
+    return PublishedRun(manifest, doc, assessed, {'/'.join(_slot(*key, producer_v2=producer_v2)[0]): value
                                                   for key, value in payloads.items()})
 
 
@@ -1103,7 +1174,8 @@ ENTRY_KEYS = 'kind format_version host_id slot path size sha256 required collect
 
 
 def _manifest_header(manifest, rid):
-    _keys(manifest, MANIFEST_KEYS)
+    producer_v2 = type(manifest) is dict and _is_producer_v2(manifest)
+    _keys(manifest, MANIFEST_KEYS + (' ' + _PRODUCER_SCOPE_FIELDS if producer_v2 else ''))
     require(manifest['manifest_version'] == VERSION, 'UNSUPPORTED_MANIFEST_VERSION')
     require(manifest['publication_state'] == 'PUBLISHED' and manifest['run_id'] == rid, 'MANIFEST_IDENTITY')
     _rid(rid); _enum(manifest['run_kind'], KINDS); _enum(manifest['run_state'], RUN_STATES)
@@ -1121,12 +1193,15 @@ def _manifest_header(manifest, rid):
     s['hosts'] = hs
     if manifest['batch_contract'] == NATIVE_BATCH_CONTRACT:
         s['batch_contract'] = NATIVE_BATCH_CONTRACT
+    elif producer_v2:
+        s['batch_contract'] = PRODUCER_V2_BATCH_CONTRACT
+        s.update({k: manifest[k] for k in _PRODUCER_SCOPE_FIELDS.split()})
     _scope(s)
     require(type(manifest['artifacts']) is list and 0 < len(manifest['artifacts']) <= MAX_SLOTS, 'SLOT_LIMIT')
     total = 0; entries = {}
     for row in manifest['artifacts']:
         _keys(row, ENTRY_KEYS)
-        parts, cap = _slot(row['kind'], row['host_id'], row['slot'])
+        parts, cap = _slot(row['kind'], row['host_id'], row['slot'], producer_v2=producer_v2)
         require(row['path'] == '/'.join(parts), 'INVALID_SLOT_PATH')
         key = (row['kind'], row['host_id'], row['slot'])
         require(key not in entries, 'DUPLICATE_SLOT')
@@ -1138,9 +1213,9 @@ def _manifest_header(manifest, rid):
     return s, attempts, entries
 
 
-def _file_at(parent, parts, device, entry):
+def _file_at(parent, parts, device, entry, *, producer_v2=False):
     with _directory(parent, parts[:-1], device) as d:
-        raw = _read(d, parts[-1], device, _slot(entry['kind'], entry['host_id'], entry['slot'])[1], entry['size'])
+        raw = _read(d, parts[-1], device, _slot(entry['kind'], entry['host_id'], entry['slot'], producer_v2=producer_v2)[1], entry['size'])
     require(_digest(raw) == entry['sha256'], 'ARTIFACT_HASH')
     return raw
 
@@ -1159,16 +1234,22 @@ def _read_publication(fd, device, manifest, rid, *, frozen_scope, stage_fd=None,
     # native recovery with no terminal or batch cannot prove this from its
     # core artifacts alone. Legacy/S1 scopes legitimately omit the marker.
     require(_same(s, frozen_scope), 'FROZEN_SCOPE_MISMATCH')
+    producer_v2 = _is_producer_v2(s)
+    frozen_rules = _frozen_rules(fd, device, s)
+    if producer_v2:
+        require((_PRODUCER_RULES_KIND, None, None) in entries, 'PRODUCER_RULES_MISSING')
     payloads = {}
     for key, entry in entries.items():
-        parts, _ = _slot(*key)
+        parts, _ = _slot(*key, producer_v2=producer_v2)
         if stage_fd is None:
-            raw = _file_at(fd, parts, device, entry)
+            raw = _file_at(fd, parts, device, entry, producer_v2=producer_v2)
         else:
             final = _has_at(fd, parts, device)
             staged = _has_at(stage_fd, parts, device)
             require(final != staged, 'INCOMPLETE_PREPARED_ARTIFACT')
-            raw = _file_at(fd if final else stage_fd, parts, device, entry)
+            raw = _file_at(fd if final else stage_fd, parts, device, entry, producer_v2=producer_v2)
+        if producer_v2 and key == (_PRODUCER_RULES_KIND, None, None):
+            require(raw == frozen_rules, 'PRODUCER_RULES_MISMATCH')
         if verified is None:
             payloads[key] = raw
         else:
@@ -1180,8 +1261,14 @@ def _read_publication(fd, device, manifest, rid, *, frozen_scope, stage_fd=None,
         result = verified
     require(_same(result.manifest, manifest), 'MANIFEST_MISMATCH')
     # An index cannot hide a present core slot; do not traverse untrusted names.
-    for kind, (name, _) in FILES.items():
+    files = {**FILES, _PRODUCER_RULES_KIND: (_PRODUCER_RULES_FILE, _MAX_PRODUCER_RULES)} if producer_v2 else FILES
+    for kind, (name, _) in files.items():
         if _exists(fd, name): require((kind, None, None) in entries, 'UNINDEXED_ARTIFACT')
+    if stage_fd is not None:
+        if producer_v2:
+            _v2_api().check_stage(stage_fd, device, entries)
+        else:
+            require(not _exists(stage_fd, _PRODUCER_RULES_FILE) and not _exists(stage_fd, _PRODUCER_RULES_FROZEN), 'BATCH_CONTRACT')
     if stage_fd is None:
         expected = {}
         for kind, host, slot in entries:
@@ -1191,7 +1278,7 @@ def _read_publication(fd, device, manifest, rid, *, frozen_scope, stage_fd=None,
                 require(set(_entries(d, 1000)) == set(expected), 'UNINDEXED_ARTIFACT')
                 for host, files in expected.items():
                     with _directory(d, (host,), device) as h:
-                        require(set(_entries(h, len(DETAIL_SLOTS))) == files, 'UNINDEXED_ARTIFACT')
+                        require(set(_entries(h, len(_v2_api().SLOTS if producer_v2 else DETAIL_SLOTS))) == files, 'UNINDEXED_ARTIFACT')
         else:
             require(not expected, 'MISSING_ARTIFACT')
     return result
@@ -1222,7 +1309,7 @@ class RunStore:
     def begin(self, *, run_id=None, run_kind, evidence_schema_version, source,
               recorded_at, started_at, expected_hosts, limits=None, profile=None,
               requested_flags=None, requirements=None, legacy_raw=None, legacy_provenance=None,
-              batch_contract=None):
+              batch_contract=None, producer_rules_raw=_NO_PRODUCER_RULES):
         """Reserve exactly one directory; explicit IDs never change on collision.
 
         requested_flags is keyed by literal target_id; requirements.details is
@@ -1232,7 +1319,12 @@ class RunStore:
         No dispatch or production producer registration.
         """
         self._check(); _enum(run_kind, KINDS)
-        require(batch_contract in (None, S1_BATCH_CONTRACT, NATIVE_BATCH_CONTRACT), 'BATCH_CONTRACT')
+        require(batch_contract in (None, S1_BATCH_CONTRACT, NATIVE_BATCH_CONTRACT, PRODUCER_V2_BATCH_CONTRACT), 'BATCH_CONTRACT')
+        producer_v2 = batch_contract == PRODUCER_V2_BATCH_CONTRACT
+        require(producer_v2 or producer_rules_raw is _NO_PRODUCER_RULES, 'BATCH_CONTRACT')
+        if producer_v2:
+            require(run_id is not None and run_kind == 'SYNTHETIC', 'UNVERIFIED_PRODUCER_FORMAT')
+            rules_meta = _v2_api().rules_metadata(producer_rules_raw)
         require(run_kind != 'LEGACY_IMPORT' or batch_contract is None, 'LEGACY_BATCH')
         # Historical NATIVE_SCAN fixture compatibility is explicitly selected;
         # a real producer must not silently fall back to the old short-ID shape.
@@ -1250,7 +1342,7 @@ class RunStore:
             else:
                 require(type(requested_flags) is dict and set(requested_flags) == {h['target_id'] for h in hosts}, 'PROFILE_FLAGS')
                 flags = {h['host_id']: requested_flags[h['target_id']] for h in hosts}
-                if batch_contract == NATIVE_BATCH_CONTRACT:
+                if batch_contract in (NATIVE_BATCH_CONTRACT, PRODUCER_V2_BATCH_CONTRACT):
                     require(all(type(f) is dict and f.keys() == NATIVE_COLLECTORS.keys()
                                 for f in flags.values()), 'PROFILE_FLAGS')
                     flags = {hid: {short: f[long] for long, short in NATIVE_COLLECTORS.items()}
@@ -1261,6 +1353,14 @@ class RunStore:
                  'requirements': {'assessment': False, 'cff': False, 'details': []} if requirements is None else requirements}
             if batch_contract == NATIVE_BATCH_CONTRACT:
                 s['batch_contract'] = NATIVE_BATCH_CONTRACT
+            elif producer_v2:
+                s['batch_contract'] = PRODUCER_V2_BATCH_CONTRACT
+                s.update(rules_meta)
+                if requirements is None and flags is not None:
+                    # Validate closed flags before deriving the only allowed slots.
+                    require(all(type(f) is dict and f.keys() == set(COLLECTORS)
+                                and all(type(x) is bool for x in f.values()) for f in flags.values()), 'PROFILE_FLAGS')
+                    s['requirements']['details'] = _v2_api().required_slots(s)
             s = _loads(_json_bytes(s)); _scope(s)
             if run_kind == 'LEGACY_IMPORT':
                 require(type(legacy_raw) is bytes and len(legacy_raw) <= MAX_EVIDENCE and
@@ -1288,6 +1388,8 @@ class RunStore:
                 # on failure. Initial journal becomes durable before return.
                 with _directory(run_fd, ('checkpoints',), self._device, create=True): pass
                 journal = {'journal_version': VERSION, 'scope': s, 'intents': [], 'legacy_provenance': provenance}
+                if producer_v2:
+                    _write(run_fd, _PRODUCER_RULES_FROZEN, producer_rules_raw, self._device)
                 _write(run_fd, 'journal.json', _seal(journal, MAX_MANIFEST), self._device)
                 writer = RunWriter(run_fd, lock, self._device, journal)
                 run_fd = lock = None
@@ -1320,7 +1422,7 @@ class RunStore:
     @_public
     def open(self, run_id):
         """Read only a fully verified manifest/core set; never trust a directory."""
-        with self._locked_run(run_id, shared=True) as (fd, _):
+        with self._locked_run(run_id, shared=True) as (fd, lock):
             if not _exists(fd, 'run_manifest.json'): raise StoreError('INCOMPLETE_RUN')
             try:
                 raw = _read(fd, 'run_manifest.json', self._device, MAX_MANIFEST)
@@ -1328,8 +1430,12 @@ class RunStore:
                 require(raw == _json_bytes(manifest), 'NONCANONICAL_MANIFEST')
                 journal = _journal(_unseal(_read(fd, 'journal.json', self._device, MAX_MANIFEST),
                                            MAX_MANIFEST), run_id)
-                return _read_publication(fd, self._device, manifest, run_id,
-                                         frozen_scope=journal['scope'])
+                result = _read_publication(fd, self._device, manifest, run_id,
+                                           frozen_scope=journal['scope'])
+                if _is_producer_v2(journal['scope']):
+                    with RunWriter(os.dup(fd), os.dup(lock), self._device, journal) as reader:
+                        reader._verify_prepared_checkpoints(result)
+                return result
             except FileNotFoundError:
                 raise StoreError('MISSING_ARTIFACT') from None
 
@@ -1387,6 +1493,13 @@ class RunWriter:
         _check_dir(self._fd, self._device)
         require(not _exists(self._fd, 'run_manifest.json'), 'ALREADY_PUBLISHED')
         if mutable: require(not _exists(self._fd, 'prepared.json'), 'PUBLICATION_PREPARED')
+        s = self._j['scope']
+        if _is_producer_v2(s):
+            actual = _journal(_unseal(_read(self._fd, 'journal.json', self._device, MAX_MANIFEST), MAX_MANIFEST), self.run_id)
+            require(_same(actual, self._j), 'FROZEN_SCOPE_MISMATCH')
+            _frozen_rules(self._fd, self._device, s)
+        elif _exists(self._fd, _PRODUCER_RULES_FROZEN) or _exists(self._fd, _PRODUCER_RULES_FILE):
+            raise StoreError('BATCH_CONTRACT')
 
     def _host(self, hid):
         _id(hid)
@@ -1427,12 +1540,17 @@ class RunWriter:
         else:
             _terminal(s, doc, h, body['terminal'], body['attempted'])
         att['terminal'] = body['terminal']
-        require(type(body['details']) is list and len(body['details']) <= len(DETAIL_SLOTS), 'SLOT_LIMIT')
-        slots = set()
-        for d in body['details']:
-            _detail(s, doc, d)
-            require(d['host_id'] == hid and d['slot'] not in slots, 'DUPLICATE_SLOT')
-            slots.add(d['slot'])
+        if _is_producer_v2(s):
+            require(doc['run']['finished_at'] == s['recorded_at'], 'PRODUCER_TIME_MISMATCH')
+            frozen = _frozen_rules(self._fd, self._device, s)
+            slots = set(_v2_api().verify_host(s, doc, h, body['terminal'], body['details'], _v2_api().load_rules(s, frozen)))
+        else:
+            require(type(body['details']) is list and len(body['details']) <= len(DETAIL_SLOTS), 'SLOT_LIMIT')
+            slots = set()
+            for d in body['details']:
+                _detail(s, doc, d)
+                require(d['host_id'] == hid and d['slot'] not in slots, 'DUPLICATE_SLOT')
+                slots.add(d['slot'])
         required = {x['slot'] for x in s['requirements']['details'] if x['host_id'] == hid}
         require(h['host_state'] != 'COMPLETE' or required <= slots, 'REQUIRED_DETAIL_MISSING')
         return doc, att, body['details']
@@ -1486,11 +1604,14 @@ class RunWriter:
 
     def _payloads(self, document, checkpoints):
         payloads = {('evidence', None, None): _canonical(document)}
+        s = self._j['scope']; producer_v2 = _is_producer_v2(s)
+        if producer_v2:
+            payloads[_PRODUCER_RULES_KIND, None, None] = _frozen_rules(self._fd, self._device, s)
         for _, _, details in checkpoints.values():
             for detail in details:
                 key = ('detail', detail['host_id'], detail['slot'])
                 require(key not in payloads, 'DUPLICATE_SLOT')
-                payloads[key] = _json_bytes(detail, MAX_DETAIL)
+                payloads[key] = (_v2_api().detail_bytes(detail['slot'], detail['value']) if producer_v2 else _json_bytes(detail, MAX_DETAIL))
         if self._j['legacy_provenance'] is not None:
             payloads['legacy', None, None] = _json_bytes(self._j['legacy_provenance'], MAX_DETAIL)
         return payloads
@@ -1563,8 +1684,9 @@ class RunWriter:
         self._check()
         # Before prepare, no final core files may exist. Orphan staging from a
         # crash is ignored, private, and bounded; no deletion of old outputs.
+        producer_v2 = _is_producer_v2(self._j['scope'])
         require(not any(_exists(self._fd, name) for name, _ in FILES.values()) and
-                not _exists(self._fd, 'details'), 'UNPREPARED_CORE_ARTIFACT')
+                not _exists(self._fd, _PRODUCER_RULES_FILE) and not _exists(self._fd, 'details'), 'UNPREPARED_CORE_ARTIFACT')
         stages = [n for n in _entries(self._fd, MAX_SLOTS) if n.startswith('.stage-')]
         require(len(stages) < MAX_STAGES, 'RECOVERY_STAGE_LIMIT')
         stage = '.stage-' + secrets.token_hex(16)
@@ -1572,7 +1694,7 @@ class RunWriter:
         try:
             stage_fd = _mkdir(self._fd, stage, self._device)
             for row in result.manifest['artifacts']:
-                parts, _ = _slot(row['kind'], row['host_id'], row['slot'])
+                parts, _ = _slot(row['kind'], row['host_id'], row['slot'], producer_v2=producer_v2)
                 with _directory(stage_fd, parts[:-1], self._device, create=True) as d:
                     _write(d, parts[-1], result.artifacts[row['path']], self._device)
             # Durable immutable prepare marker comes BEFORE moving any core file.
@@ -1587,6 +1709,9 @@ class RunWriter:
     def _verify_prepared_checkpoints(self, result):
         checkpoints = self._checkpoints()
         doc, manifest = result.document, result.manifest
+        producer_v2 = _is_producer_v2(self._j['scope'])
+        if producer_v2:
+            require(result.artifacts.get(_PRODUCER_RULES_FILE) == _frozen_rules(self._fd, self._device, self._j['scope']), 'PRODUCER_RULES_MISMATCH')
         rows = {h['host_id']: h for h in manifest['hosts']}
         require(manifest['recovery'] or set(checkpoints) == set(rows), 'MISSING_TERMINAL_CHECKPOINT')
         indexed = {hid: {k: [] for k in ('hosts', 'collections', 'assets', 'evidence')} for hid in rows}
@@ -1601,14 +1726,15 @@ class RunWriter:
                     require(indexed[hid][registry] == fragment[registry],
                             'CHECKPOINT_MISMATCH')
                 for detail in details:
-                    path = '/'.join(_slot('detail', hid, detail['slot'])[0])
-                    require(result.artifacts.get(path) == _json_bytes(detail, MAX_DETAIL), 'CHECKPOINT_MISMATCH')
+                    path = '/'.join(_slot('detail', hid, detail['slot'], producer_v2=producer_v2)[0])
+                    raw = _v2_api().detail_bytes(detail['slot'], detail['value']) if producer_v2 else _json_bytes(detail, MAX_DETAIL)
+                    require(result.artifacts.get(path) == raw, 'CHECKPOINT_MISMATCH')
             else:
                 require(row['terminal'] is None and row['attempted'] is not True and
                         (row['dispatch_intent'] is None or row['dispatch_intent'] == (hid in self._j['intents'])) and
                         not any(indexed[hid][k] for k in ('collections', 'assets', 'evidence')),
                         'CHECKPOINT_MISMATCH')
-        expected_details = {'/'.join(_slot('detail', d['host_id'], d['slot'])[0])
+        expected_details = {'/'.join(_slot('detail', d['host_id'], d['slot'], producer_v2=producer_v2)[0])
                             for _, _, ds in checkpoints.values() for d in ds}
         require({p for p in result.artifacts if p.startswith('details/')} == expected_details, 'CHECKPOINT_MISMATCH')
         if self._j['legacy_provenance'] is not None:
@@ -1631,7 +1757,7 @@ class RunWriter:
                     # and all terminal checkpoints. No guess from final files.
                     self._verify_prepared_checkpoints(result)
                 for key, row in entries.items():
-                    parts, _ = _slot(*key)
+                    parts, _ = _slot(*key, producer_v2=_is_producer_v2(s))
                     already = _has_at(self._fd, parts, self._device)
                     with _directory(stage, parts[:-1], self._device) as src:
                         with _directory(self._fd, parts[:-1], self._device, create=True) as dest:
