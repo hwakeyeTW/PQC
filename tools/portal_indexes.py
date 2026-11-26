@@ -56,12 +56,13 @@ def _key(prefix, value):
     return prefix + '-' + hashlib.sha256(_serial(value).encode('ascii')).hexdigest()
 
 
-def _bounded_bytes(value):
+def _bounded_bytes(value, *, limit=None):
+    cap = _MAX_JSON if limit is None else min(_MAX_JSON, limit)
     out = bytearray()
     encoder = json.JSONEncoder(ensure_ascii=True, sort_keys=True, separators=(',', ':'), allow_nan=False)
     for chunk in encoder.iterencode(value):
         part = chunk.encode('ascii')
-        _require(len(part) <= _MAX_JSON - len(out), 'CRYPTO_INDEX_SIZE_LIMIT')
+        _require(len(part) <= cap - len(out), 'CRYPTO_INDEX_SIZE_LIMIT')
         out.extend(part)
     return bytes(out)
 
@@ -478,17 +479,27 @@ def project_crypto_indexes(published):
 def render_crypto_indexes(published):
     """Return (projection, fixed page bytes) without writing any report files."""
     result = project_crypto_indexes(published)
+    return result, _render_crypto_projection(result)
+
+
+def _render_crypto_projection(result, *, page_limit=None, total_limit=None):
+    """Render the same trusted projection; optional internal remaining byte caps."""
     pages = {}
+    cap = _MAX_HTML if page_limit is None else min(_MAX_HTML, page_limit)
+    remaining = total_limit
     try:
         env = Environment(loader=FileSystemLoader(str(_TEMPLATES)), autoescape=True,
                           undefined=StrictUndefined, keep_trailing_newline=True)
         for name in ('algorithms', 'libraries'):
+            limit = cap if remaining is None else min(cap, remaining)
             out = bytearray()
             for chunk in env.get_template(name + '.html.j2').generate(p=result, index=result[name]):
                 raw = chunk.encode('utf-8')
-                _require(len(raw) <= _MAX_HTML - len(out), 'CRYPTO_INDEX_SIZE_LIMIT')
+                _require(len(raw) <= limit - len(out), 'CRYPTO_INDEX_SIZE_LIMIT')
                 out.extend(raw)
             pages[name + '.html'] = bytes(out)
+            if remaining is not None:
+                remaining -= len(out)
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('CRYPTO_INDEX_RENDER_ERROR') from None
-    return result, pages
+    return pages

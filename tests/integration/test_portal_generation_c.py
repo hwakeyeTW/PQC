@@ -930,3 +930,610 @@ def test_cb1b_empty_saved_findings_presentation(root):
     assert 'empty-findings' in parsed.ids and 'finding-records' not in parsed.ids
     assert b'This does not imply PASS.' in pages['findings.html']
     assert not any(h.startswith('coverage.html#') for h in parsed.links)
+
+
+# B2a: K is the reviewed four-page contract, independent of the new renderer.
+_CB2A_K = 'b73119c562d7493ea344c2c755211e667293cc9f'
+_CB2A_K_FILES = {**_CB1B_R_FILES,
+    'tools/portal_generation_c.py': '25b0494bc314dd986842b8668fc127d60af487bd',
+    'tools/export_summary.py': '2220923cd9005f63c985e3a2e5042200b10d60db',
+    'templates/portal/findings.html.j2': '1b954192adfe52a56908bdf494ca3c8ca066143e',
+    'templates/portal/coverage.html.j2': '89d935e946b65415bb9a4a46e2afdb9af6478de9',
+    'tools/render_portal.py': '6a4f023b168eac4ea6c44168672d7b677e9a024c',
+    'tools/portal_indexes.py': 'aaeac9204c47c0cc49a3f23e1a58bad90de2d65a',
+    'templates/portal/run_index.html.j2': '2de1bb92a6bcacdce67c960ca629a3ce3cc60538',
+    'templates/portal/base.html.j2': 'c754c04158b5eb67602fb67a94de9a8ebac7adab',
+    'templates/portal/hosts.html.j2': 'bcea0773ca1fbd6623ebd7eb2de0bb7013b3f6ed',
+    'templates/portal/host.html.j2': 'd374e4c994006bd30c2923dfd296db1a8ce71f2a',
+    'templates/portal/algorithms.html.j2': '93f17e36497182f1b7fa2a24a964f27c01988b41',
+    'templates/portal/libraries.html.j2': '2f92e1e76aa3d15a14ae264b6f5f7bd109262cc8',
+    'templates/portal/portal.css': '0ea62c13ee66ee60205b1e6bdf1f779dc56222d8',
+}
+
+
+def _cb2a_original(tmp_path):
+    from types import ModuleType
+    old_assets, old_ca = _cb1b_original(tmp_path, _CB2A_K, _CB2A_K_FILES, 'k', 'PQC_CB2A_K_ROOT')
+    old = []
+    for name in ('portal_indexes', 'render_portal'):
+        module = ModuleType('_cb2a_k_' + name)
+        path = tmp_path / 'fixed-k/tools' / (name + '.py')
+        module.__file__ = str(path)
+        exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        old.append(module)
+    old_crypto, old_portal = old
+    old_ca.portal_indexes = old_assets.portal_indexes = old_ca.export_summary.portal_indexes = old_crypto
+    return old_ca, old_crypto, old_portal
+
+
+def _cb2a_parse(raw):
+    # Keep the original stricter B1 parser unchanged. Core pages also contain
+    # fixed parent links and host-to-batch fragments, resolved below against
+    # actual render buffers and verified Store artifacts (not synthetic pages).
+    from collections import defaultdict
+    from html.parser import HTMLParser
+    from urllib.parse import urlsplit
+
+    class Page(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.ids, self.links, self.stack = set(), [], []
+            self.refs = defaultdict(set)
+            self.feed(raw.decode('utf-8')); self.close()
+
+        def handle_starttag(self, tag, attrs):
+            assert tag not in {'script', 'iframe', 'object', 'embed', 'base', 'form', 'img'}
+            assert len(dict(attrs)) == len(attrs)
+            attrs = dict(attrs)
+            assert not any(k.startswith('on') or k in ('src', 'srcset', 'action', 'style') for k in attrs)
+            ident = attrs.get('id')
+            if ident is not None:
+                assert ident not in self.ids
+                self.ids.add(ident)
+            if tag not in ('meta', 'link', 'br', 'hr', 'input', 'area', 'source', 'wbr'):
+                self.stack.append((tag, ident))
+            if 'href' in attrs:
+                href = attrs['href']; u = urlsplit(href)
+                assert not u.scheme and not u.netloc and not u.query and not u.path.startswith('/')
+                assert '%' not in href and '\\' not in href
+                assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in href)
+                self.links.append(href)
+                for _, i in self.stack:
+                    if i is not None:
+                        self.refs[i].add(href)
+
+        def handle_endtag(self, tag):
+            if tag in ('meta', 'link', 'br', 'hr', 'input', 'area', 'source', 'wbr'):
+                return
+            assert self.stack and self.stack[-1][0] == tag
+            self.stack.pop()
+
+    return Page()
+
+
+def _cb2a_check(pub, full):
+    from html import escape
+    from urllib.parse import urlsplit
+    from tools import render_portal as portal
+    m, doc, assessed, artifacts = pub
+    ids = m['expected_host_ids']
+    old_names = set(ca._HTML + ca._JSON + ca._CSV) | {
+        hid + suffix for hid in ids for suffix in ('.cbom.json', '.cbom.provenance.json')}
+    new_names = {'hosts.html', 'algorithms.html', 'libraries.html', 'crypto_indexes.json'} | {
+        hid + '.html' for hid in ids}
+    assert full.run_id == m['run_id'] and set(full.files) == old_names | new_names
+    assert len(full.files) == 13 + 3 * len(ids) and list(full.files) == sorted(full.files)
+    all_buffers = {'index.html': full.index, 'portal.css': full.css,
+                   **{'portal-v5/' + n: r for n, r in full.files.items()}}
+    assert full.entries == tuple(dict(name=n, size=len(r), sha256=hashlib.sha256(r).hexdigest())
+                                 for n, r in sorted(all_buffers.items()))
+    assert len(full.entries) == 15 + 3 * len(ids)
+    assert not full.index.startswith((portal._CRYPTO_MARKER, portal._HISTORY_MARKER, b'<!-- PQC portal-v5'))
+    assert all('receipt' not in n for n in all_buffers)
+    assert full.css == portal._render_css()
+    pages = {n: _cb2a_parse(r) for n, r in all_buffers.items() if n.endswith('.html')}
+    _cb1a_asset_links(json.loads(full.files['asset_indexes.json']), full.files)
+    _cb1b_summary_links(pub, full.files)
+    owners = {h: h for h in ids}
+    for field, key in (('collections', 'collection_id'), ('assets', 'asset_id'), ('evidence', 'evidence_id')):
+        owners.update({r[key]: r['host_id'] for r in doc[field]})
+    if assessed is not None:
+        for field, key in (('claims', 'claim_id'), ('findings', 'finding_id')):
+            owners.update({r[key]: r['subject']['host_id'] for r in assessed[field]})
+    entries = {r['path']: r for r in m['artifacts']}
+    assert set(entries) == set(artifacts)
+    history_links = 0
+    for name, page in pages.items():
+        nested = name.startswith('portal-v5/')
+        hid = name.removeprefix('portal-v5/').removesuffix('.html') if nested else None
+        if hid not in ids:
+            hid = None
+        for href in page.links:
+            u = urlsplit(href); path, frag = u.path, u.fragment
+            if path == ('../../index.html' if nested else '../index.html'):
+                assert not frag
+                history_links += 1   # external catalog not created in B2a
+                continue
+            if not path:
+                dest = name
+            elif nested and path.startswith('../'):
+                dest = path[3:]
+                assert dest in {'index.html', 'portal.css'} | set(entries)
+                if dest in entries:
+                    assert hid is not None and entries[dest]['host_id'] in (None, hid)
+            elif nested:
+                assert path in full.files
+                dest = 'portal-v5/' + path
+            else:
+                assert path in all_buffers or path in entries
+                dest = path
+            assert dest in all_buffers or dest in entries
+            if frag:
+                assert dest in pages and frag in pages[dest].ids, (name, href)
+                if dest.startswith('portal-v5/h-') and frag in owners:
+                    assert owners[frag] + '.html' == dest.removeprefix('portal-v5/')
+            if hid and dest.startswith('portal-v5/h-') and dest != name:
+                # Only the explicit adjacent-host navigation, never a cross-host
+                # reference to another host's record.
+                assert not frag
+                i = ids.index(hid)
+                assert dest.removeprefix('portal-v5/').removesuffix('.html') in ids[max(0, i-1):i+2]
+    assert history_links == len(pages)
+    assert {h for h in pages['index.html'].ids if h.startswith('h-')} == set(ids)
+    assert {h for h in pages['portal-v5/hosts.html'].ids if h.startswith('h-')} == set(ids)
+    root = pages['index.html']
+    assert {'portal-v5/' + n for n in ('hosts.html', 'algorithms.html', 'libraries.html',
+        'certificates.html', 'services.html', 'findings.html', 'coverage.html', 'crypto_indexes.json')} <= set(root.links)
+    assert set(root.refs['artifact-rows']) == set(entries)
+    assert all(r['path'] not in root.links and escape(r['path']).encode() in full.index
+               for r in m['missing_artifacts'])
+    p = json.loads(full.files['crypto_indexes.json'])
+    for hid in ids:
+        name = 'portal-v5/' + hid + '.html'; page = pages[name]
+        assert {ident for ident in page.ids if ident in owners} == {ident for ident, h in owners.items() if h == hid}
+        assert {x[3:] for x in page.refs['artifacts'] if x.startswith('../')} == {
+            path for path, entry in entries.items() if entry['host_id'] in (None, hid)}
+        host = next(h for h in m['hosts'] if h['host_id'] == hid)
+        assert host['host_state'].encode() in full.files[hid + '.html']
+        assert host['attempt_status'].encode() in full.files[hid + '.html']
+        assert ('host-not-assessed' in page.ids) == (assessed is None)
+        for r in m['missing_artifacts']:
+            if r['path'].startswith('details/' + hid + '/'):
+                assert '../' + r['path'] not in page.links and escape(r['path']).encode() in full.files[hid + '.html']
+        assert validator.validate_cbom_bytes(full.files[hid + '.cbom.json']) == validator.ValidationResult()
+    for name in ('algorithms', 'libraries'):
+        page = pages['portal-v5/' + name + '.html']
+        for g in p[name]['groups']:
+            assert g['id'] in page.ids
+            href = name + '.html#' + g['id']
+            for field in ('host_ids', 'asset_ids', 'evidence_ids', 'claim_ids'):
+                for ref in g[field]:
+                    assert href in pages['portal-v5/' + owners[ref] + '.html'].refs[ref]
+                    # Every actual membership link targets its own owner and
+                    # recorded record; an empty index is not invented coverage.
+                    assert owners[ref] + '.html#' + ref in page.refs[g['id']]
+        for cid in p[name]['unresolved_claim_ids']:
+            assert name + '.html#unresolved-claims' in pages['portal-v5/' + owners[cid] + '.html'].refs[cid]
+    return pages
+
+
+@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
+def test_cb2a_actual_buffers_and_k_oracle(root, tmp_path, monkeypatch, kind):
+    import tools
+    from tools import render_portal as portal
+    from test_portal_overview import publish
+    from test_portal_crypto_index import publish_crypto, MALICIOUS
+    if kind.startswith('c1'):
+        pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=kind == 'c1-assessed')
+    elif kind == 'recovery':
+        pub = c1._c2_open(root, ('complete', 'complete', 'complete'), recovery=True)
+        assert [h['attempt_status'] for h in pub.manifest['hosts']] == ['ATTEMPTED', 'UNKNOWN', 'NOT_ATTEMPTED']
+        assert len(pub.manifest['missing_artifacts']) == 7
+    elif kind == 'native-v1':
+        pub = publish(root, states=('COMPLETE', 'PARTIAL', 'UNREACHABLE'), native=True, assessed=True, details=True)
+    elif kind == 's1':
+        pub = publish_crypto(root)
+    elif kind == 'legacy':
+        raw = json.loads((ROOT / 'tests/fixtures/legacy_report.json').read_bytes())['legacy-per-host']
+        path = tmp_path / 'legacy-b2a.json'; path.write_text(json.dumps(raw)); path.chmod(0o600)
+        import_reports._publish(import_reports._prepare(path, 'legacy-per-host', a.RID, a.END, 'fixture', '1.0.0'), root)
+        with rs.RunStore(root) as store:
+            pub = store.open(a.RID)
+    else:
+        pub = a.publish(root, assessed=False, empty=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old_ca, old_crypto, old_portal = _cb2a_original(tmp_path)
+    marker = rs._json_bytes(pub.manifest)
+    with monkeypatch.context() as m:
+        # Old renderer has local imports: bind those explicitly, as well as
+        # the old assembler, summary and asset module globals. Never let the
+        # historical rendering oracle call the candidate crypto renderer.
+        m.setattr(tools, 'portal_indexes', old_crypto)
+        m.setattr(gen, 'portal_indexes', old_crypto)
+        old_preview = old_crypto.render_crypto_indexes(pub)
+        old_default = old_ca._assemble_payload(pub)
+        assert old_ca._assemble_payload(pub, portal_v5=False) == old_default
+        old_b1 = old_ca._assemble_payload(pub, portal_v5=True)
+        css = old_portal._render_css()
+        if not rs._is_producer_v2(pub.manifest):
+            old_render = [old_portal._render(pub)] + [getattr(old_portal, n)(pub, marker, css)
+                for n in ('_render_v2', '_render_v3', '_render_v4')]
+        else:
+            old_render = None
+            with pytest.raises(rs.StoreError) as exc:
+                old_portal._render(pub)
+            old_error = exc.value.code
+    assert crypto.render_crypto_indexes(pub) == old_preview
+    assert tuple(ca._assemble_payload(pub)) == tuple(old_default)
+    assert tuple(ca._assemble_payload(pub, portal_v5=False)) == tuple(old_default)
+    assert tuple(ca._assemble_payload(pub, portal_v5=True)) == tuple(old_b1)
+    if old_render is not None:
+        assert [portal._render(pub)] + [getattr(portal, n)(pub, marker, css)
+            for n in ('_render_v2', '_render_v3', '_render_v4')] == old_render
+    else:
+        with pytest.raises(rs.StoreError) as exc:
+            portal._render(pub)
+        assert exc.value.code == old_error
+    full = ca._assemble_v5_render_payload(pub)
+    pages = _cb2a_check(pub, full)
+    assert {n: full.files[n] for n in old_b1.files} == old_b1.files
+    assert json.loads(full.files['crypto_indexes.json']) == old_preview[0]
+    assert all(full.files[n] == r for n, r in old_preview[1].items())
+    assert full.css == css
+    if old_render is not None:
+        for n in old_render[-1][1]:
+            assert full.files[n] == old_render[-1][1][n]
+    if kind == 's1':
+        assert MALICIOUS.encode() not in b''.join(r for n, r in full.files.items() if n.endswith('.html'))
+        assert b'&lt;img src=x onerror=alert(1)&gt;' in full.files['algorithms.html']
+    if rs._is_producer_v2(pub.manifest):
+        assert b'Producer rules version' in full.index and pub.manifest['producer_rules_sha256'].encode() in full.index
+        assert b'Producer rules' in full.index and 'producer_rules.json' in pages['index.html'].links
+        for h in pub.manifest['expected_host_ids']:
+            assert b'Producer rules (batch-wide)' in full.files[h + '.html']
+    else:
+        assert b'Producer rules version' not in full.index
+    assert ca._assemble_v5_render_payload(pub) == full
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2a_actual_signatures_and_call_through(root, monkeypatch):
+    import os
+    from tools import render_portal as portal
+    pub = c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+    before = c1._c2_tree(root)
+    with rs.RunStore(root) as store, store._locked_run(c1.RID, shared=True) as (fd, lock):
+        actual = store.open(c1.RID)
+        assert actual == pub
+        sigs = portal._core_signatures(fd, store._device, actual, portal_v5=True)
+        assert set(sigs) == set(pub.artifacts) | {'run_manifest.json', 'journal.json'}
+        for path in pub.artifacts:
+            f = root / c1.RID / path; st = f.stat()
+            parents, sig = sigs[path]
+            p = root / c1.RID
+            expected = [(p.stat().st_dev, p.stat().st_ino)]
+            for part in path.split('/')[:-1]:
+                p /= part; expected.append((p.stat().st_dev, p.stat().st_ino))
+            assert parents == tuple(expected)
+            assert sig == (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_nlink, st.st_size,
+                           st.st_mtime_ns, st.st_ctime_ns)
+        counts = Counter()
+        for module, name in ((rs.RunStore, 'open'), (crypto, 'project_crypto_indexes'),
+            (assets, 'project_asset_indexes'), (ex, '_project_scan_summary'),
+            (validator, 'validate_cbom_bytes'), (gen, '_verified_taxonomy'),
+            (crypto, '_render_crypto_projection'), (assets, '_render_asset_indexes'),
+            (ex, '_render_summary_projection'), (portal, '_render_v5_core')):
+            original = getattr(module, name)
+            def call(*args, _name=name, _original=original, **kwargs):
+                counts[_name] += 1
+                return _original(*args, **kwargs)
+            monkeypatch.setattr(module, name, call)
+        full = ca._assemble_v5_render_payload(actual)
+        assert counts == {'project_asset_indexes': 1, 'project_crypto_indexes': 2,
+            'validate_cbom_bytes': 3, '_verified_taxonomy': 1, '_project_scan_summary': 1,
+            '_render_crypto_projection': 1, '_render_asset_indexes': 1,
+            '_render_summary_projection': 1, '_render_v5_core': 1}
+        assert portal._core_signatures(fd, store._device, actual, portal_v5=True) == sigs
+    assert c1._c2_tree(root) == before
+    _cb2a_check(pub, full)
+
+
+@pytest.mark.parametrize('fault', ['tamper', 'missing', 'symlink', 'hardlink'])
+def test_cb2a_pinned_signature_rejects(root, fault):
+    from tools import render_portal as portal
+    pub = c1._c2_open(root, ('complete',))
+    path = next(p for p in pub.artifacts if p.startswith('details/'))
+    target = root / c1.RID / path
+    with rs.RunStore(root) as store, store._locked_run(c1.RID, shared=True) as (fd, lock):
+        pub = store.open(c1.RID)
+        portal._core_signatures(fd, store._device, pub, portal_v5=True)
+        if fault == 'tamper':
+            data = target.read_bytes(); target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+        elif fault == 'hardlink':
+            import os
+            os.link(target, root.parent / 'hardlink-fixture')
+        else:
+            target.unlink()
+            if fault == 'symlink':
+                target.symlink_to(root / c1.RID / 'producer_rules.json')
+        with pytest.raises(rs.StoreError, match='^(ARTIFACT_CHANGED|UNSAFE_FILE)$'):
+            portal._core_signatures(fd, store._device, pub, portal_v5=True)
+        with pytest.raises(rs.StoreError):
+            store.open(c1.RID)
+
+
+@pytest.mark.parametrize('fault', ['foreign', 'path', 'wrong-v1-slot', 'wrong-v2-slot', 'mode', 'projection'])
+def test_cb2a_invalid_private_bindings(root, fault):
+    from tools import render_portal as portal
+    pub = a.publish(root, assessed=False, empty=True) if fault == 'wrong-v2-slot' else c1._c2_open(root, ('complete',))
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    if fault == 'mode':
+        for v in (None, 0, 1, 'true', [], {}):
+            with pytest.raises(rs.StoreError, match='^INVALID_PUBLICATION$'):
+                portal._view(pub, portal_v5=v)
+            with pytest.raises(rs.StoreError, match='^INVALID_PUBLICATION$'):
+                portal._host_views(pub, {}, portal_v5=v)
+            with pytest.raises(rs.StoreError, match='^INVALID_PUBLICATION$'):
+                portal._core_signatures(-1, -1, pub, portal_v5=v)
+    elif fault == 'projection':
+        p = crypto.project_crypto_indexes(pub); p['hosts']['h-' + 'f'*64] = {}
+        with pytest.raises(rs.StoreError, match='^INVALID_CRYPTO_INDEX_PUBLICATION$'):
+            portal._render_v5_core(pub, p, page_limit=ca._MAX_HTML, html_limit=ca._MAX_HTML_TOTAL,
+                                   bundle_limit=ca._MAX_BUNDLE, json_limit=ca._MAX_JSON)
+    else:
+        bad = deepcopy(pub)
+        if fault == 'wrong-v2-slot':
+            row = dict(next(r for r in bad.manifest['artifacts'] if r['kind'] == 'evidence'))
+            row.update(kind='detail', host_id=bad.manifest['expected_host_ids'][0], slot='platform-v2')
+            bad.manifest['artifacts'].append(row)
+        else:
+            row = next(r for r in bad.manifest['artifacts'] if r['kind'] == 'detail')
+            if fault == 'foreign':
+                data = bad.artifacts.pop(row['path']); row['host_id'] = 'h-' + 'f'*64
+                row['path'] = f"details/{row['host_id']}/{row['slot']}.json"; bad.artifacts[row['path']] = data
+            elif fault == 'path':
+                row['path'] = '../outside.json'
+            else:
+                row['slot'] = 'platform'
+        with pytest.raises(rs.StoreError):
+            portal._view(bad, portal_v5=True)
+        with pytest.raises(rs.StoreError):
+            portal._host_views(bad, {'collectors': []}, portal_v5=True)
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+            ca._assemble_v5_render_payload(bad)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def _cb2a_watch_writers(monkeypatch):
+    # Observe the actual fail-closed chunk guard (no mocked rendering or
+    # validator). The failed UTF-8/ASCII chunk must not have been extended.
+    failures = []
+    original = rs.require
+
+    def checked(ok, code='INVALID_STORE_DATA'):
+        if not ok and code in ('PORTAL_SIZE_LIMIT', 'CRYPTO_INDEX_SIZE_LIMIT'):
+            frame = sys._getframe(1)
+            while frame and frame.f_code.co_name not in ('page', '_render_crypto_projection', '_bounded_bytes', '_render_css'):
+                frame = frame.f_back
+            if frame:
+                f = frame.f_locals
+                kind = frame.f_code.co_name
+                if kind == 'page':
+                    name = f['template']
+                    if name == 'host.html.j2':
+                        name = f['context']['host']['host_id'] + '.html'
+                    else:
+                        name = {'run_index.html.j2': 'index.html', 'hosts.html.j2': 'hosts.html'}[name]
+                elif kind == '_render_crypto_projection':
+                    name = f['name'] + '.html'
+                elif kind == '_bounded_bytes':
+                    name = 'crypto_indexes.json'
+                else:
+                    name = 'portal.css'
+                if kind != '_render_css':
+                    chunk = f['part'] if kind == '_bounded_bytes' else f['raw']
+                    limit = f['cap'] if kind == '_bounded_bytes' else f['limit']
+                    assert len(f['out']) <= limit and len(chunk) > limit - len(f['out'])
+                    failures.append((name, limit, len(f['out']), len(chunk)))
+                elif 'css' in f:
+                    assert len(f['css']) > f['cap'] and len(f['css']) <= f['cap'] + 1
+                    failures.append((name, f['cap'], 0, len(f['css'])))
+                else:
+                    assert f['cap'] <= 0
+                    failures.append((name, f['cap'], 0, 0))
+        return original(ok, code)
+    monkeypatch.setattr(rs, 'require', checked)
+    return failures
+
+
+@pytest.mark.parametrize('page_name', ['algorithms.html', 'libraries.html', 'index.html', 'host'])
+def test_cb2a_core_page_exact_streaming(root, monkeypatch, page_name):
+    from tools import render_portal as portal
+    pub = (c1._c2_open(root, ('complete', 'partial', 'connection'), assessed=True)
+           if page_name == 'host' else a.publish(root, assessed=False, empty=True))
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    p = crypto.project_crypto_indexes(pub)
+    opts = dict(page_limit=ca._MAX_HTML, html_limit=ca._MAX_HTML_TOTAL,
+                bundle_limit=ca._MAX_BUNDLE, json_limit=ca._MAX_JSON)
+    index, css, pages = portal._render_v5_core(pub, p, **opts)
+    outputs = {'index.html': index, **pages}
+    order = ['algorithms.html', 'libraries.html', 'index.html', 'hosts.html'] + [
+        h + '.html' for h in pub.manifest['expected_host_ids']]
+    if page_name == 'host':
+        page_name = max(order[4:], key=lambda n: len(outputs[n]))
+    limit = len(outputs[page_name]); i = order.index(page_name)
+    assert all(len(outputs[n]) <= limit for n in order[:i])
+    faults = _cb2a_watch_writers(monkeypatch)
+    opts['page_limit'] = limit
+    subsequent = next((n for n in order[i+1:] if len(outputs[n]) > limit), None)
+    if subsequent:
+        with pytest.raises(rs.StoreError, match='^(PORTAL_SIZE_LIMIT|CRYPTO_INDEX_SIZE_LIMIT)$'):
+            portal._render_v5_core(pub, p, **opts)
+        # At exact capacity, the complete selected page succeeded; the
+        # subsequent larger page alone failed its actual chunk guard.
+        assert faults[-1][:2] == (subsequent, limit)
+    else:
+        assert portal._render_v5_core(pub, p, **opts) == (index, css, pages)
+    faults.clear()
+    opts['page_limit'] = limit - 1
+    with pytest.raises(rs.StoreError, match='^(PORTAL_SIZE_LIMIT|CRYPTO_INDEX_SIZE_LIMIT)$'):
+        portal._render_v5_core(pub, p, **opts)
+    assert faults[-1][:2] == (page_name, limit - 1)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('cap', ['_MAX_HTML_TOTAL', '_MAX_BUNDLE', 'remaining-json', 'remaining-css', 'css', 'json'])
+def test_cb2a_remaining_capacity(root, monkeypatch, cap):
+    from tools import render_portal as portal
+    pub = a.publish(root, assessed=False, empty=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    full = ca._assemble_v5_render_payload(pub)
+    b1 = ca._assemble_payload(pub, portal_v5=True)
+    b1_size = sum(e['size'] for e in b1.entries)
+    json_size = len(full.files['crypto_indexes.json']); css_size = len(full.css)
+    faults = _cb2a_watch_writers(monkeypatch)
+    if cap in ('_MAX_HTML_TOTAL', '_MAX_BUNDLE'):
+        size = sum(e['size'] for e in full.entries if cap == '_MAX_BUNDLE' or e['name'].endswith('.html'))
+        monkeypatch.setattr(ca, cap, size)
+        assert ca._assemble_v5_render_payload(pub) == full
+        monkeypatch.setattr(ca, cap, size - 1)
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+            ca._assemble_v5_render_payload(pub)
+        hid = pub.manifest['expected_host_ids'][0]
+        assert faults[-1][:2] == (hid + '.html', len(full.files[hid + '.html']) - 1)
+    elif cap in ('remaining-json', 'remaining-css'):
+        # B1 (all its HTML/exports/CBOM pairs) has already been charged.
+        size = b1_size + json_size + (css_size if cap == 'remaining-css' else 0)
+        monkeypatch.setattr(ca, '_MAX_BUNDLE', size)
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+            ca._assemble_v5_render_payload(pub)
+        if cap == 'remaining-css':
+            assert faults[-1][:2] == ('algorithms.html', 0)
+        # For remaining-json exact the CSS has no remaining byte room. The
+        # JSON guard must not reject; CSS's initial cap check does instead.
+        else:
+            assert faults[-1] == ('portal.css', 0, 0, 0)
+        faults.clear()
+        monkeypatch.setattr(ca, '_MAX_BUNDLE', size - 1)
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+            ca._assemble_v5_render_payload(pub)
+        assert faults[-1][:2] == (('crypto_indexes.json', json_size - 1) if cap == 'remaining-json'
+                                  else ('portal.css', css_size - 1))
+    elif cap == 'css':
+        monkeypatch.setattr(portal, '_MAX_CSS', css_size)
+        assert ca._assemble_v5_render_payload(pub) == full
+        monkeypatch.setattr(portal, '_MAX_CSS', css_size - 1)
+        with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_SIZE_LIMIT$'):
+            ca._assemble_v5_render_payload(pub)
+        assert faults[-1][:2] == ('portal.css', css_size - 1)
+    else:
+        p = crypto.project_crypto_indexes(pub)
+        opts = dict(page_limit=ca._MAX_HTML, html_limit=ca._MAX_HTML_TOTAL,
+                    bundle_limit=ca._MAX_BUNDLE)
+        assert portal._render_v5_core(pub, p, json_limit=json_size, **opts)[2]['crypto_indexes.json'] == full.files['crypto_indexes.json']
+        with pytest.raises(rs.StoreError, match='^CRYPTO_INDEX_SIZE_LIMIT$'):
+            portal._render_v5_core(pub, p, json_limit=json_size - 1, **opts)
+        assert faults[-1][:2] == ('crypto_indexes.json', json_size - 1)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('missing', ['host.html.j2', 'algorithms.html.j2'])
+def test_cb2a_missing_template(root, tmp_path, monkeypatch, missing):
+    import tools
+    from tools import render_portal as portal
+    pub = a.publish(root, assessed=False, empty=True)
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    old_ca, old_crypto, old_portal = _cb2a_original(tmp_path)
+    module = portal if missing == 'host.html.j2' else crypto
+    old = old_portal if module is portal else old_crypto
+    for m, label in ((module, 'candidate'), (old, 'old')):
+        dest = tmp_path / ('missing-' + label); dest.mkdir(mode=0o700)
+        for path in m._TEMPLATES.iterdir():
+            if path.name != missing and path.name in {'portal.css', 'base.html.j2', 'run_index.html.j2',
+                    'hosts.html.j2', 'host.html.j2', 'algorithms.html.j2', 'libraries.html.j2'}:
+                (dest / path.name).write_bytes(path.read_bytes())
+        monkeypatch.setattr(m, '_TEMPLATES', dest)
+    marker = rs._json_bytes(pub.manifest); css = old_portal._render_css()
+    with monkeypatch.context() as m:
+        m.setattr(tools, 'portal_indexes', old_crypto)
+        with pytest.raises(rs.StoreError) as old_error:
+            old_portal._render_v4(pub, marker, css)
+    with pytest.raises(rs.StoreError) as error:
+        portal._render_v4(pub, marker, css)
+    assert error.value.code == old_error.value.code
+    with pytest.raises(rs.StoreError, match='^PORTAL_PAYLOAD_INVALID$'):
+        ca._assemble_v5_render_payload(pub)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+def test_cb2a_actual_legacy_raw_sentinel(root, monkeypatch):
+    # Persist an allowed but unclassified legacy field in a real Store. The
+    # original host facts allowlist suppresses it; do not use a typed allowed
+    # configuration value as if it were an unclassified raw diagnostic.
+    import test_portal_overview as old_fixture
+    sentinel = 'SYNTHETIC_RAW_DIAGNOSTIC_MUST_NOT_DISPLAY'
+    original = old_fixture.observation
+    def observed(doc, host, collector, state, kind, data, *args, **kwargs):
+        original(doc, host, collector, state, kind, data, *args, **kwargs)
+        if kind == 'PACKAGE_INVENTORY':
+            row = deepcopy(doc['evidence'][-1]); key = 'unclassified-raw-fixture'
+            row.update(observation_key=key, evidence_id=old_fixture.e.evidence_id(
+                doc['run']['run_id'], row['host_id'], row['collection_id'], key),
+                evidence_kind='LEGACY_OBSERVATION', algorithm=None,
+                data=dict(field='fixture-extra', value=sentinel))
+            doc['collections'][-1]['evidence_ids'].append(row['evidence_id'])
+            doc['evidence'].append(row)
+    monkeypatch.setattr(old_fixture, 'observation', observed)
+    pub = old_fixture.publish(root, states=('PARTIAL',), legacy=True)
+    assert any(r['data'].get('value') == sentinel for r in pub.document['evidence'])
+    assert any(sentinel.encode() in r for r in pub.artifacts.values())
+    before, snapshot = c1._c2_tree(root), deepcopy(pub)
+    full = ca._assemble_v5_render_payload(pub)
+    assert all(sentinel.encode() not in r for r in (full.index, full.css, *full.files.values()))
+    hid = pub.manifest['expected_host_ids'][0]
+    assert b'Not displayed (unclassified legacy field)' in full.files[hid + '.html']
+    _cb2a_check(pub, full)
+    assert pub == snapshot and c1._c2_tree(root) == before
+
+
+@pytest.mark.parametrize('recovery', [False, True])
+def test_cb2a_actual_v2_terminal_and_artifact_rows(root, recovery):
+    from tools import render_portal as portal
+    pub = c1._c2_open(root, ('complete', 'complete', 'complete') if recovery else
+                      ('complete', 'partial', 'connection'), assessed=not recovery, recovery=recovery)
+    before = c1._c2_tree(root)
+    m = pub.manifest
+    full = ca._assemble_v5_render_payload(pub)
+    index = a.Page(full.index)
+    def value(v):
+        if v is None: return 'Unknown / not recorded'
+        if v is True: return 'Yes'
+        if v is False: return 'No'
+        return str(v)
+    expected = []
+    for h in m['hosts']:
+        hid = h['host_id']; terminal = h['terminal']
+        actual_rows = {} if terminal is None else {
+            rs.NATIVE_COLLECTORS.get(r['collector_id'], r['collector_id']): r for r in terminal['collectors']}
+        rows = []
+        for flag, requested in sorted(m['flags'][hid].items()):
+            record = actual_rows.get(flag)
+            rows.append([flag, value(requested), *([value(record['state']), value(record['reason_code']),
+                value(record['rc']), str(len(record['collection_ids']))] if record is not None else [value(None)]*4)])
+        expected += [[h['target_id'], *row] for row in rows]
+        page = a.Page(full.files[hid + '.html'])
+        assert page.tables['host-collectors'][1:] == rows
+        assert len(rows) == len(rs.COLLECTORS)  # platform is not a profile flag
+    assert index.tables['collector-rows'][1:] == expected
+    labels = {'producer-rules': 'Producer rules', 'rules': 'Assessment rules', 'batch': 'Batch manifest',
+              'evidence': 'Evidence JSON', 'assessed': 'Assessed Evidence JSON', 'detail': 'Detail JSON',
+              'cff': 'CFF projection', 'legacy': 'Legacy provenance'}
+    assert index.tables['artifact-rows'][1:] == [[labels[r['kind']], r['path'], r['format_version'],
+                                                 str(r['size'])] for r in m['artifacts']]
+    slots = {r['slot'] for r in m['artifacts'] if r['kind'] == 'detail'}
+    assert slots == {'producer-handoff-v2', 'platform-v2', 'certificate-assets-v1'}
+    assert m['missing_artifacts']
+    assert b'Producer rules SHA-256' in full.index and m['producer_rules_version'].encode() in full.index
+    if recovery:
+        assert b'NOT_ATTEMPTED' in full.index and b'Recovered publication' in full.index
+    assert c1._c2_tree(root) == before
