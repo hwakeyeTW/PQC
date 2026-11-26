@@ -17,6 +17,7 @@ from typing import NamedTuple
 
 COMMAND_SECONDS = 30
 OUTPUT_BYTES = 16 * 1024
+_POLICY_OUTPUT_BYTES = 64 * 1024 + 1
 
 
 class CommandResult(NamedTuple):
@@ -84,6 +85,15 @@ def run_bounded(argv, *, timeout_s=COMMAND_SECONDS):
     A lower timeout may narrow (never enlarge) a fixed adapter's budget.
     The combined stdout/stderr cap is a failure threshold, not truncation.
     """
+    return _run_bounded(argv, timeout_s, OUTPUT_BYTES)
+
+
+def run_policy_bounded(argv, *, timeout_s=COMMAND_SECONDS):
+    """Private CP1 entry for the fixed canonical policy child frame only."""
+    return _run_bounded(argv, timeout_s, _POLICY_OUTPUT_BYTES)
+
+
+def _run_bounded(argv, timeout_s, output_bytes):
     try:
         argv_bytes = (sum(len(x.encode('utf-8')) + 1 for x in argv)
                       if type(argv) in (list, tuple) and len(argv) <= 32
@@ -137,7 +147,7 @@ def run_bounded(argv, *, timeout_s=COMMAND_SECONDS):
                     time.sleep(min(0.02, left))
                     continue
                 for key, _ in sel.select(min(left, 0.05)):
-                    remaining = OUTPUT_BYTES - sum(map(len, buffers))
+                    remaining = output_bytes - sum(map(len, buffers))
                     data = os.read(key.fd, min(4096, remaining + 1))
                     if not data:
                         sel.unregister(key.fileobj)
