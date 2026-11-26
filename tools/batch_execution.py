@@ -2642,7 +2642,7 @@ def _v2_base_row(row):
     result['collectors'] = [{**c, 'collection_ids': [],
         'reason_code': ('COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else
                         'INVALID_ADAPTER_RESULT' if c['state'] == 'ERROR'
-                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl')
+                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
                         and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')
                         else c['reason_code'])}
         for c in row['collectors']]
@@ -2665,7 +2665,7 @@ def _valid_v2_outcome(row, flag, requested, cap):
         reduced['reason_code'] = 'COMMAND_IO_FAILED'
     if (reduced.get('state') == 'ERROR'
             and reduced.get('reason_code') in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')):
-        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl')
+        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
                 or reduced.get('rc') is not None or ids):
             return False
         reduced['reason_code'] = 'INVALID_ADAPTER_RESULT'
@@ -2703,6 +2703,15 @@ def validate_producer_manifest(manifest, rc):
                     and row['platform']['collection_ids']
                     and len(ssl_fatal) == len(ssl_rows)
                     and len({c['reason_code'] for c in ssl_fatal}) == 1,
+                    3, 'INVALID_TERMINAL_MANIFEST')
+        # CP2-only fatal extension: no Policy references, with prior Platform
+        # evidence and no later producer dispatch. V1's outcome grammar stays closed.
+        policy_row = next(c for c in row['collectors'] if c['collector_id'] == bridge.POLICY_FLAG)
+        if policy_row['state'] == 'ERROR' and policy_row['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT'):
+            require(row['attempted'] and row['reason_code'] in _FATAL
+                    and row['platform']['collection_ids']
+                    and all(c['state'] == 'NOT_SCANNED' and not c['collection_ids']
+                            for c in row['collectors'] if c['collector_id'] in (bridge.SSHD, bridge.KEYS, bridge.CERT_FLAG)),
                     3, 'INVALID_TERMINAL_MANIFEST')
         ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
         require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)

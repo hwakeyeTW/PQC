@@ -1936,9 +1936,9 @@ def _cp2_tool(state):
     if state == 'ok':
         return dict(state='OK', exists=True, isreg=True, islnk=False, executable=True)
     if state == 'link':
-        return dict(state='OK', exists=True, isreg=True, islnk=True, executable=True)
+        return dict(state='OK', exists=True, isreg=False, islnk=True, executable=None)
     if state == 'unknown':
-        return dict(state='UNKNOWN', exists=None, isreg=None, islnk=None, executable=None)
+        return dict(state='UNKNOWN')
     assert state == 'absent'
     return dict(state='OK', exists=False, isreg=None, islnk=None, executable=None)
 
@@ -2031,7 +2031,7 @@ def test_cp2_actual_o2_order_and_large_reader(fixture, monkeypatch):
         original, doc['hosts'][0]['host_id'], source=bridge._source(bridge.POLICY,snap),
         observed_at=rows[0]['observed_at'], snapshot=snap,rules=RULES,
         platform_snapshot=platform_snapshot(),requested=True)
-    assert {x['collection_id']:x for x in rows} == {x['collection_id']:x for x in expected['collections']}
+    assert {x['collection_id']:x for x in rows} == {x['collection_id']:{**x, 'evidence_ids':sorted(x['evidence_ids'])} for x in expected['collections']}
     assert {x['evidence_id']:x for x in doc['evidence'] if x['collection_id'] in {r['collection_id'] for r in rows}} == {x['evidence_id']:x for x in expected['evidence']}
     assert bundle['companions'][n][bridge.POLICY] == {
         'metadata':expected['metadata'], 'diagnostics':expected['diagnostics']}
@@ -2068,7 +2068,8 @@ def test_cp2_actual_failure_layers(fixture,monkeypatch,mode,ordinal,reason,inner
 
 
 @pytest.mark.parametrize('fault,reason', [
-    ('guard','GUARD_REJECTED'),('foreign','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('guard','GUARD_REJECTED'),('connection','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('foreign','REMOTE_CLEANUP_UNCONFIRMED'),
     ('replay','REMOTE_CLEANUP_UNCONFIRMED'),('ordinal','REMOTE_CLEANUP_UNCONFIRMED'),
     ('cleanup','REMOTE_CLEANUP_UNCONFIRMED'),('duplicate','INVALID_ADAPTER_RESULT'),
     ('nan','INVALID_ADAPTER_RESULT'),('extra','INVALID_ADAPTER_RESULT'),
@@ -2086,6 +2087,8 @@ def test_cp2_fatal_no_following_stage_or_host(fixture,monkeypatch,fault,reason):
         if fault == 'guard' and when == 'prepare':
             with cfg.open('a') as f:
                 f.write('\n# anonymous CP2 guard drift\n')
+        if fault == 'connection' and when == 'prepare':
+            monkeypatch.setattr(batch, '_restricted_connection', lambda name: 'CONNECTION_FAILED')
         if when != 'completion':
             return completion
         if fault == 'foreign':
@@ -2117,17 +2120,49 @@ def test_cp2_fatal_no_following_stage_or_host(fixture,monkeypatch,fault,reason):
     assert m['hosts'][1]['host_state'] == 'NOT_ATTEMPTED'
     assert not _p2_rows(cp2,names[1]) and not _p2_rows(cp2,names[0])[1:]
     assert not any(x['collector_id'] == bridge.POLICY for x in bundle['document']['collections'])
+    if fault in ('guard','connection'):
+        assert not _p2_rows(cp2,n) and set(bundle['companions'][n]) == {bridge.PLATFORM}
+    if fault == 'guard':
+        # V2-only exception does not authorize invented references or a later stage.
+        for case in ('policy-ref','platform-missing','later-collected'):
+            bad = copy.deepcopy(m)
+            row = bad['hosts'][0]
+            by = {c['collector_id']:c for c in row['collectors']}
+            if case == 'policy-ref':
+                by[bridge.POLICY_FLAG]['collection_ids'] = ['c-'+'a'*64]
+            elif case == 'platform-missing':
+                row['platform']['collection_ids'] = []
+            else:
+                by[bridge.SSHD].update(state='COLLECTED',reason_code='COLLECTED',rc=0)
+            with pytest.raises(batch.Denied):
+                batch.validate_producer_manifest(bad,rc)
+        legacy = {**m,'batch_manifest_version':1,'hosts':[batch._v2_base_row(row) for row in m['hosts']]}
+        next(c for c in legacy['hosts'][0]['collectors'] if c['collector_id']==bridge.POLICY_FLAG)['reason_code'] = reason
+        with pytest.raises(batch.Denied):
+            batch.validate_terminal_manifest(legacy,rc)
     assert not trap.exists()
 
 
-def test_cp2_actual_consumer_loss(fixture,monkeypatch):
+@pytest.mark.parametrize('mode',['consumer-loss','signal'])
+def test_cp2_actual_consumer_loss(fixture,monkeypatch,mode):
     make,_,trace,trap,_ = fixture
     ctx,names = make(count=2,forks=1,flags=selected_flags(bridge.POLICY_FLAG))
     n = names[0]
-    _,_,cp2 = _cp2_register(monkeypatch,ctx,trace,modes={(n,0):'consumer-loss'},stage_seconds=4)
+    _,_,cp2 = _cp2_register(monkeypatch,ctx,trace,
+        modes={(n,0):'consumer-loss' if mode=='consumer-loss' else 'outer-timeout'},stage_seconds=4)
+    sent=[]; before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    if mode=='signal':
+        poll=batch._ProducerWorkerWave.poll
+        def interrupt(self):
+            if not sent and (cp2.tmp/f'{n}-0-group.json').exists():
+                sent.append(time.monotonic()); os.kill(os.getpid(),signal.SIGINT)
+            return poll(self)
+        monkeypatch.setattr(batch._ProducerWorkerWave,'poll',interrupt)
     with _p2_owned_supervisors(cp2) as reaped:
         rc,m,bundle = checked(ctx)
-    assert rc == 6 and m['reason_code'] == 'REMOTE_CLEANUP_UNCONFIRMED'
+    assert rc==(7 if mode=='signal' else 6) and m['reason_code']==('INTERRUPTED' if mode=='signal' else 'REMOTE_CLEANUP_UNCONFIRMED')
+    assert (mode!='signal' or sent) and [name for name,_ in launches]==names[:1]
+    assert _signal_state()==before
     assert m['hosts'][1]['host_state'] == 'NOT_ATTEMPTED'
     stages = _p2_rows(cp2,n)
     assert len(stages) == 1 and stages[0]['supervisor'] in reaped
@@ -2175,7 +2210,9 @@ def test_cp2_closed_receipt_frame_boundary_and_context(fixture):
                 completion._replace(started=False),
                 completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": 0.0',1)),
                 completion._replace(stdout=b'{"changed":false,"changed":false}'),
-                completion._replace(binding=binding._replace(task_uuid='other-task'))):
+                completion._replace(binding=binding._replace(task_uuid='other-task')),
+                completion._replace(binding=binding._replace(run_id='other-run')),
+                completion._replace(binding=binding._replace(producer_id=bridge.OPENSSL))):
         with pytest.raises(bridge._StageFailure):
             bridge._stage_receipt(bad,binding)
     # The staged context is opt-in and does not change the legacy default.
@@ -2191,6 +2228,7 @@ def test_cp2_closed_receipt_frame_boundary_and_context(fixture):
     result = bridge.normalize_handoff(fatal,RUN,HOST,flags,TIME,RULES,staged_policy=True)
     assert result.special == 'GUARD_REJECTED' and set(result.companions) == {bridge.PLATFORM}
     value['records'][0]['snapshot']['tools']['timeout'] = [_cp2_tool('unknown')]
+    value['records'][0]['snapshot']['rpms'] = {}
     with pytest.raises(bridge.BridgeError):
         bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,staged_policy=True)
     value['records'][1]['snapshot'] = bridge._policy_timeout_gap()
@@ -2257,4 +2295,3 @@ def test_cp2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
         row=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.POLICY_FLAG)
         assert row['reason_code']=='CONTROLLER_TIMEOUT' and not row['collection_ids']
     assert not trap.exists() and _signal_state()==before
-
