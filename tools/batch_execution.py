@@ -2708,8 +2708,23 @@ def validate_producer_manifest(manifest, rc):
         # evidence and no later producer dispatch. V1's outcome grammar stays closed.
         policy_row = next(c for c in row['collectors'] if c['collector_id'] == bridge.POLICY_FLAG)
         if policy_row['state'] == 'ERROR' and policy_row['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT'):
+            # A selected O2 producer must have completed before Policy. Its
+            # snapshot projects every requested flag with references; a clean
+            # ordinary whole-producer failure instead projects the same error
+            # and rc without references. Neither shape proves cleanup itself.
+            ssl_complete = not ssl_rows or all(
+                c['collection_ids'] and (c['state'] in ('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL',
+                                                        'UNKNOWN', 'PERMISSION_DENIED')
+                    or (c['state'], c['reason_code']) in (('ERROR', 'COLLECTION_ERROR'),
+                                                          ('NOT_SCANNED', 'ADAPTER_NOT_AVAILABLE')))
+                for c in ssl_rows)
+            ssl_ordinary_failure = bool(ssl_rows) and all(
+                c['state'] == 'ERROR' and c['reason_code'] in bridge._STAGE_RPM_FAILURES
+                and not c['collection_ids']
+                and (c['reason_code'], c['rc']) == (ssl_rows[0]['reason_code'], ssl_rows[0]['rc'])
+                for c in ssl_rows)
             require(row['attempted'] and row['reason_code'] in _FATAL
-                    and row['platform']['collection_ids']
+                    and row['platform']['collection_ids'] and (ssl_complete or ssl_ordinary_failure)
                     and all(c['state'] == 'NOT_SCANNED' and not c['collection_ids']
                             for c in row['collectors'] if c['collector_id'] in (bridge.SSHD, bridge.KEYS, bridge.CERT_FLAG)),
                     3, 'INVALID_TERMINAL_MANIFEST')

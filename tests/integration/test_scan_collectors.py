@@ -2143,6 +2143,118 @@ def test_cp2_fatal_no_following_stage_or_host(fixture,monkeypatch,fault,reason):
     assert not trap.exists()
 
 
+def _cp2_terminal_after_o2(families, reason, prior='complete'):
+    flags = selected_flags(*families, bridge.POLICY_FLAG, bridge.SSHD)
+    data = envelope(flags=flags, partial=prior == 'partial')
+    data['records'] = data['records'][:-1]  # SSH was not dispatched.
+    data['records'][-1].update(reason_code=reason, rc=None, snapshot=None)
+    if families:
+        o2 = data['records'][1]
+        if prior in bridge._STAGE_RPM_FAILURES:
+            o2.update(reason_code=prior, rc=7 if prior == 'COMMAND_FAILED' else None,
+                      snapshot=None)
+        elif prior in ('unknown', 'out-of-scope'):
+            p = platform_snapshot('Debian' if prior == 'out-of-scope' else 'OracleLinux')
+            if prior == 'unknown':
+                p['facts_state'] = 'UNKNOWN'
+                p['facts'] = {}
+            p['rpms'] = {}
+            data['records'][0]['snapshot'] = p
+            o2.update(reason_code='PLATFORM_GAP', rc=None, snapshot=bridge._gap_snapshot(
+                bridge.OPENSSL, flags, bridge._platform_status(p)))
+        elif prior in ('typed-error', 'permission'):
+            for slot in o2['snapshot']['slots'].values():
+                if slot['state'] != 'NOT_SCANNED':
+                    slot.update(state='ERROR' if prior == 'typed-error' else 'PERMISSION_DENIED',
+                                reason='COMMAND_FAILED' if prior == 'typed-error' else 'PERMISSION_DENIED',
+                                rc=7 if prior == 'typed-error' else None, rows=[])
+    projection = bridge.normalize_handoff(data, RUN, HOST, flags, TIME, RULES,
+                                           staged_openssl=True, staged_policy=True)
+    rows = [projection.outcomes[f] for f in batch._COLLECTORS]
+    row = {**batch._host(HOST, True, rows, reason), 'platform': projection.outcomes[bridge.PLATFORM]}
+    state, run_reason, rc = batch._run_state([batch._v2_base_row(row)], reason)
+    manifest = dict(batch_manifest_version=2, target_ids=[HOST], target_count=1,
+                    limits=dict(max_hosts=10, forks=1, serial=2, ssh_timeout_s=15, command_timeout_s=30),
+                    profile='baseline', run_state=state, reason_code=run_reason, hosts=[row])
+    return manifest, rc
+
+
+@pytest.mark.parametrize('families', [(bridge.PACKAGES,), (bridge.SSL,), (bridge.PACKAGES, bridge.SSL)],
+                         ids=['packages', 'ssl', 'both'])
+@pytest.mark.parametrize('reason', ['GUARD_REJECTED', 'CONTROLLER_TIMEOUT'])
+@pytest.mark.parametrize('fault', ['prior-fatal', 'prior-stopped', 'not-dispatched', 'unreachable',
+                                   'other-fatal', 'no-refs-success', 'ordinary-with-refs',
+                                   'mixed-snapshot', 'mixed-ordinary', 'mixed-rc'])
+def test_cp2_terminal_prior_o2_order(families, reason, fault):
+    manifest, rc = _cp2_terminal_after_o2(families, reason)
+    assert batch.validate_producer_manifest(manifest, rc) is None
+    rows = {c['collector_id']: c for c in manifest['hosts'][0]['collectors']}
+    row = rows[families[0]]
+    if fault in ('prior-fatal', 'prior-stopped', 'not-dispatched', 'unreachable', 'other-fatal'):
+        state, prior = {'prior-fatal': ('ERROR', reason), 'prior-stopped': ('NOT_SCANNED', 'STOPPED'),
+                        'not-dispatched': ('NOT_SCANNED', 'NOT_DISPATCHED'),
+                        'unreachable': ('UNREACHABLE', 'CONNECTION_FAILED'),
+                        'other-fatal': ('ERROR', 'REMOTE_CLEANUP_UNCONFIRMED')}[fault]
+        row.update(state=state, reason_code=prior, rc=None, collection_ids=[])
+    elif fault == 'no-refs-success':
+        row['collection_ids'] = []
+    elif fault == 'ordinary-with-refs':
+        row.update(state='ERROR', reason_code='COMMAND_FAILED', rc=7)
+    else:
+        if len(families) == 1:
+            # A one-flag ordinary outcome still requires a valid original rc.
+            row.update(state='ERROR', reason_code='COMMAND_FAILED', rc=0, collection_ids=[])
+        else:
+            row.update(state='ERROR', reason_code='COMMAND_FAILED', rc=7, collection_ids=[])
+            if fault != 'mixed-snapshot':
+                rows[families[1]].update(state='ERROR', reason_code='COMMAND_TIMEOUT' if fault == 'mixed-ordinary'
+                                         else 'COMMAND_FAILED', rc=7 if fault == 'mixed-ordinary' else 8, collection_ids=[])
+    with pytest.raises(batch.Denied, match='INVALID_TERMINAL_MANIFEST'):
+        batch.validate_producer_manifest(manifest, rc)
+
+
+@pytest.mark.parametrize('reason', ['GUARD_REJECTED', 'CONTROLLER_TIMEOUT'])
+@pytest.mark.parametrize('families', [(), (bridge.PACKAGES,), (bridge.SSL,), (bridge.PACKAGES, bridge.SSL)],
+                         ids=['unselected', 'packages', 'ssl', 'both'])
+def test_cp2_terminal_prior_o2_positive(families, reason):
+    cases = ('complete',) if not families else ('complete', 'partial', 'typed-error', 'permission',
+             'unknown', 'out-of-scope', *bridge._STAGE_RPM_FAILURES)
+    for prior in cases:
+        manifest, rc = _cp2_terminal_after_o2(families, reason, prior)
+        assert batch.validate_producer_manifest(manifest, rc) is None, prior
+
+
+def test_cp2_native_o2_then_policy_fatal(fixture, monkeypatch):
+    make, _, trace, trap, cfg = fixture
+    ctx, names = make(count=2, forks=1, flags=selected_flags(bridge.PACKAGES, bridge.POLICY_FLAG,
+                                                          bridge.SSHD, bridge.CERT_FLAG))
+    n = names[0]
+
+    def corrupt(when, binding, completion):
+        if when == 'prepare' and binding.ordinal == 0:
+            with cfg.open('a') as f:
+                f.write('\n# anonymous CP2 guard drift after O2\n')
+        return completion
+
+    p2, o2, cp2 = _cp2_register(monkeypatch, ctx, trace, o2_kwargs={}, fault=corrupt)
+    rc, manifest, bundle = checked(ctx)
+    row = manifest['hosts'][0]
+    by = {c['collector_id']: c for c in row['collectors']}
+    assert rc == 6 and manifest['reason_code'] == 'GUARD_REJECTED'
+    assert manifest['hosts'][1]['host_state'] == 'NOT_ATTEMPTED'
+    assert len(_p2_rows(p2, n)) == 3 and len(_p2_rows(o2, n)) == 2
+    assert all(c['cleanup'] for c in _p2_rows(o2, n, 'done'))
+    assert len({c['worker'] for c in _p2_rows(p2, n) + _p2_rows(o2, n)}) == 1
+    assert len(row['platform']['collection_ids']) == 10
+    assert by[bridge.PACKAGES]['state'] == 'COLLECTED' and len(by[bridge.PACKAGES]['collection_ids']) == 2
+    assert by[bridge.POLICY_FLAG]['reason_code'] == 'GUARD_REJECTED' and not by[bridge.POLICY_FLAG]['collection_ids']
+    assert all(by[f]['state'] == 'NOT_SCANNED' and not by[f]['collection_ids'] for f in (bridge.SSHD, bridge.CERT_FLAG))
+    assert set(bundle['companions'][n]) == {bridge.PLATFORM, bridge.OPENSSL}
+    assert not _p2_rows(cp2, n) and not any(_p2_rows(d, names[1]) for d in (p2, o2, cp2))
+    assert not any((trace.parent / (n + '.' + p + '.json')).exists() for p in (bridge.SSH, bridge.CERT))
+    assert not trap.exists()
+
+
 @pytest.mark.parametrize('mode',['consumer-loss','signal'])
 def test_cp2_actual_consumer_loss(fixture,monkeypatch,mode):
     make,_,trace,trap,_ = fixture
