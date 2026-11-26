@@ -88,12 +88,17 @@ def _producer_adapters():
     return {}
 
 
-# I1b P2/O2: fixed private stage bridges. Not a live transport or a public driver
+# I1b P2/O2/CP2: fixed private stage bridges. Not a live transport or a public driver
 # registry. A prepare callback may only package the bound fixed P1 stage;
 # the returned launcher must consume its one-use native launch gate before
 # dispatch. It owns independent stage completion and cleanup evidence.
 _PLATFORM_STAGES = ('metadata', *('release-rpm-' + name for name in platform.PACKAGES))
 _OPENSSL_STAGES = openssl_runtime.SLOTS
+_POLICY_STAGES = ('reader', 'show-bin', 'show-sbin')
+_POLICY_READER_SCOPES = tuple(s for s in crypto_policy.SCOPES if s != 'profile-show')
+_POLICY_PAYLOAD_BYTES = 64 * 1024
+_POLICY_RECEIPT_BYTES = 66 * 1024
+_POLICY_FRAME_BYTES = 128 * 1024
 _STAGE_FRAME_BYTES = 32 * 1024
 _STAGE_RECEIPT_BYTES = 16 * 1024
 _STAGE_RPM_FAILURES = MappingProxyType({
@@ -120,12 +125,21 @@ class _OpenSSLStageBinding(NamedTuple):
     ordinal: int
 
 
+class _PolicyStageBinding(NamedTuple):
+    run_id: str
+    target_id: str
+    task_uuid: str
+    producer_id: str
+    stage: str
+    ordinal: int
+
+
 class _StageCompletion(NamedTuple):
     # The binding is the actual controller-issued object, not fields taken
     # from remote output. clean is the trusted driver's independent lifecycle
     # receipt, never copied from an unchecked frame. started=False requires
     # proof that no stage process was launched.
-    binding: _StageBinding | _OpenSSLStageBinding
+    binding: _StageBinding | _OpenSSLStageBinding | _PolicyStageBinding
     stdout: bytes
     stderr: bytes
     wrapper_rc: int | None
@@ -169,10 +183,76 @@ def _bound_openssl_stage_validator():
     return pqc_openssl_acquire.validate_receipt
 
 
+def _bound_policy_stage_validator():
+    # Offline Store/import callers never need to load Ansible.
+    from ansible_collections.security.compliance_pqc_readiness.plugins.modules import pqc_policy_acquire
+    expected = (Path(__file__).resolve().parents[1] / 'ansible_collections/security/'
+                'compliance_pqc_readiness/plugins/modules/pqc_policy_acquire.py')
+    require(Path(pqc_policy_acquire.__file__).resolve() == expected
+            and pqc_policy_acquire.STAGES == _POLICY_STAGES
+            and pqc_policy_acquire.PAYLOAD_BYTES == _POLICY_PAYLOAD_BYTES
+            and pqc_policy_acquire.RECEIPT_BYTES == _POLICY_RECEIPT_BYTES
+            and pqc_policy_acquire.WRAPPER_BYTES == _POLICY_FRAME_BYTES,
+            'INVALID_STAGE_VALIDATOR')
+    return pqc_policy_acquire.validate_receipt
+
+
 def _openssl_plan(flags):
     require(all(type(flags[f]) is bool for f in (PACKAGES, SSL)))
     return tuple((i, stage) for i, stage in enumerate(_OPENSSL_STAGES)
                  if flags[PACKAGES if stage in openssl_runtime.PACKAGES else SSL])
+
+
+def _policy_plan(flags, snapshot):
+    """Derive an exact plan from validated same-host P1 data, never paths."""
+    require(type(flags[POLICY_FLAG]) is bool)
+    if not flags[POLICY_FLAG]:
+        return ()
+    tools = platform.normalize_tools(snapshot['tools'])
+    if (_platform_status(snapshot) != 'UNVERIFIED'
+            or tools['timeout'][2]['available'] is not True):
+        return ()
+    for i, row in enumerate(snapshot['tools']['update-crypto-policies'], 1):
+        if (row['state'] == 'OK' and row.get('exists') is True
+                and row.get('isreg') is True and row.get('islnk') is False
+                and row.get('executable') is True):
+            return ((0, 'reader'), (i, _POLICY_STAGES[i]))
+    return ((0, 'reader'),)
+
+
+def _policy_timeout_gap():
+    return {scope: crypto_policy.result('NOT_SCANNED', 'TIMEOUT_TOOL_UNAVAILABLE')
+            for scope in crypto_policy.SCOPES}
+
+
+def _validate_staged_policy(snapshot, flags, platform_snapshot):
+    """Pure revalidation of the closed projection and its fixed plan."""
+    require(flags[POLICY_FLAG] is True and platform_snapshot is not None)
+    crypto_policy.normalize_snapshot(snapshot)
+    plan = _policy_plan(flags, platform_snapshot)
+    status = _platform_status(platform_snapshot)
+    if status != 'UNVERIFIED':
+        require(snapshot == _gap_snapshot(POLICY, flags, status))
+    elif not plan:
+        require(snapshot == _policy_timeout_gap())
+    else:
+        reader = {scope: snapshot[scope] for scope in _POLICY_READER_SCOPES}
+        require(all(row['state'] != 'NOT_SCANNED' and row['rc'] is None
+                    and all(item['result']['rc'] is None for item in row['overrides'])
+                    for row in reader.values()))
+        if any(row['reason'] == 'TOTAL_LIMIT' or
+               any(item['result']['reason'] == 'TOTAL_LIMIT' for item in row['overrides'])
+               for row in reader.values()):
+            require(reader == {scope: crypto_policy.result('ERROR', 'TOTAL_LIMIT')
+                               for scope in _POLICY_READER_SCOPES})
+        show = snapshot['profile-show']
+        if len(plan) == 1:
+            require(show == crypto_policy.result('NOT_SCANNED', 'SHOW_TOOL_UNAVAILABLE'))
+        else:
+            require(show['state'] != 'NOT_SCANNED')
+            if show['reason'] == 'AMBIGUOUS_PROFILE':
+                require(show['rc'] == 0 and type(show['rc']) is int)
+    require(not _uncertain(snapshot))
 
 
 def _stage_receipt(completion, binding):
@@ -183,8 +263,16 @@ def _stage_receipt(completion, binding):
         raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED')
     try:
         out, err, rc = completion.stdout, completion.stderr, completion.wrapper_rc
+        if type(binding) is _PolicyStageBinding:
+            require(binding.producer_id == POLICY and type(binding.ordinal) is int
+                    and 0 <= binding.ordinal < len(_POLICY_STAGES)
+                    and binding.stage == _POLICY_STAGES[binding.ordinal])
+            frame_bytes = _POLICY_FRAME_BYTES
+        else:
+            require(type(binding) in (_StageBinding, _OpenSSLStageBinding))
+            frame_bytes = _STAGE_FRAME_BYTES
         require(type(out) is bytes and type(err) is bytes
-                and len(out) + len(err) <= _STAGE_FRAME_BYTES)
+                and len(out) + len(err) <= frame_bytes)
         if not completion.started:
             require(rc is None and not out and not err)
             raise _StageFailure('COMMAND_START_FAILED', clean=True)
@@ -196,6 +284,8 @@ def _stage_receipt(completion, binding):
             'module_args': {'stage': binding.stage}})
         if type(binding) is _StageBinding:
             validator = _bound_stage_validator()
+        elif type(binding) is _PolicyStageBinding:
+            validator = _bound_policy_stage_validator()
         else:
             require(type(binding) is _OpenSSLStageBinding and binding.producer_id == OPENSSL
                     and type(binding.ordinal) is int and 0 <= binding.ordinal < len(_OPENSSL_STAGES)
@@ -203,6 +293,11 @@ def _stage_receipt(completion, binding):
             validator = _bound_openssl_stage_validator()
         receipt = validator(frame['receipt'], binding.stage)
         if not receipt['cleanup_confirmed']:
+            raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED', receipt['rc'])
+        if (type(binding) is _PolicyStageBinding and receipt['payload'] is not None
+                and _uncertain(receipt['payload'])):
+            # A clean outer supervisor cannot certify an uncertain inner
+            # --show cleanup. Retain pending and deny further dispatch.
             raise _StageFailure('REMOTE_CLEANUP_UNCONFIRMED', receipt['rc'])
         return receipt
     except _StageFailure:
@@ -293,6 +388,51 @@ class _OpenSSLStageAdapter:
         snapshot = dict(flags=frozen, platform_status='UNVERIFIED',
                         slots={stage: slots[stage] for stage in _OPENSSL_STAGES})
         validate(openssl_runtime.validate_snapshot, snapshot)
+        return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
+
+
+class _PolicyStageAdapter:
+    """Fixed CP1 stages; authorization and the ordinal gate belong to the worker."""
+    def __init__(self, prepare):
+        require(callable(prepare), 'INVALID_STAGE_DRIVER')
+        self.prepare = prepare
+
+    def collect(self, run_id, target, task_uuid, flags, platform_snapshot, invoke, validate):
+        require(flags[POLICY_FLAG] is True)
+        plan = validate(_policy_plan, flags, platform_snapshot)
+        status = validate(_platform_status, platform_snapshot)
+        if status != 'UNVERIFIED':
+            return dict(reason_code='PLATFORM_GAP', rc=None, cleanup_confirmed=True,
+                        snapshot=_gap_snapshot(POLICY, flags, status))
+        if not plan:
+            # COMMAND_OK denotes a complete internal projection, not a
+            # launched native command. All nine scopes explicitly remain gaps.
+            return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True,
+                        snapshot=_policy_timeout_gap())
+        slots = {}
+        if len(plan) == 1:
+            slots['profile-show'] = crypto_policy.result('NOT_SCANNED', 'SHOW_TOOL_UNAVAILABLE')
+        for ordinal, stage in plan:
+            binding = _PolicyStageBinding(run_id, target, task_uuid, POLICY, stage, ordinal)
+            scopes = _POLICY_READER_SCOPES if stage == 'reader' else ('profile-show',)
+            try:
+                receipt = invoke(self.prepare, binding)
+                if receipt['reason_code'] != 'COMMAND_OK':
+                    raise _StageFailure(receipt['reason_code'], receipt['rc'], receipt['cleanup_confirmed'])
+            except _StageFailure as exc:
+                if exc.clean is not True or exc.reason not in _STAGE_RPM_FAILURES:
+                    return exc.value()
+                # The outer helper rc is not an observed inner --show rc.
+                rows = {scope: crypto_policy.result('ERROR', _STAGE_RPM_FAILURES[exc.reason])
+                        for scope in scopes}
+            else:
+                rows = receipt['payload']
+                if _uncertain(rows):
+                    return _StageFailure('INVALID_ADAPTER_RESULT', receipt['rc'], True).value()
+            shape(rows, scopes)
+            require(not slots.keys() & rows.keys())
+            slots.update(copy.deepcopy(rows))
+        snapshot = {scope: slots[scope] for scope in crypto_policy.SCOPES}
         return dict(reason_code='COMMAND_OK', rc=0, cleanup_confirmed=True, snapshot=snapshot)
 
 
@@ -604,9 +744,13 @@ def precheck(producer, snapshot, flags, platform_snapshot, run_id, target, obser
         raise BridgeError('INVALID_PRODUCER')
 
 
-def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False, staged_openssl=False):
+def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=False,
+           staged_openssl=False, staged_policy=False):
     """Validate one trusted adapter return and bind its observed time."""
-    require(type(staged_openssl) is bool and (not staged_openssl or producer == OPENSSL))
+    require(type(staged_openssl) is bool and (not staged_openssl or producer == OPENSSL)
+            and type(staged_policy) is bool and (not staged_policy or producer == POLICY))
+    if staged_policy:
+        require(platform_snapshot is not None and flags[POLICY_FLAG] is True)
     if staged_openssl and not gap:
         require(platform_snapshot is not None and _platform_status(platform_snapshot) == 'UNVERIFIED')
     shape(value, ('reason_code', 'rc', 'cleanup_confirmed', 'snapshot'))
@@ -617,13 +761,18 @@ def record(producer, value, flags, platform_snapshot, run_id, target, *, gap=Fal
     if reason == 'COMMAND_OK' or gap:
         require(clean and type(snapshot) is dict and (reason, rc) == (('PLATFORM_GAP', None) if gap else ('COMMAND_OK', 0)))
         require(not staged_openssl or not _uncertain(snapshot))
+        if staged_policy:
+            require(gap == (_platform_status(platform_snapshot) != 'UNVERIFIED'))
+            _validate_staged_policy(snapshot, flags, platform_snapshot)
         precheck(producer, snapshot, flags, platform_snapshot, run_id, target, now)
     else:
         require(reason in FAILURES and snapshot is None and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0)
                 and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
-                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL))
+                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL)
+                     or (staged_policy and producer == POLICY))
                 and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                 and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean))
+        require(not staged_policy or reason in FATAL)
     return dict(producer_id=producer, observed_at=now, **copy.deepcopy(value))
 
 
@@ -756,13 +905,15 @@ class HostProjection:
         self.special = special
 
 
-def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *, staged_openssl=False):
+def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *,
+                      staged_openssl=False, staged_policy=False):
     """Bind actual typed snapshots to one frozen target, in fixed producer order.
 
     The optional private context comes only from the trusted staged session,
     never the handoff itself. The legacy synthetic contract is unchanged.
     """
-    require(type(staged_openssl) is bool)
+    require(type(staged_openssl) is bool and type(staged_policy) is bool)
+    require(not staged_policy or flags[POLICY_FLAG] is True)
     shape(envelope, ('handoff_version', 'run_id', 'target_id', 'connection', 'records'))
     require(type(envelope['handoff_version']) is int and envelope['handoff_version'] == WIRE_VERSION
             and envelope['run_id'] == run_id and envelope['target_id'] == target)
@@ -800,6 +951,8 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *, sta
         reason, rc, clean, snapshot = (row[k] for k in ('reason_code', 'rc', 'cleanup_confirmed', 'snapshot'))
         require(type(reason) is str and type(clean) is bool and (rc is None or type(rc) is int and -255 <= rc <= 255))
         fset = (PLATFORM,) if producer == PLATFORM else PRODUCER_FLAGS[producer]
+        if staged_policy and producer == POLICY:
+            require(platform_snapshot is not None and flags[POLICY_FLAG] is True)
         if snapshot is not None:
             require(clean and type(snapshot) is dict)
             if reason == 'PLATFORM_GAP':
@@ -808,6 +961,8 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *, sta
             else:
                 require(reason == 'COMMAND_OK' and rc == 0 and (producer == PLATFORM or _platform_status(platform_snapshot) == 'UNVERIFIED'))
             require(not (staged_openssl and producer == OPENSSL and _uncertain(snapshot)))
+            if staged_policy and producer == POLICY:
+                _validate_staged_policy(snapshot, flags, platform_snapshot)
             precheck(producer, snapshot, flags, platform_snapshot, run_id, target, observed_at)
             source = _source(producer, snapshot)
             doc, detail = _normalize(doc, host, producer, snapshot, source, observed_at, rules, flags, platform_snapshot)
@@ -822,9 +977,12 @@ def normalize_handoff(envelope, run_id, target, flags, started_at, rules, *, sta
         else:
             if staged_openssl and producer == OPENSSL:
                 require(platform_snapshot is not None and _platform_status(platform_snapshot) == 'UNVERIFIED')
+            if staged_policy and producer == POLICY:
+                require(reason in FATAL)
             require(reason in FAILURES and (clean or reason == 'REMOTE_CLEANUP_UNCONFIRMED')
                     and (reason not in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT', 'INTERRUPTED')
-                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL))
+                     or producer == PLATFORM or (staged_openssl and producer == OPENSSL)
+                     or (staged_policy and producer == POLICY))
                     and (reason != 'REMOTE_CLEANUP_UNCONFIRMED' or not clean)
                     and (reason != 'COMMAND_FAILED' or rc is not None and rc != 0))
             for f in fset:

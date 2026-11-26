@@ -1224,6 +1224,10 @@ def _platform_budget():
 
 def _openssl_budget():
     return 7 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
+
+
+def _policy_budget():
+    return 2 * (_GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1) + _GUARD_SECONDS
 _COLLECTORS = tuple(sorted(_scope.FLAGS))
 _PASSIVE = frozenset(_COLLECTORS) - {'pqc_collect_tls_services'}
 _VALID = frozenset(('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL'))
@@ -1631,6 +1635,8 @@ class _PlatformWorker:
         self.plan = ()
         self.platform_proof = None
         self.openssl_plan = b._openssl_plan(flags)
+        self.policy_requested = flags[b.POLICY_FLAG]
+        self.openssl_completed = False
 
     def limit(self, end):
         end = min(end, self.host_end, self.lease.limit(self.name))
@@ -1674,6 +1680,40 @@ class _PlatformWorker:
         self.ordinal = 0
         self.validation_left = _GUARD_SECONDS
 
+    def note_openssl(self, row):
+        from tools import scan_collectors as b
+        require(self.producer == b.OPENSSL and not self.openssl_completed
+                and row['producer_id'] == b.OPENSSL and row['cleanup_confirmed'] is True
+                and not b.record_stop(row) and not self.lease.pending(self.name)
+                and ((row['reason_code'] == 'COMMAND_OK' and row['snapshot'] is not None
+                      and self.ordinal == len(self.plan))
+                     or (row['reason_code'] in b._STAGE_RPM_FAILURES
+                         and row['snapshot'] is None and 0 < self.ordinal <= len(self.plan))),
+                3, 'INVALID_NATIVE_RESULT')
+        self.limit(self.producer_end)
+        self.openssl_completed = True
+
+    def start_policy(self, run_id, flags, platform_snapshot):
+        from tools import scan_collectors as b
+        require(self.producer in (b.PLATFORM, b.OPENSSL) and self.run_id == run_id
+                and self.platform_proof is not None and self.platform_proof is platform_snapshot
+                and self.policy_requested is True and flags[b.POLICY_FLAG] is True
+                and b._openssl_plan(flags) == self.openssl_plan
+                and not self.lease.pending(self.name), 3, 'INVALID_NATIVE_RESULT')
+        previous = self.producer
+        # One bounded producer interval, capped by the original host and
+        # shared wave lease. Empty plans have the same proof requirements.
+        self.producer_end = min(self.limit(self.host_end), time.monotonic() + _policy_budget())
+        self.producer = b.POLICY
+        self.ordinal = 0
+        self.validation_left = _GUARD_SECONDS
+        status = self.validate(b._platform_status, platform_snapshot)
+        if status == 'UNVERIFIED' and self.openssl_plan:
+            require(previous == b.OPENSSL and self.openssl_completed, 3, 'INVALID_NATIVE_RESULT')
+        else:
+            require(previous == b.PLATFORM and not self.openssl_completed, 3, 'INVALID_NATIVE_RESULT')
+        self.plan = self.validate(b._policy_plan, flags, platform_snapshot)
+
     def validate(self, fn, *args, **kwargs):
         # Cumulative per-producer 30s validation, not 30s for each stage.
         start = time.monotonic()
@@ -1690,7 +1730,9 @@ class _PlatformWorker:
         from tools import scan_collectors as b
         require(((self.producer == b.PLATFORM and type(binding) is b._StageBinding)
                  or (self.producer == b.OPENSSL and type(binding) is b._OpenSSLStageBinding
-                     and binding.producer_id == b.OPENSSL))
+                     and binding.producer_id == b.OPENSSL)
+                 or (self.producer == b.POLICY and type(binding) is b._PolicyStageBinding
+                     and binding.producer_id == b.POLICY))
                 and binding.run_id == self.run_id and binding.target_id == self.name
                 and binding.task_uuid == self.task_uuid and type(binding.ordinal) is int
                 and self.ordinal < len(self.plan)
@@ -1704,6 +1746,8 @@ class _PlatformWorker:
             start = time.monotonic()
             stage_end = self.limit(min(self.producer_end,
                                       start + _GUARD_SECONDS + _SSH_SECONDS + _COMMAND_SECONDS + 1))
+            if self.producer == b.POLICY and stage_end - start < _COMMAND_SECONDS + 1:
+                raise _Deadline()
             # Packaging and both guard checks share one G budget. No launch
             # inside prepare. Recheck the actual consumed binding immediately
             # after the separate synthetic connection witness.
@@ -1754,8 +1798,15 @@ class _PlatformWorker:
                 self.limit(command_end)
             self.limit(command_end)
             return receipt
-        except b._StageFailure:
-            if self.producer == b.OPENSSL and used and trusted_clean:
+        except b._StageFailure as exc:
+            if self.producer == b.POLICY:
+                # Only a matching completion, not a launcher exception,
+                # can prove clean termination of an active native stage.
+                if used and not trusted_clean:
+                    raise b._StageFailure('REMOTE_CLEANUP_UNCONFIRMED') from None
+                if not used and exc.clean:
+                    raise b._StageFailure('INVALID_ADAPTER_RESULT', clean=True) from None
+            if self.producer in (b.OPENSSL, b.POLICY) and used and trusted_clean:
                 try:
                     self.limit(command_end)
                 except _Deadline:
@@ -2591,7 +2642,7 @@ def _v2_base_row(row):
     result['collectors'] = [{**c, 'collection_ids': [],
         'reason_code': ('COMMAND_IO_FAILED' if c['reason_code'] == 'COLLECTION_ERROR' else
                         'INVALID_ADAPTER_RESULT' if c['state'] == 'ERROR'
-                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl')
+                        and c['collector_id'] in ('pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
                         and c['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')
                         else c['reason_code'])}
         for c in row['collectors']]
@@ -2614,7 +2665,7 @@ def _valid_v2_outcome(row, flag, requested, cap):
         reduced['reason_code'] = 'COMMAND_IO_FAILED'
     if (reduced.get('state') == 'ERROR'
             and reduced.get('reason_code') in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT')):
-        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl')
+        if (flag not in ('pqc-platform', 'pqc_collect_packages', 'pqc_collect_openssl', 'pqc_collect_crypto_policy')
                 or reduced.get('rc') is not None or ids):
             return False
         reduced['reason_code'] = 'INVALID_ADAPTER_RESULT'
@@ -2652,6 +2703,30 @@ def validate_producer_manifest(manifest, rc):
                     and row['platform']['collection_ids']
                     and len(ssl_fatal) == len(ssl_rows)
                     and len({c['reason_code'] for c in ssl_fatal}) == 1,
+                    3, 'INVALID_TERMINAL_MANIFEST')
+        # CP2-only fatal extension: no Policy references, with prior Platform
+        # evidence and no later producer dispatch. V1's outcome grammar stays closed.
+        policy_row = next(c for c in row['collectors'] if c['collector_id'] == bridge.POLICY_FLAG)
+        if policy_row['state'] == 'ERROR' and policy_row['reason_code'] in ('GUARD_REJECTED', 'CONTROLLER_TIMEOUT'):
+            # A selected O2 producer must have completed before Policy. Its
+            # snapshot projects every requested flag with references; a clean
+            # ordinary whole-producer failure instead projects the same error
+            # and rc without references. Neither shape proves cleanup itself.
+            ssl_complete = not ssl_rows or all(
+                c['collection_ids'] and (c['state'] in ('COLLECTED', 'NOT_APPLICABLE', 'PARTIAL',
+                                                        'UNKNOWN', 'PERMISSION_DENIED')
+                    or (c['state'], c['reason_code']) in (('ERROR', 'COLLECTION_ERROR'),
+                                                          ('NOT_SCANNED', 'ADAPTER_NOT_AVAILABLE')))
+                for c in ssl_rows)
+            ssl_ordinary_failure = bool(ssl_rows) and all(
+                c['state'] == 'ERROR' and c['reason_code'] in bridge._STAGE_RPM_FAILURES
+                and not c['collection_ids']
+                and (c['reason_code'], c['rc']) == (ssl_rows[0]['reason_code'], ssl_rows[0]['rc'])
+                for c in ssl_rows)
+            require(row['attempted'] and row['reason_code'] in _FATAL
+                    and row['platform']['collection_ids'] and (ssl_complete or ssl_ordinary_failure)
+                    and all(c['state'] == 'NOT_SCANNED' and not c['collection_ids']
+                            for c in row['collectors'] if c['collector_id'] in (bridge.SSHD, bridge.KEYS, bridge.CERT_FLAG)),
                     3, 'INVALID_TERMINAL_MANIFEST')
         ids = [i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']]
         require(len(ids) <= bridge.MAX_REFS and len(ids) == len(set(ids)) and not refs.intersection(ids)
@@ -2697,6 +2772,8 @@ class _ProducerLedger(_Ledger):
         try:
             envelope = self.session.handoff.read(n, receipt)
             context = {'staged_openssl': True} if self.session.openssl_staged else {}
+            if self.session.policy_staged and self.flags[n][self.session.bridge.POLICY_FLAG]:
+                context['staged_policy'] = True
             projection = self.session.bridge.normalize_handoff(envelope, self.session.run_id, n, self.flags[n],
                                                                 self.session.started_at, self.session.rules, **context)
         except Exception:
@@ -2759,6 +2836,7 @@ class _ProducerSession:
         self.handlers = {}
         self.staged = False
         self.openssl_staged = False
+        self.policy_staged = False
 
     def _identity(self, ctx):
         import uuid
@@ -2772,17 +2850,26 @@ class _ProducerSession:
                 and all((k == self.bridge.PLATFORM and callable(v.prepare))
                         if type(v) is self.bridge._PlatformStageAdapter else
                         (k == self.bridge.OPENSSL and callable(v.prepare))
-                        if type(v) is self.bridge._OpenSSLStageAdapter else callable(v)
+                        if type(v) is self.bridge._OpenSSLStageAdapter else
+                        (k == self.bridge.POLICY and callable(v.prepare))
+                        if type(v) is self.bridge._PolicyStageAdapter else callable(v)
                         for k, v in registry.items()),
                 3, 'INVALID_ADAPTER_REGISTRY')
         self.staged = type(registry.get(self.bridge.PLATFORM)) is self.bridge._PlatformStageAdapter
         self.openssl_staged = type(registry.get(self.bridge.OPENSSL)) is self.bridge._OpenSSLStageAdapter
-        require(not self.openssl_staged or self.staged, 3, 'INVALID_ADAPTER_REGISTRY')
+        self.policy_staged = type(registry.get(self.bridge.POLICY)) is self.bridge._PolicyStageAdapter
+        require(not (self.openssl_staged or self.policy_staged) or self.staged,
+                3, 'INVALID_ADAPTER_REGISTRY')
         try:
             eligible = {n: self.bridge.requested(ctx._decisions[n]['requested_flags']) for n in ctx._targets}
         except self.bridge.BridgeError:
             raise Denied(2, 'UNSUPPORTED_PRODUCER') from None
         require(all(set(v) <= registry.keys() for v in eligible.values()), 2, 'PRODUCER_ADAPTER_NOT_AVAILABLE')
+        # A staged CP2 host must not derive its ordered acquisition from a
+        # generic OpenSSL surrogate when that same host requests O2.
+        require(not self.policy_staged or self.openssl_staged or
+                all(not {self.bridge.POLICY, self.bridge.OPENSSL} <= set(v)
+                    for v in eligible.values()), 3, 'INVALID_ADAPTER_REGISTRY')
         ledger = _ProducerLedger(ctx, self, eligible)
         targets = [n for n in ctx._targets if eligible[n]]
         if targets:
@@ -2797,6 +2884,7 @@ class _ProducerSession:
     def budget(self, producers):
         return sum(_platform_budget() if self.staged and p == self.bridge.PLATFORM else
                    _openssl_budget() if self.openssl_staged and p == self.bridge.OPENSSL else
+                   _policy_budget() if self.policy_staged and p == self.bridge.POLICY else
                    _COMMAND_SECONDS + 1 for p in producers)
 
     def collect(self, name, flags, registry):
@@ -2820,14 +2908,16 @@ class _ProducerSession:
             for producer in b.requested(flags):
                 value = None
                 staged_producer = ((self.staged and producer == b.PLATFORM) or
-                                   (self.openssl_staged and producer == b.OPENSSL))
+                                   (self.openssl_staged and producer == b.OPENSSL) or
+                                   (self.policy_staged and producer == b.POLICY))
                 try:
                     if self.staged and producer == b.PLATFORM:
                         worker.start(self.run_id)
                         value = registry[producer].collect(self.run_id, name, worker.task_uuid,
                                                            worker.invoke, worker.validate)
                         row = worker.validate(b.record, producer, value, flags, platform_snapshot, self.run_id, name)
-                        if (self.openssl_staged and b.OPENSSL in b.requested(flags)
+                        if (((self.openssl_staged and b.OPENSSL in b.requested(flags))
+                             or (self.policy_staged and flags[b.POLICY_FLAG]))
                                 and row['snapshot'] is not None and not b.record_stop(row)):
                             worker.note_platform(row)
                     elif (self.openssl_staged and producer == b.OPENSSL
@@ -2839,6 +2929,19 @@ class _ProducerSession:
                                               self.run_id, name, staged_openssl=True)
                         require(row['snapshot'] is None or worker.ordinal == len(worker.plan),
                                 3, 'INVALID_NATIVE_RESULT')
+                        if self.policy_staged and flags[b.POLICY_FLAG] and not b.record_stop(row):
+                            worker.note_openssl(row)
+                    elif self.policy_staged and producer == b.POLICY:
+                        worker.start_policy(self.run_id, flags, platform_snapshot)
+                        value = registry[producer].collect(self.run_id, name, worker.task_uuid, flags,
+                                                           platform_snapshot, worker.invoke, worker.validate)
+                        row = worker.validate(b.record, producer, value, flags, platform_snapshot,
+                                              self.run_id, name,
+                                              gap=value['reason_code'] == 'PLATFORM_GAP', staged_policy=True)
+                        require(row['snapshot'] is None or
+                                (worker.ordinal == len(worker.plan) and not worker.lease.pending(name)),
+                                3, 'INVALID_NATIVE_RESULT')
+                        worker.limit(worker.producer_end)
                     else:
                         # Legacy single-call surrogate budget unchanged. A
                         # staged host's later producers also observe the lease.

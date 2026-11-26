@@ -324,3 +324,73 @@ undispatched. Loss of the host's handoff cannot authenticate earlier
 in-memory snapshots. The existing 7 basic scopes, at most 256 provider
 scopes, MAX_REFS, MAX_WIRE and MAX_HOSTS remain unchanged; L1/L2
 observations do not assert L3/L4/L5. Both registries remain empty.
+
+
+
+### I1b CP2 — restricted fixed Crypto Policy native bridge
+
+The private Policy adapter accepts only the actual same-worker P1 snapshot
+object after validated, independently clean completion. The fixed order is
+Platform, selected OpenSSL, Policy, SSH, Cert. Selected O2 on an eligible
+CP2 host must complete through its staged lifecycle (including legal clean
+ordinary failure); no generic Platform or mixed generic OpenSSL substitute
+can authorize acquisition. Neither public registry nor live transport is
+enabled. Existing offline Store/import callers do not load Ansible to
+normalize a legacy envelope.
+
+The worker and adapter independently derive the same fixed ordinal plan
+from frozen requested Policy flag, validated Platform facts and ordered
+tool observations. UNKNOWN or OUT_OF_SCOPE retains the existing nine
+typed platform gap scopes without native dispatch. An otherwise eligible
+OL9.x with no positively proven timeout capability has nine
+NOT_SCANNED/TIMEOUT_TOOL_UNAVAILABLE slots and no dispatch. For a positive
+eligible platform/timeout, reader is ordinal 0. Only the exact positive
+ordered tool slot (state OK, exists, regular, non-link, executable all
+proved) may choose show-bin ordinal 1, otherwise show-sbin ordinal 2.
+Bin has priority; never infer a path from aggregate availability. If no
+slot proves availability, profile-show remains
+NOT_SCANNED/SHOW_TOOL_UNAVAILABLE. At most two stages, no retry or fallback,
+even if CP1 later discovers that the selected file is absent or unsafe.
+CP1 independently validates its trusted file and fixed path contract.
+
+Each CP2 binding carries run, target, task UUID, fixed Policy producer,
+stage and canonical ordinal. An exact issued binding object, one-use
+native begin gate and independent started/cleanup witness are required.
+The combined stdout+stderr wrapper frame is at most 128 KiB for Policy
+bindings only. The lazy canonical CP1 validator at the actual collection
+module path checks exact stages and 66 KiB receipt / 64 KiB payload limits;
+P1/O2 keep 32 KiB frame / 16 KiB receipt limits. Wrapper keys, changed
+false, exact invocation stage, wrapper rc0, empty stderr and strict ASCII
+JSON (no duplicate keys, floats or non-finite constants) remain closed.
+The native worker's elapsed deadlines and independent cleanup proof are
+not inferred from a remote cleanup bit, process exit alone or an exception.
+
+Merge exactly the eight reader scopes and one show scope. Confirmed
+ordinary outer failures become narrow typed scope ERROR gaps with null
+inner rc, and may permit the remaining fixed stage only under the original
+lease. Actual show payload retains its inner rc. Reader TOTAL_LIMIT is
+an eight-scope all-gap; no truncated partial success. An empty plan is an
+internal complete gap projection, not successful command execution.
+Unconfirmed cleanup, uncertain inner cleanup, foreign/replayed completion,
+invalid stage/frame, guard/transport/deadline failure or interruption stops
+the current producer without a partial Policy snapshot; completed earlier
+observations are retained only if a valid host envelope is available.
+Later producers do not run. A worker's loss cannot prove earlier data or
+cleanup.
+
+The original nine-scope Policy snapshot, crypto_policy.normalize_snapshot
+and build_crypto_policy_evidence, original profile conflict/FIPS semantics,
+assessment and exact companion/collection bindings are reused. FIPS is
+not PQC readiness. Private staged_policy context is supplied only by the
+trusted session/ledger, never a serialized field, and defaults to false.
+No change to the default C1 or legacy callable normalization contract,
+handoff v1, manifest v2, Policy nine refs, 294 maximum refs, 1 MiB wire or
+ten-host limit. No change to CP1 module/helper or mirrors.
+
+Focused test_cp2_* cases cover actual short/FQCN packaging, P1 and O2
+ordering, reader/show gating, oversized-for-P1 but legal-for-CP2 reader,
+original builder and assessment, malformed/foreign receipts, failures and
+worker cleanup/earliest lease. They must be executed against fixed source
+and actual approved native runtime before engineering acceptance. Actual
+Controller, OL9.7/9.8/9.9, installed tools, remote lifetime, load and
+Before-After/offline release QA remain NOT_TESTED under #28.
