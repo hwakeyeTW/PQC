@@ -394,3 +394,83 @@ worker cleanup/earliest lease. They must be executed against fixed source
 and actual approved native runtime before engineering acceptance. Actual
 Controller, OL9.7/9.8/9.9, installed tools, remote lifetime, load and
 Before-After/offline release QA remain NOT_TESTED under #28.
+
+## I1b SSH S2 (approved #57 staged bridge)
+
+The private SSH stage adapter uses the existing S1 module and original #17
+SSH normalizer and mandatory `validate_details` companion. Only `config`
+(ordinal 0) and `keys` (ordinal 1) may launch, with exact issued run/target/
+task/producer/ordinal/stage binding, validated same-worker P1 and legal selected
+O2/CP2 completion. The lazy validator is the canonical S1 module at its
+fixed collection path with exact stage/cap constants and both native gates
+false. Wrapper shape remains changed=false, exact invocation stage, rc0,
+empty stderr and strict ASCII JSON without duplicates, floats or non-finite
+values. The independent started/cleanup witness is mandatory; remote cleanup
+or a launcher exception alone does not authorize a subsequent stage.
+
+The staged snapshot has exactly eight slots and one `global-default` context.
+Disabled and platform-gap precedence is the original #17 grammar; native
+key-flag-required takes precedence over host-local stop. The five client
+slots and native-0 are explicit UNKNOWN gaps when otherwise eligible, not
+-Q/-T/-G dispatch or a positive native observation. Acquired config/keys
+payloads are the canonical S1 slot grammar with null inner rc. A clean
+COMMAND_OUTPUT_LIMIT becomes ERROR/OUTPUT_LIMIT and can proceed to the
+next fixed stage. Confirmed COMMAND_TIMEOUT or inner TIMEOUT becomes
+ERROR/TIMEOUT; confirmed ordinary start/command/I/O/residual failure or
+inner EXECUTION_ERROR becomes ERROR/EXECUTION_ERROR. These stop otherwise
+eligible later slots as ACQUISITION_STOPPED and omit later Cert for that
+host, retaining earlier trusted slots and allowing other hosts to proceed.
+Unconfirmed cleanup, invalid stage/receipt/guard, foreign/replayed binding,
+controller deadline or interrupt stays fatal, with no incomplete SSH
+snapshot. Worker loss cannot authenticate any partial memory. Completed
+earlier producers survive only in a valid handoff.
+
+The private `staged_ssh` context defaults to false and is supplied by the
+trusted session/ledger, never by a serialized envelope. The parent
+revalidates the original whole snapshot and each eligible S1 file slot,
+forced gaps and halt ordering. Schema reconstruction is not a cleanup
+witness. Only this exact context permits a confirmed host-local execution
+error; the original legacy uncertain-stop behavior is not weakened. The
+normalizer reuses original SSH collection/evidence/asset identities and
+validates exact mandatory in-memory details. Original 2 MiB SSH detail,
+Evidence and assessment limits, max refs 294, SSHD cap 8/KEYS cap 1, handoff
+v1 and manifest v2 remain. The single fixed context projects seven SSHD
+scopes and one keys scope when both selected. No positive Q/T capability,
+effective configuration, service negotiation or PQC readiness is inferred.
+
+### Canonical capacity
+
+S1 slot 262144 bytes, child output 262145 including LF, compact receipt
+262243, combined SSH wrapper 524483. These are per-stage boundaries only.
+The original 32 KiB P1/O2 and 128 KiB CP2 frames are not widened. For four
+staged producers, the conservative payload allocation is 10*16384 +
+2*65536 + 2*262144 = 819200 bytes. Adding 16384 for the fixed canonical
+record/envelope structure gives 835584 bytes. The additional structure
+consists of fixed field/slot names, at most four staged records, bounded
+run/target/timestamp identifiers, flags and fixed disabled/gap rows. Actual
+`wire_bytes` tests use maximum-length run/target/time identities, 256
+providers, a full 262144-byte validator-legal config slot and 32 keys, with
+all flag and gap plans. They measure 286492 bytes for those four records,
+including 2005 bytes of non-payload structure, and 287879 with the original
+small Cert surrogate (293 refs). An expanded validator-legal existing Cert
+surrogate with 128 sources/256 blocks is 416443 bytes for the full envelope.
+These are measured fixture sizes, not a realizable maximum for every
+producer. Exact/+1 tests distinguish the fixed wire/FD boundary from the
+semantic rejection of deliberately oversized Cert fields; no new Cert
+budget is implied by the 212992 bytes remaining in the allocation.
+The actual FQCN config-file fixture produces a 145444-byte wrapper and a
+179422-byte full canonical envelope including the existing Cert surrogate;
+raw frames never enter the queue. The handoff serializer/reader and FD
+write reject over 1048576 bytes; original cumulative, node, depth, IPC and
+single-consume limits remain. No truncation with success.
+
+Focused `test_ssh_s2_*` cases exercise actual private short/FQCN
+AnsiballZ/native workers, fixed plans, prior ordering, strict frames and
+aggregate limits, original typed details and tamper rejection, ordinary
+limit and host-local stop, fatal/no-new-host dispatch, worker loss, signal
+and peer earliest lease with actual process-group cleanup. Existing S1
+module/mirror and original #17 normalizer remain unchanged. This is
+restricted in-memory synthetic/offline engineering, not Store persistence,
+CBOM standalone qualification, live SSH, Certificate native acquisition
+or C3. #8/#17 mandatory qualifications remain HOLD; #28 formal environment
+verification remains NOT_TESTED until the fixed release candidate.

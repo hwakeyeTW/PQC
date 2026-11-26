@@ -2407,3 +2407,692 @@ def test_cp2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
         row=next(c for c in m['hosts'][0]['collectors'] if c['collector_id']==bridge.POLICY_FLAG)
         assert row['reason_code']=='CONTROLLER_TIMEOUT' and not row['collection_ids']
     assert not trap.exists() and _signal_state()==before
+
+
+# SSH S2 uses the original S1 synthetic packaging fixture, never a legal
+# acquisition against the product's fixed root. Only the trusted fixture
+# launcher supplies lifecycle evidence for the exact issued binding.
+def _ssh_s2_fixture_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('_ssh_s2_acquisition_fixture',
+                                                 ROOT / 'tests/unit/test_ssh_acquire.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _SSH2Driver(_P2Driver):
+    def __init__(self, tmp, ctx, *, fqcn=False, large=False, modes=None, fault=None,
+                 stage_seconds=28):
+        super().__init__(tmp, ctx, modes=modes, stage_seconds=stage_seconds, fault=fault)
+        self.s1 = _ssh_s2_fixture_module()
+        self.fqcn, self.large = fqcn, large
+        self.parent_pid = os.getpid()
+        self.validator = bridge._bound_ssh_stage_validator()
+
+    def prepare(self, binding):
+        import selectors
+        import subprocess
+        assert type(binding) is bridge._SSHStageBinding and binding.producer_id == bridge.SSH
+        name, stage, ordinal = binding.target_id, binding.stage, binding.ordinal
+        assert binding.run_id and binding.task_uuid and name in self.ctx._targets
+        assert os.getpid() != self.parent_pid and stage == bridge._SSH_STAGES[ordinal]
+        stem = f'{name}-{ordinal}'
+        private = self.tmp / stem
+        private.mkdir(mode=0o700)
+        mode = self.modes.get((name, ordinal), 'ok')
+        s1 = self.s1
+        root = s1._root(private)
+        group = self.tmp / (stem + '-group.json')
+        if self.large and stage == 'config':
+            # Real file acquisition: three bounded drop-ins, <64 KiB source
+            # total, <512 projected rows, but >128 KiB actual wrapper.
+            directory = root / 'etc/ssh/sshd_config.d'
+            for file in directory.iterdir():
+                file.unlink()
+            s1.legacy.put(root / 'etc/ssh/sshd_config',
+                          'Include /etc/ssh/sshd_config.d/*.conf\nHostKey /etc/ssh/ssh_host_ed25519_key\n')
+            for i in range(3):
+                s1.legacy.put(directory / f'{i}.conf', ('Ciphers a' + 'x'*91 + '\n')*150)
+        def patch(source):
+            if mode in ('outer-timeout', 'consumer-loss'):
+                return s1._replace(source, 'def _acquire(stage):\n', 'def _acquire(stage):\n'
+                    '    import json\n'
+                    '    signal.signal(signal.SIGALRM, signal.SIG_IGN)\n'
+                    '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                    '    child = os.fork()\n'
+                    '    if child == 0:\n        time.sleep(60)\n        os._exit(0)\n'
+                    f'    with open({str(group)!r}, "x") as f:\n'
+                    '        json.dump(dict(pids=[os.getpid(), child], pgid=os.getpgrp()), f)\n'
+                    '    time.sleep(60)\n')
+            if mode == 'inner-timeout':
+                return s1._replace(source, 'def _acquire(stage):\n', 'def _acquire(stage):\n'
+                    '    import json\n'
+                    f'    with open({str(group)!r}, "x") as f:\n'
+                    '        json.dump(dict(pids=[os.getpid()], pgid=os.getpgrp()), f)\n'
+                    '    time.sleep(60)\n')
+            if mode == 'exec-error':
+                return s1._replace(source, 'def _acquire(stage):\n', 'def _acquire(stage):\n'
+                    '    raise RuntimeError("ANONYMOUS_CHILD_FAILURE")\n')
+            if mode == 'inner-exec-error':
+                return s1._replace(source, 'def _acquire(stage):\n', 'def _acquire(stage):\n'
+                    '    return result("ERROR", "EXECUTION_ERROR")\n')
+            if mode in ('slot-max', 'slot-over'):
+                row = s1._sized_slot(s1.acq.SLOT_BYTES + (mode == 'slot-over'))
+                return s1._replace(source, 'def _acquire(stage):\n',
+                                   'def _acquire(stage):\n    return ' + repr(row) + '\n')
+            if mode == 'outer-overflow':
+                return s1._replace(source, 'def _child(stage):\n', 'def _child(stage):\n'
+                    '    sys.stdout.buffer.write(b"x" * (CHILD_BYTES+1))\n    return\n')
+            return source
+        fixture = s1._fixture(private / 'candidate', root, fqcn=self.fqcn,
+                              inner=.5 if mode == 'inner-timeout' else 23,
+                              outer=self.stage_seconds, patch=patch)
+        wrapper, env = s1._package(private / 'native', stage, fixture)
+        if self.fault is not None:
+            self.fault('prepare', binding, None)
+
+        def launch(begin):
+            if mode == 'no-begin':
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            end = begin()
+            if mode == 'false-clean':
+                raise bridge._StageFailure('COMMAND_TIMEOUT', -9, True)
+            if mode == 'no-start':
+                return bridge._StageCompletion(binding, b'', b'', None, False, True)
+            proc = subprocess.Popen([self.python, '-I', '-B', str(wrapper)], cwd=wrapper.parent,
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            (self.tmp / (stem + '-launch.json')).write_text(json.dumps(dict(
+                stage=stage, ordinal=ordinal, task=binding.task_uuid, run=binding.run_id,
+                worker=os.getpid(), supervisor=proc.pid, began=time.monotonic(), end=end)))
+            buffers = [bytearray(), bytearray()]
+            try:
+                with selectors.DefaultSelector() as sel:
+                    for i, stream in enumerate((proc.stdout, proc.stderr)):
+                        sel.register(stream, selectors.EVENT_READ, i)
+                    while sel.get_map() or proc.poll() is None:
+                        if mode == 'consumer-loss' and group.exists():
+                            os._exit(17)
+                        left = end - time.monotonic()
+                        assert left > 0
+                        if not sel.get_map():
+                            time.sleep(min(.01, left)); continue
+                        for key, _ in sel.select(min(.02, left)):
+                            room = bridge._SSH_FRAME_BYTES - sum(map(len, buffers))
+                            data = os.read(key.fd, min(4096, room + 1))
+                            assert len(data) <= room
+                            if data:
+                                buffers[key.data].extend(data)
+                            else:
+                                sel.unregister(key.fileobj)
+                proc.wait(timeout=max(.01, end-time.monotonic()))
+            finally:
+                proc.stdout.close(); proc.stderr.close()
+                if proc.poll() is None:
+                    proc.wait(timeout=self.stage_seconds+1)
+            assert proc.returncode == 0 and not buffers[1]
+            assert not batch._scope.group_exists(proc.pid)
+            assert not Path('/proc', str(proc.pid)).exists()
+            if group.exists():
+                witness = json.loads(group.read_bytes())
+                assert witness['pgid'] != proc.pid and not batch._scope.group_exists(witness['pgid'])
+                assert all(not Path('/proc', str(pid)).exists() for pid in witness['pids'])
+            raw = bytes(buffers[0])
+            receipt = self.validator(json.loads(raw)['receipt'], stage)
+            assert receipt['cleanup_confirmed'] is True
+            (self.tmp / (stem + '-done.json')).write_text(json.dumps(dict(
+                reason=receipt['reason_code'], outer_rc=receipt['rc'], wrapper_rc=proc.returncode,
+                payload=receipt['payload'], cleanup=True, ended=time.monotonic(), frame_bytes=len(raw))))
+            completion = bridge._StageCompletion(binding, raw, bytes(buffers[1]), proc.returncode, True, True)
+            return self.fault('completion', binding, completion) if self.fault is not None else completion
+        return launch
+
+
+def _ssh_s2_register(monkeypatch, ctx, trace, *, all_prior=False, platform_kwargs=None, o2_kwargs=None, **kwargs):
+    if all_prior:
+        p2, o2, cp2 = _cp2_register(monkeypatch, ctx, trace, platform_kwargs=platform_kwargs,
+                                   o2_kwargs=o2_kwargs or {}, large=True)
+    else:
+        p2 = _p2_register(monkeypatch, ctx, trace, **(platform_kwargs or {}))
+        o2 = cp2 = None
+    directory = trace.parent / 'ssh-s2'
+    directory.mkdir(mode=0o700)
+    s2 = _SSH2Driver(directory, ctx, **kwargs)
+    registry = bridge._producer_adapters()
+    registry[bridge.SSH] = bridge._SSHStageAdapter(s2.prepare)
+    monkeypatch.setattr(bridge, '_producer_adapters', lambda: registry)
+    return p2, o2, cp2, s2
+
+
+def _ssh_s2_detail(bundle, name):
+    detail = bundle['companions'][name][bridge.SSH]
+    ssh.validate_details(bundle['document'], detail, RULES)
+    assert detail['context_refs'] == ['global-default'] and len(detail['records']) == 8
+    return {r['slot']: r for r in detail['records']}
+
+
+def test_ssh_s2_fixed_budgets_and_caps():
+    session = batch._ProducerSession(RULES)
+    assert session.budget(bridge.PRODUCERS) == 155
+    session.staged = session.openssl_staged = session.policy_staged = True
+    assert session.budget(bridge.PRODUCERS) == 1064
+    session.ssh_staged = True
+    assert batch._ssh_budget() == 182 and session.budget(bridge.PRODUCERS) == 1215
+    for ps, producer, host, invocation in ((bridge.PRODUCERS,1215,1267,13335),
+                                           (bridge.PRODUCERS[:-1],1184,1236,13025)):
+        assert session.budget(ps) == producer
+        assert batch._GUARD_SECONDS+batch._SSH_SECONDS+producer+batch._WORKER_GRACE+5 == host
+        assert 2*batch._GUARD_SECONDS+10*(2*batch._GUARD_SECONDS+host)+5 == invocation
+    assert (bridge._SSH_SLOT_BYTES, bridge._SSH_CHILD_BYTES, bridge._SSH_RECEIPT_BYTES,
+            bridge._SSH_FRAME_BYTES, bridge._SSH_STAGED_PAYLOAD_BUDGET, bridge._SSH_STAGED_WIRE_BUDGET,
+            bridge.MAX_WIRE, bridge.MAX_HOSTS, bridge.MAX_REFS, batch._QUEUE_BYTES) == (
+                262144,262145,262243,524483,819200,835584,1048576,10,294,3500)
+    assert not bridge._producer_adapters() and not batch._passive_adapters()
+    with pytest.raises(batch.Denied, match='LIVE_NOT_AVAILABLE'):
+        batch._restricted_connection(HOST)
+
+
+@pytest.mark.parametrize('families,expected', [((), []), ((bridge.SSHD,),[0]),
+    ((bridge.KEYS,),[1]), ((bridge.SSHD,bridge.KEYS),[0,1])], ids=['none','config','keys','both'])
+def test_ssh_s2_actual_flags(fixture, monkeypatch, families, expected):
+    make,_,trace,trap,_ = fixture
+    flags = selected_flags(*families)
+    ctx,names = make(count=1, flags=flags)
+    n = names[0]
+    p2,_,_,s2 = _ssh_s2_register(monkeypatch, ctx, trace)
+    rc,m,bundle = checked(ctx)
+    assert [x['ordinal'] for x in _p2_rows(s2,n)] == expected and not trap.exists()
+    if not expected:
+        assert not _p2_rows(p2,n) and not bundle['companions'] and rc == 6
+        return
+    detail = _ssh_s2_detail(bundle,n)
+    for slot in ssh.CLIENTS:
+        assert detail[slot]['reason'] == ('NATIVE_SAFETY_UNPROVEN' if flags[bridge.SSHD] else 'DISABLED_BY_USER')
+        assert not detail[slot]['observations'] and detail[slot]['rc'] is None
+    assert detail['native-0']['reason'] == ('DISABLED_BY_USER' if not flags[bridge.SSHD] else
+                                            'NATIVE_SAFETY_UNPROVEN' if flags[bridge.KEYS] else 'KEY_FLAG_REQUIRED')
+    assert not detail['native-0']['observations']
+    for s,f in zip(bridge._SSH_STAGES,(bridge.SSHD,bridge.KEYS)):
+        assert (detail[s]['state'] == 'NOT_SCANNED') is not flags[f]
+    assert len({x['worker'] for x in _p2_rows(p2,n)+_p2_rows(s2,n)}) == 1
+    assert len({x['task'] for x in _p2_rows(p2,n)+_p2_rows(s2,n)}) == 1
+
+
+@pytest.mark.parametrize('kind', ['unknown','out-of-scope'])
+def test_ssh_s2_actual_platform_gap(fixture, monkeypatch, kind):
+    make,_,trace,trap,_ = fixture
+    ctx,names = make(count=1,flags=ALL)
+    n=names[0]
+    # Use the existing typed P1 fact fixture, not a guessed host platform.
+    versions={n: {'distribution_version':'invalid','distribution_major_version':'invalid'} if kind=='unknown'
+                 else {'distribution':'Debian','os_family':'Debian'}}
+    p2,o2,cp2,s2 = _ssh_s2_register(monkeypatch, ctx, trace, all_prior=True,
+                                     platform_kwargs={'versions':versions})
+    rc,m,bundle=checked(ctx)
+    assert len(_p2_rows(p2,n))==1 and not any(_p2_rows(d,n) for d in (o2,cp2,s2))
+    detail=_ssh_s2_detail(bundle,n)
+    assert all(r['reason']==('PLATFORM_UNRESOLVED' if kind=='unknown' else 'PLATFORM_OUT_OF_SCOPE') for r in detail.values())
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('fqcn', [False,True], ids=['short','fqcn'])
+def test_ssh_s2_actual_order_and_companion(fixture, monkeypatch, fqcn):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=ALL)
+    n=names[0]
+    p2,o2,cp2,s2=_ssh_s2_register(monkeypatch,ctx,trace,all_prior=True,fqcn=fqcn,large=fqcn)
+    # Capture the complete canonical envelope, not native frames, at the real
+    # private write boundary. This remains anonymous fixture data only.
+    write=bridge.Handoff.write
+    def observe(self,target,value):
+        raw=bridge.wire_bytes(value)
+        (trace.parent/'ssh-s2-envelope.json').write_bytes(raw)
+        return write(self,target,value)
+    monkeypatch.setattr(bridge.Handoff,'write',observe)
+    rc,m,bundle=checked(ctx)
+    launches=[_p2_rows(d,n) for d in (p2,o2,cp2,s2)]
+    assert [[x['ordinal'] for x in xs] for xs in launches] == [[0,1,2],list(range(7)),[0,1],[0,1]]
+    assert len({x['worker'] for xs in launches for x in xs})==len({x['task'] for xs in launches for x in xs})==1
+    for prior,next_stage in zip((p2,o2,cp2),launches[1:]):
+        assert _p2_rows(prior,n,'done')[-1]['ended'] <= next_stage[0]['began']
+    assert (trace.parent/(n+'.'+bridge.CERT+'.json')).exists()
+    detail=_ssh_s2_detail(bundle,n)
+    assert detail['config']['state'] in ('COLLECTED','PARTIAL') and detail['keys']['state']=='COLLECTED'
+    assert any(x['config_evidence_ids'] for x in detail['keys']['observations'])
+    assert len({x['asset_id'] for x in detail['keys']['observations']})==1
+    assert all(not detail[s]['observations'] for s in (*ssh.CLIENTS,'native-0'))
+    ssh_evidence={eid for r in detail.values() for eid in r['evidence_ids']}
+    assert ssh_evidence
+    assert not any(x['level'] in ('L2','L3','L4','L5') and x['assessment_state']=='PASS'
+                   for x in bundle['assessed']['claims'] if ssh_evidence.intersection(x['evidence_ids']))
+    if fqcn:
+        assert 131072 < _p2_rows(s2,n,'done')[0]['frame_bytes'] <= bridge._SSH_FRAME_BYTES
+    raw=(trace.parent/'ssh-s2-envelope.json').read_bytes(); data=bridge.read_wire(raw)
+    assert data['records'][-1]['producer_id']==bridge.CERT
+    prior=data['records'][:-1]; four={**data,'records':prior}
+    p,o,c,h=[r['snapshot'] for r in prior]
+    payloads=[{k:v for k,v in p.items() if k!='rpms'},*p['rpms'].values(),*o['slots'].values(),
+              {k:v for k,v in c.items() if k!='profile-show'},c['profile-show'],
+              h['slots']['config'],h['slots']['keys']]
+    sizes=[len(bridge.wire_bytes(x)) for x in payloads]
+    assert len(sizes)==14 and all(x<=16384 for x in sizes[:10])
+    assert all(x<=65536 for x in sizes[10:12]) and all(x<=262144 for x in sizes[12:])
+    overhead=len(bridge.wire_bytes(four))-sum(sizes)
+    assert 0<=overhead<=bridge._SSH_STRUCTURE_RESERVE and len(bridge.wire_bytes(four))<=835584
+    assert len(raw)<=1048576 and bundle['handoff_metrics'][n]['typed_bytes']==len(raw)
+    assert bundle['handoff_metrics'][n]['ipc_bytes']<=3500
+    print('SSH_S2_ACTUAL_WIRE',json.dumps(dict(four=len(bridge.wire_bytes(four)),with_cert=len(raw),
+        payloads=sizes,overhead=overhead,frame=_p2_rows(s2,n,'done')[0]['frame_bytes'])))
+    tampered=copy.deepcopy(bundle['companions'][n][bridge.SSH]); tampered['records'][-1]['context_ref']='ctx-'+'a'*64
+    with pytest.raises(evidence.EvidenceError): ssh.validate_details(bundle['document'],tampered,RULES)
+    assert not trap.exists()
+
+
+@pytest.mark.parametrize('prior',['platform','openssl','policy'])
+def test_ssh_s2_mixed_prior_denied(fixture,monkeypatch,prior):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=ALL)
+    register(monkeypatch,trace,p=0)
+    generic=bridge._producer_adapters()
+    p2,o2,cp2,s2=_ssh_s2_register(monkeypatch,ctx,trace,all_prior=True)
+    registry=bridge._producer_adapters()
+    key={'platform':bridge.PLATFORM,'openssl':bridge.OPENSSL,'policy':bridge.POLICY}[prior]
+    registry[key]=generic[key]
+    monkeypatch.setattr(bridge,'_producer_adapters',lambda:registry)
+    calls=[]
+    monkeypatch.setattr(batch,'_restricted_connection',lambda n: calls.append(n) or 'CONNECTED')
+    with pytest.raises(batch.Denied,match='INVALID_ADAPTER_REGISTRY'):
+        batch.execute_producer_batch(ctx,RULES)
+    assert not calls and not trap.exists() and not any(_p2_rows(d,names[0]) for d in (p2,o2,cp2,s2))
+
+
+@pytest.mark.parametrize('mode,reason,halt', [
+    ('outer-timeout','TIMEOUT',True), ('inner-timeout','TIMEOUT',True),
+    ('exec-error','EXECUTION_ERROR',True),('inner-exec-error','EXECUTION_ERROR',True),
+    ('no-start','EXECUTION_ERROR',True),('outer-overflow','OUTPUT_LIMIT',False),
+    ('slot-over','OUTPUT_LIMIT',False)])
+def test_ssh_s2_actual_failure_layers(fixture,monkeypatch,mode,reason,halt):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG))
+    n,other=names
+    p2,_,_,s2=_ssh_s2_register(monkeypatch,ctx,trace,modes={(n,0):mode},
+                               stage_seconds=4 if mode=='outer-timeout' else 28)
+    rc,m,bundle=checked(ctx)
+    assert rc in (0,5) and m['reason_code'] not in batch._FATAL
+    d=_ssh_s2_detail(bundle,n)
+    assert (d['config']['state'],d['config']['reason'],d['config']['rc'])==('ERROR',reason,None)
+    assert not d['config']['observations'] and not d['config']['gaps']
+    assert d['keys']['reason']==('ACQUISITION_STOPPED' if halt else 'OK')
+    assert d['native-0']['reason']==('ACQUISITION_STOPPED' if halt else 'NATIVE_SAFETY_UNPROVEN')
+    assert (trace.parent/(n+'.'+bridge.CERT+'.json')).exists() is not halt
+    assert (bridge.CERT in bundle['companions'][n]) is not halt
+    assert [x['ordinal'] for x in _p2_rows(s2,n)]==([] if mode=='no-start' else [0] if halt else [0,1])
+    if halt:
+        c=next(x for x in m['hosts'][0]['collectors'] if x['collector_id']==bridge.CERT_FLAG)
+        assert c['reason_code']=='STOPPED' and not c['collection_ids']
+    assert [x['ordinal'] for x in _p2_rows(s2,other)]==[0,1]
+    assert (trace.parent/(other+'.'+bridge.CERT+'.json')).exists() and not trap.exists()
+
+
+def test_ssh_s2_keys_timeout_retains_config(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG))
+    n,other=names
+    _,_,_,s2=_ssh_s2_register(monkeypatch,ctx,trace,modes={(n,1):'inner-timeout'})
+    rc,m,bundle=checked(ctx)
+    d=_ssh_s2_detail(bundle,n)
+    assert rc==5 and d['config']['observations'] and d['keys']['reason']=='TIMEOUT'
+    assert d['native-0']['reason']=='ACQUISITION_STOPPED' and bridge.CERT not in bundle['companions'][n]
+    assert bridge.CERT in bundle['companions'][other] and not trap.exists()
+
+
+@pytest.mark.parametrize('fault,reason', [('guard','GUARD_REJECTED'),('foreign','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('replay','REMOTE_CLEANUP_UNCONFIRMED'),('cleanup','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('inner-cleanup','REMOTE_CLEANUP_UNCONFIRMED'),('false-clean','REMOTE_CLEANUP_UNCONFIRMED'),('no-begin','REMOTE_CLEANUP_UNCONFIRMED'),
+    ('duplicate','INVALID_ADAPTER_RESULT')])
+def test_ssh_s2_fatal_stops_dispatch(fixture,monkeypatch,fault,reason):
+    make,_,trace,trap,cfg=fixture
+    ctx,names=make(count=2,forks=1,flags=ALL)
+    n,other=names
+    old=[]
+    def mutate(when,binding,completion):
+        if when=='prepare' and fault=='guard':
+            with cfg.open('a') as f: f.write('\n# anonymous guard drift\n')
+        if when!='completion': return completion
+        if fault=='foreign': return completion._replace(binding=binding._replace(task_uuid='foreign'))
+        if fault=='cleanup': return completion._replace(clean=False)
+        if fault=='inner-cleanup':
+            frame=json.loads(completion.stdout)
+            frame['receipt'].update(reason_code='REMOTE_CLEANUP_UNCONFIRMED',rc=-9,
+                                    cleanup_confirmed=False,payload=None)
+            return completion._replace(stdout=json.dumps(frame).encode('ascii'))
+        if fault=='duplicate': return completion._replace(stdout=b'{"changed":false,"changed":false}')
+        if fault=='replay':
+            if old: return old[0]
+            old.append(completion)
+        return completion
+    p2,o2,cp2,s2=_ssh_s2_register(monkeypatch,ctx,trace,all_prior=True,fault=mutate,
+        modes={(n,0):fault} if fault in ('false-clean','no-begin') else {})
+    rc,m,bundle=checked(ctx)
+    assert rc==6 and m['reason_code']==reason and m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    assert set(bundle['companions'][n])=={bridge.PLATFORM,bridge.OPENSSL,bridge.POLICY}
+    rows={x['collector_id']:x for x in m['hosts'][0]['collectors']}
+    assert all(rows[f]['reason_code']==reason and not rows[f]['collection_ids'] for f in (bridge.SSHD,bridge.KEYS))
+    assert rows[bridge.CERT_FLAG]['state']=='NOT_SCANNED' and not rows[bridge.CERT_FLAG]['collection_ids']
+    assert not any(_p2_rows(d,other) for d in (p2,o2,cp2,s2))
+    assert not (trace.parent/(n+'.'+bridge.CERT+'.json')).exists() and not trap.exists()
+    if fault=='guard':
+        # New terminal grammar rejects incomplete selected prior producers
+        # even though they can be legal outcomes elsewhere in V2.
+        for family in (bridge.PACKAGES,bridge.POLICY_FLAG):
+            forged=copy.deepcopy(m)
+            c=next(c for c in forged['hosts'][0]['collectors'] if c['collector_id']==family)
+            c.update(state='NOT_SCANNED',reason_code='STOPPED',rc=None,collection_ids=[])
+            with pytest.raises(batch.Denied): batch.validate_producer_manifest(forged,rc)
+
+
+@pytest.mark.parametrize('mode',['consumer-loss','signal'])
+def test_ssh_s2_actual_consumer_loss(fixture,monkeypatch,mode):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=2,forks=1,flags=selected_flags(bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG))
+    n=names[0]
+    _,_,_,s2=_ssh_s2_register(monkeypatch,ctx,trace,
+        modes={(n,0):'consumer-loss' if mode=='consumer-loss' else 'outer-timeout'},stage_seconds=4)
+    sent=[]; before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    if mode=='signal':
+        poll=batch._ProducerWorkerWave.poll
+        def interrupt(self):
+            if not sent and (s2.tmp/f'{n}-0-group.json').exists():
+                sent.append(time.monotonic()); os.kill(os.getpid(),signal.SIGINT)
+            return poll(self)
+        monkeypatch.setattr(batch._ProducerWorkerWave,'poll',interrupt)
+    with _p2_owned_supervisors(s2) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert rc==(7 if mode=='signal' else 6) and m['reason_code']==('INTERRUPTED' if mode=='signal' else 'REMOTE_CLEANUP_UNCONFIRMED')
+    assert (mode!='signal' or sent) and [name for name,_ in launches]==names[:1]
+    assert _signal_state()==before and m['hosts'][1]['host_state']=='NOT_ATTEMPTED'
+    stages=_p2_rows(s2,n)
+    assert len(stages)==1 and stages[0]['supervisor'] in reaped
+    assert not bundle['document']['collections'] and not trap.exists()
+
+
+def _ssh_s2_typed_snapshot(flags, *, config=None, keys=None, status='UNVERIFIED'):
+    if status!='UNVERIFIED':
+        return bridge._gap_snapshot(bridge.SSH,flags,status)
+    acquired={'config': config if config is not None else bridge._ssh_slot('UNKNOWN','SOURCE_MISSING'),
+              'keys': keys if keys is not None else bridge._ssh_slot('COLLECTED','OK')}
+    slots={}; halted=False
+    for stage in (*ssh.BASE_SLOTS,'native-0'):
+        gap=bridge._ssh_fixed_gap(flags,stage,halted)
+        slots[stage]=gap if gap is not None else acquired[stage]
+        if gap is None:
+            halted=acquired[stage]['reason'] in ('TIMEOUT','EXECUTION_ERROR')
+    return dict(flags={f:flags[f] for f in (bridge.SSHD,bridge.KEYS)},platform_status=status,
+                context_refs=['global-default'],slots=slots)
+
+
+def test_ssh_s2_frame_receipt_slot_boundary(fixture):
+    make,_,_,_,_=fixture
+    make(count=1)
+    s1=_ssh_s2_fixture_module()
+    slot=s1._sized_slot(262144)
+    binding=bridge._SSHStageBinding(RUN,HOST,'task',bridge.SSH,'config',0)
+    receipt=dict(format=1,stage='config',reason_code='COMMAND_OK',rc=0,cleanup_confirmed=True,payload=slot)
+    # Both stages have fixed receipt shapes; keys has a shorter legal envelope
+    # and a much smaller realizable payload. Config is the exact cap witness.
+    assert len(s1.acq.canonical(slot))==262144 and len(s1.acq.canonical(receipt))==262243
+    raw=json.dumps(dict(changed=False,invocation={'module_args':{'stage':'config'}},receipt=receipt)).encode('ascii')
+    assert 131072<len(raw)<=524483
+    completion=bridge._StageCompletion(binding,raw,b'',0,True,True)
+    assert bridge._stage_receipt(completion,binding)==receipt
+    exact=raw+b' '*(bridge._SSH_FRAME_BYTES-len(raw))
+    assert bridge._stage_receipt(completion._replace(stdout=exact),binding)==receipt
+    oversized=copy.deepcopy(receipt); oversized['payload']=s1._sized_slot(262145)
+    def frame(r): return json.dumps(dict(changed=False,invocation={'module_args':{'stage':'config'}},receipt=r)).encode('ascii')
+    for bad in (completion._replace(stdout=exact+b' '),completion._replace(stdout=exact,stderr=b'x'),
+                completion._replace(stdout=frame(oversized)),completion._replace(stdout=frame({**receipt,'stage':'keys'})),
+                completion._replace(stdout=frame({**receipt,'extra':None})),completion._replace(stdout=b'{"changed":false,"changed":false}'),
+                completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": 0.0',1)),
+                completion._replace(stdout=raw.replace(b'"rc": 0',b'"rc": NaN',1)),
+                completion._replace(wrapper_rc=True),completion._replace(started=False),completion._replace(clean=False),
+                completion._replace(binding=binding._replace()),completion._replace(binding=binding._replace(run_id='other')),
+                completion._replace(binding=binding._replace(target_id='other.invalid')),
+                completion._replace(binding=binding._replace(task_uuid='other')),
+                completion._replace(binding=binding._replace(producer_id=bridge.POLICY)),
+                completion._replace(binding=binding._replace(ordinal=1))):
+        with pytest.raises(bridge._StageFailure): bridge._stage_receipt(bad,binding)
+    # No widening of the older fixed binding types.
+    for other in (bridge._StageBinding(RUN,HOST,'task','metadata',0),
+                  bridge._PolicyStageBinding(RUN,HOST,'task',bridge.POLICY,'reader',0),
+                  bridge._OpenSSLStageBinding(RUN,HOST,'task',bridge.OPENSSL,bridge._OPENSSL_STAGES[0],0)):
+        with pytest.raises(bridge._StageFailure):
+            bridge._stage_receipt(completion._replace(binding=other),other)
+    print('SSH_S2_EXACT_CAPS',json.dumps(dict(slot=len(s1.acq.canonical(slot)),receipt=len(s1.acq.canonical(receipt)),
+          frame=len(raw),padded_frame=len(exact))))
+
+
+def test_ssh_s2_actual_max_slot(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=1,flags=selected_flags(bridge.SSHD,bridge.KEYS))
+    n=names[0]
+    _,_,_,s2=_ssh_s2_register(monkeypatch,ctx,trace,modes={(n,0):'slot-max'},fqcn=True)
+    rc,m,bundle=checked(ctx)
+    done=_p2_rows(s2,n,'done')
+    assert len(done)==2 and len(bridge.wire_bytes(done[0]['payload']))==262144
+    assert 131072<done[0]['frame_bytes']<=524483
+    detail=_ssh_s2_detail(bundle,n)
+    assert detail['config']['state']=='COLLECTED' and detail['keys']['state']=='COLLECTED'
+    assert len(ssh.canonical(bundle['companions'][n][bridge.SSH]))<2097152 and not trap.exists()
+
+
+def test_ssh_s2_canonical_aggregate_and_handoff_bounds(fixture,tmp_path):
+    make,_,_,_,_=fixture
+    make(count=1)
+    s1=_ssh_s2_fixture_module()
+    # Full validator-legal typed envelope with maximum permitted identities,
+    # full 256 KiB config, maximum key count, and real existing Cert shape.
+    # The 32 key rows cannot realize a 256 KiB slot; do not invent rows.
+    flags=ALL
+    run_id='r'*64; host='h'*247+'.invalid'; at='2026-01-01T00:00:00.000000Z'
+    assert len(host)==255
+    value=envelope(p=256,flags=flags,target=host)
+    value['run_id']=run_id
+    for r in value['records']: r['observed_at']=at
+    # 256 providers within an individual 16 KiB compact payload cap.
+    keys=dict(state='PARTIAL',reason='KEY_GAP',rc=None,gaps=['KEY_TYPE_UNKNOWN'],rows=[dict(
+        source_ref='key-'+f'{i:064x}',key_type='ssh-'+('x'*124),bits=None,
+        fingerprint_sha256=f'{i:064x}',grammar='UNKNOWN_TYPE') for i in range(32)])
+    value['records'][3]['snapshot']=_ssh_s2_typed_snapshot(flags,config=s1._sized_slot(262144),keys=keys)
+    four={**value,'records':value['records'][:-1]}
+    p,o,c,h=[r['snapshot'] for r in four['records']]
+    payloads=[{k:v for k,v in p.items() if k!='rpms'},*p['rpms'].values(),*o['slots'].values(),
+              {k:v for k,v in c.items() if k!='profile-show'},{'profile-show':c['profile-show']},
+              h['slots']['config'],h['slots']['keys']]
+    sizes=[len(bridge.wire_bytes(x)) for x in payloads]
+    assert all(x<=16384 for x in sizes[:10]) and all(x<=65536 for x in sizes[10:12])
+    assert all(x<=262144 for x in sizes[12:])
+    total=len(bridge.wire_bytes(four)); overhead=total-sum(sizes)
+    assert 0<=overhead<=16384 and total<=835584 and sum([16384]*10+[65536]*2+[262144]*2)==819200
+    # The overhead depends only on the closed envelope keys, counts and
+    # bounded scalar identities, not token content inside compact payloads.
+    # Check all SSH flag plans and forced/halt/gap slots using the actual
+    # serializer (gap slots included in the measured overhead, not payload).
+    for ssh_flags in ((False,False),(True,False),(False,True),(True,True)):
+        f={**flags,bridge.SSHD:ssh_flags[0],bridge.KEYS:ssh_flags[1]}
+        for status in ('UNVERIFIED','UNKNOWN','OUT_OF_SCOPE'):
+            for halt in (False,True):
+                s=_ssh_s2_typed_snapshot(f,config=bridge._ssh_slot('ERROR','TIMEOUT') if halt else None,
+                                         status=status)
+                ssh.validate_snapshot(s)
+                assert len(bridge.wire_bytes(s))<16384
+    # Valid typed full envelope and actual mandatory companion projection.
+    raw=bridge.wire_bytes(value)
+    assert len(raw)<bridge.MAX_WIRE and bridge.read_wire(raw)==value
+    projection=bridge.normalize_handoff(value,run_id,host,flags,TIME,RULES,
+                                       staged_openssl=True,staged_policy=True,staged_ssh=True)
+    ssh.validate_details(projection.document,projection.companions[bridge.SSH],RULES)
+    print('SSH_S2_AGGREGATE',json.dumps(dict(four=total,payloads=sizes,structure=overhead,
+          theoretical_payload=819200,allocated=835584,complete_with_cert=len(raw),refs=len(projection.document['collections']))))
+    # Existing Cert surrogate with 128 unique sources and 256 legal blocks.
+    # This is not authorization for a new native Certificate stage.
+    expanded=copy.deepcopy(value)
+    root=expanded['records'][-1]['snapshot']['roots'][cert.ROOTS[0]]
+    example=root['sources'][0]['blocks'][0]
+    root['entries']=128
+    root['sources']=[]
+    for i in range(128):
+        blocks=[copy.deepcopy(example) for _ in range(2)]
+        for j,block in enumerate(blocks):
+            block['certificate']['fingerprint']=f'{2*i+j:064x}'
+            block['certificate']['subject']='CN=fixture-'+str(2*i+j)
+        root['sources'].append(dict(source_id='src-'+f'{i:064x}',target_id='src-'+f'{i+128:064x}',
+                                    format='PEM',gaps=[],blocks=blocks))
+    cert.validate_snapshot(expanded['records'][-1]['snapshot']['roots'])
+    expanded_raw=bridge.wire_bytes(expanded)
+    assert len(expanded_raw)<=bridge.MAX_WIRE and bridge.read_wire(expanded_raw)==expanded
+    expanded_projection=bridge.normalize_handoff(expanded,run_id,host,flags,TIME,RULES,
+                                 staged_openssl=True,staged_policy=True,staged_ssh=True)
+    ssh.validate_details(expanded_projection.document,expanded_projection.companions[bridge.SSH],RULES)
+    print('SSH_S2_EXISTING_CERT_WIRE',json.dumps(dict(sources=128,blocks=256,complete=len(expanded_raw))))
+    # At the wire-only boundary, use the same complete envelope structure and
+    # a deliberately oversized anonymous Cert DN, not a claimed valid Cert
+    # snapshot. The product typed validator rejects it; this isolates the
+    # original 1 MiB serializer/FD boundary without inventing a Cert budget.
+    boundary=copy.deepcopy(value)
+    field=boundary['records'][-1]['snapshot']['roots'][cert.ROOTS[0]]['sources'][0]['blocks'][0]['certificate']
+    field['issuer']+='x'*(bridge.MAX_WIRE-len(raw))
+    exact=bridge.wire_bytes(boundary); assert len(exact)==1048576
+    with pytest.raises((bridge.BridgeError,evidence.EvidenceError)):
+        bridge.normalize_handoff(boundary,run_id,host,flags,TIME,RULES,
+                                  staged_openssl=True,staged_policy=True,staged_ssh=True)
+    hnd=bridge.Handoff(run_id,[host])
+    try:
+        field['issuer']+='x'
+        with pytest.raises(bridge.BridgeError,match='HANDOFF_SIZE_LIMIT'): hnd.write(host,boundary)
+        assert os.fstat(hnd.slots[host][1]).st_size==0
+        field['issuer']=field['issuer'][:-1]
+        receipt=hnd.write(host,boundary)
+        assert receipt['byte_count']==1048576 and hnd.read(host,receipt)==boundary
+        with pytest.raises(bridge.BridgeError): hnd.read(host,receipt)
+    finally: assert hnd.close()
+
+
+def test_ssh_s2_private_context_and_tamper(fixture):
+    make,_,_,_,_=fixture
+    make(count=1)
+    flags=selected_flags(bridge.SSHD,bridge.KEYS,bridge.CERT_FLAG)
+    value=envelope(flags=flags)
+    # Keep the original config result after a confirmed keys execution error.
+    value['records'][1]['snapshot']=_ssh_s2_typed_snapshot(flags,keys=bridge._ssh_slot('ERROR','EXECUTION_ERROR'))
+    value['records'].pop()
+    staged=bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,staged_ssh=True)
+    assert staged.special is None and staged.outcomes[bridge.CERT_FLAG]['reason_code']=='STOPPED'
+    assert bridge.SSH in staged.companions
+    legacy=bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES)
+    assert legacy.special=='REMOTE_CLEANUP_UNCONFIRMED'
+    with pytest.raises(bridge.BridgeError): bridge.normalize_handoff({**value,'staged_ssh':True},RUN,HOST,flags,TIME,RULES)
+    after=copy.deepcopy(value); after['records'].append(envelope(flags=flags)['records'][-1])
+    with pytest.raises(bridge.BridgeError,match='PRODUCER_ORDER_MISMATCH'):
+        bridge.normalize_handoff(after,RUN,HOST,flags,TIME,RULES,staged_ssh=True)
+    for fault in ('native-positive','second-context','wrong-flag','wrong-stop','wrong-platform','invalid-file-gap'):
+        forged=copy.deepcopy(value); s=forged['records'][1]['snapshot']
+        if fault=='native-positive': s['slots']['client-kex'].update(state='COLLECTED',reason='OK',rc=0,rows=['mlkem768x25519-sha256'])
+        elif fault=='second-context': s['context_refs'].append('ctx-'+'a'*64); s['slots']['native-1']=copy.deepcopy(s['slots']['native-0'])
+        elif fault=='wrong-flag': s['flags'][bridge.KEYS]=False
+        elif fault=='wrong-stop': s['slots']['native-0']=bridge._ssh_slot('UNKNOWN','NATIVE_SAFETY_UNPROVEN')
+        elif fault=='wrong-platform': s['platform_status']='OUT_OF_SCOPE'
+        else: s['slots']['config']=bridge._ssh_slot('UNKNOWN','TOOL_UNAVAILABLE')
+        with pytest.raises((bridge.BridgeError,ValueError)):
+            bridge.normalize_handoff(forged,RUN,HOST,flags,TIME,RULES,staged_ssh=True)
+    flags=ALL
+    full=envelope(flags=flags)
+    full['records'][3]['snapshot']=_ssh_s2_typed_snapshot(flags)
+    for ctx in ({},{'staged_openssl':True},{'staged_policy':True}):
+        with pytest.raises(bridge.BridgeError):
+            bridge.normalize_handoff(full,RUN,HOST,flags,TIME,RULES,staged_ssh=True,**ctx)
+
+
+@pytest.mark.parametrize('in_flight',[False,True],ids=['no-new-stage','active-stage'])
+def test_ssh_s2_dual_worker_earliest_lease(fixture,monkeypatch,in_flight):
+    make,_,trace,trap,_=fixture
+    ctx,names=make(count=3,forks=2,flags=selected_flags(bridge.SSHD,bridge.KEYS))
+    a,b,_=names; ready=trace.parent/'ssh-s2-a-ready'; verified=trace.parent/'ssh-s2-b-verified'
+    marks={}
+    def synchronize(when,binding,completion):
+        if not in_flight and when=='prepare' and binding.target_id==a and binding.ordinal==0:
+            ready.write_text('ready'); _p2_wait(verified)
+            worker=batch._PLATFORM_WORKER.get(); end=worker.lease.limit(a)
+            (trace.parent/'ssh-s2-child-lease.json').write_text(json.dumps(dict(end=end,now=time.monotonic())))
+        return completion
+    p2,_,_,s2=_ssh_s2_register(monkeypatch,ctx,trace,
+        platform_kwargs={'versions':{b:{'distribution':'Debian','os_family':'Debian'}}},
+        modes={(a,0):'outer-timeout'} if in_flight else {},stage_seconds=6 if in_flight else 28,fault=synchronize)
+    make_queue=batch._make_queue
+    def queue(validator=None):
+        q=make_queue(validator); send=q.send_task_result
+        def hold(result):
+            if result.as_wire_task_result().host_name==b:
+                _p2_wait(s2.tmp/f'{a}-0-group.json' if in_flight else ready)
+                send(result);time.sleep(15)
+            else: send(result)
+        q.send_task_result=hold;return q
+    monkeypatch.setattr(batch,'_make_queue',queue)
+    accepted=batch._ProducerWorkerWave._receipt_accepted
+    def observe(self):
+        result=accepted(self)
+        if b in self.ledger.projections and not verified.exists():
+            assert b not in self.confirmed and self.workers[b].is_alive()
+            end=self.limit(); assert end==min(self.ends[b],self.grace[b])<self.ends[a]
+            assert self.lease.limit(a)==end
+            marks.update(earliest=end,verified=time.monotonic());verified.write_text('verified')
+        return result
+    monkeypatch.setattr(batch._ProducerWorkerWave,'_receipt_accepted',observe)
+    before=_signal_state(); launches=_observe_native_queue(monkeypatch)
+    with _p2_owned_supervisors(s2) as reaped:
+        rc,m,bundle=checked(ctx)
+    assert marks['verified']<marks['earliest'] and [n for n,_ in launches]==names[:2]
+    assert [r['host_state'] for r in m['hosts']]==['ERROR','ERROR','NOT_ATTEMPTED']
+    assert rc==6 and b in bundle['companions'] and not _p2_rows(s2,b)
+    assert not any(_p2_rows(s2,n) or _p2_rows(p2,n) for n in names[2:])
+    if in_flight:
+        assert len(_p2_rows(s2,a))==1 and not _p2_rows(s2,a,'done')
+        assert _p2_rows(s2,a)[0]['supervisor'] in reaped
+        assert m['reason_code']=='REMOTE_CLEANUP_UNCONFIRMED' and a not in bundle['companions']
+    else:
+        child=json.loads((trace.parent/'ssh-s2-child-lease.json').read_bytes())
+        assert child['end']==marks['earliest'] and 0<child['end']-child['now']<=batch._WORKER_GRACE
+        assert not _p2_rows(s2,a) and m['reason_code']=='CONTROLLER_TIMEOUT'
+        assert set(bundle['companions'][a])=={bridge.PLATFORM}
+        assert all(c['reason_code']=='CONTROLLER_TIMEOUT' and not c['collection_ids']
+                   for c in m['hosts'][0]['collectors'] if c['collector_id'] in (bridge.SSHD,bridge.KEYS))
+    assert not trap.exists() and _signal_state()==before
+
+
+
+def test_ssh_s2_actual_prior_ordinary_and_empty_policy(fixture,monkeypatch):
+    make,_,trace,trap,_=fixture
+    flags=selected_flags(bridge.PACKAGES,bridge.POLICY_FLAG,bridge.SSHD,bridge.KEYS)
+    ctx,names=make(count=1,flags=flags)
+    n=names[0]
+    p2,o2,cp2,s2=_ssh_s2_register(monkeypatch,ctx,trace,all_prior=True,
+        platform_kwargs={'tool_rows':{n:{'timeout':[_cp2_tool('absent')]}}},
+        o2_kwargs={'modes':{(n,0):'inner-failure'}})
+    rc,m,bundle=checked(ctx)
+    assert [x['ordinal'] for x in _p2_rows(o2,n)]==[0,1]
+    assert _p2_rows(o2,n,'done')[0]['payload']['state']=='ERROR'
+    assert all(x['cleanup'] for x in _p2_rows(o2,n,'done'))
+    assert not _p2_rows(cp2,n) and [x['ordinal'] for x in _p2_rows(s2,n)]==[0,1]
+    assert all(x['reason']=='TIMEOUT_TOOL_UNAVAILABLE' for x in bundle['companions'][n][bridge.POLICY]['diagnostics'])
+    assert len({x['worker'] for d in (p2,o2,s2) for x in _p2_rows(d,n)})==1
+    _ssh_s2_detail(bundle,n)
+    # Original admitted clean whole-producer O2 error grammar (no snapshot).
+    # Validate it using the real parent, not a new generic adapter path.
+    value=envelope(flags=flags)
+    value['records'][1].update(reason_code='COMMAND_FAILED',rc=7,snapshot=None)
+    value['records'][3]['snapshot']=_ssh_s2_typed_snapshot(flags)
+    projection=bridge.normalize_handoff(value,RUN,HOST,flags,TIME,RULES,
+                                      staged_openssl=True,staged_policy=True,staged_ssh=True)
+    assert projection.special is None and projection.outcomes[bridge.PACKAGES]['rc']==7
+    assert bridge.SSH in projection.companions and bridge.OPENSSL not in projection.companions
+    assert not trap.exists()

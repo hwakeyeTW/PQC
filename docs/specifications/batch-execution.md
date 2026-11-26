@@ -675,3 +675,61 @@ hosts or SSH transport. Engineering acceptance requires actual native
 worker/AnsiballZ/guard/cleanup evidence; source implementation alone is not
 a PASS. Formal Controller/OL9.x qualification remains separate under #28.
 Both registries remain empty and LIVE_NOT_AVAILABLE is unchanged.
+
+### I1b SSH S2: fixed private native worker extension
+
+A selected staged SSH adapter requires the actual same-worker P1 validated
+snapshot and completed legal staged O2 and CP2 results whenever selected.
+The registry denies a generic selected prior producer before connection.
+An eligible SSH worker issues only config ordinal 0 and keys ordinal 1,
+from the frozen flags, in that order (keys-only still uses ordinal 1).
+An unknown or out-of-scope Platform produces the original exact typed gap,
+not an SSH launch. Empty plans and clean ordinary prior outcomes preserve
+their existing staged grammar. Every stage is bound to the same run, target,
+Task UUID and exact issued binding object. No supplied path, argv, root,
+context or alternate executable is admitted. Both registries remain empty.
+
+The existing 30 s guard, 15 s synthetic connection witness, 30 s command
+and 1 s return reserve give 76 s per stage. SSH has at most two stages and
+one cumulative 30 s validation allowance: 182 s only for the explicit
+staged adapter. P1/O2/CP2 remain 258/562/182 s, and Cert remains the 31 s
+legacy surrogate. The all-five producer/host/ten-host invocation bounds
+are 1215/1267/13335 s; without Cert they are 1184/1236/13025 s. The original
+legacy and CP2-only budgets are unchanged. These are conservative internal
+bounds, not execution duration estimates or additional per-command time.
+A new producer cannot extend the host, wave-earliest or invocation deadline.
+The one-use gate requires room for the full command before launch, and
+checks the elapsed deadline after clean completion, including ordinary
+failure. Only independently verified matching completion clears pending.
+A launcher exception cannot supply its own cleanup proof.
+
+The SSH-specific frame is 524483 bytes (combined stdout and stderr), with
+the fixed S1 slot/child/compact receipt limits 262144/262145/262243 bytes.
+Earlier P1/O2 32768-byte and CP2 131072-byte frame limits stay unchanged.
+Raw frames are not queued or retained as handoff data. The canonical host
+handoff still has a hard 1048576-byte limit, ten-host cumulative 10 MiB,
+3500-byte IPC receipt, fixed depth/nodes, private FD/hash and single-consume
+validation. No increased cap, truncation or partial success on overflow.
+The four staged payload allocation is 819200 bytes plus 16384 structure
+reserve, 835584 bytes total (816 KiB); remaining 212992 bytes are not a
+Certificate acquisition budget. See collector-integration for the exact
+serializer proof and the distinction from legacy Cert snapshots.
+
+Only an independently confirmed, validated staged SSH TIMEOUT or
+EXECUTION_ERROR snapshot may stop subsequent SSH and Cert on that host
+without a global fatal, retaining earlier validated slots. Clean OUTPUT_LIMIT
+permits the next planned stage while the lease allows it. Fatal guard,
+receipt, cleanup, worker, deadline or interrupt failure discards the incomplete
+SSH snapshot and stops new host/producer dispatch; existing peer cleanup and
+RC 0/5/6/7 rules remain. The V2 SSH guard/deadline terminal extension requires
+retained validated prior projections (or original coherent O2 ordinary
+failure), no SSH references and no later Cert references. This is terminal
+shape validation, not an independent cleanup witness. The trusted parent
+revalidates the same staged rules and actual evidence binding. The default
+V1/legacy and offline Store normalization contracts are unchanged.
+
+This is restricted synthetic/offline engineering only. No actual managed
+root, native Q/T query, real SSH transport, C3, Certificate native bridge or
+persistent SSH companion is enabled. Actual Controller, OL9.7/9.8/9.9,
+transport, remote lifetime, permissions and load remain formal QA under #28;
+#8/#17 mandatory transport and Q/T qualifications remain HOLD.
