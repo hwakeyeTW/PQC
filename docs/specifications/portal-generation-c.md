@@ -245,3 +245,47 @@ fixed F and prior M/K oracles, precise reverse href/fragment checks, recorded
 occurrence subsets, binding defects and exact/+1 capacity boundaries. Formal
 browser, filesystem, target OS and full-load acceptance remain #28; C-C still
 owns activation and publication.
+
+## C-C coherent publication and explicit activation
+
+`render_run(..., with_portal_v5=False)` and `--with-portal-v5` activate the
+complete private navigation/reverse-pivot buffer from one actual pinned Store
+open. The option includes history and crypto indexes; the older flags remain
+valid together. A new default portal is still v2. An exact prior v1-v4 may
+be upgraded only with refresh and proof of its complete original output.
+Exact existing v5 is verified, not downgraded or rewritten, for every valid
+flag combination even without a catalog. No public intermediate V5 modes,
+raw fallback, V3 Store manifest reader or new assessment are introduced.
+
+Stable `index.html` is the private full buffer prefixed with the fixed V5
+marker. CSS and all nested payloads retain the assembler's exact bytes.
+Format 5 `portal-v5/portal_receipt.json` binds run ID, original manifest,
+marked index, CSS, and sorted fixed nested names, byte sizes and SHA-256s.
+The verified host set determines the closed 16 + 3h slots including receipt,
+index and CSS. HTML: 16 MiB/page and 128 MiB aggregate (marker included); JSON:
+32 MiB each; CSV: 16 MiB/file, 32 MiB aggregate; CBOM and provenance: 32 MiB
+per host pair, 256 MiB aggregate; CSS: 256 KiB; receipt: 1 MiB. The full
+publication including receipt and marker is bounded to 512 MiB, at most 1,000
+hosts under the existing Store limits. Preflight precedes output mutation.
+
+Use the existing pinned same-device private directory/file checks, exclusive
+writer lock and no-replace writes. An exact subset of staging files can be
+resumed; the sealed receipt requires the full closed generation. Recheck the
+root, run and lock identities, coherent shared-locked catalog, frozen scope,
+manifest, journal, core, previous generation, CSS and target bytes/identities
+before switching the stable index last. Never overwrite core or old generation
+files. Sync failure is not success or proof of rollback. The existing exact
+V5 no-op verifies and reconfirms durability without a catalog dependency.
+
+Catalog format 1 admits V5 only from the active stable marker and complete
+fixed-byte generation. Unreferenced stages do not authorize reads or charges.
+Safe admitted fixed slots are counted once under original catalog limits;
+size/aggregate overflow is fatal to the entire rebuild before stable changes.
+Malformed or unsafe ordinary rows are invalid and unlinked, not a capacity
+proof. Original C1 V2 producer scope, exact typed details and producer rules
+use the actual Store header/slot validators and the producer-v2 selector only
+for the supported 1.0.0 contract. No arbitrary producer marker, new Store
+version, or automatic catalog recovery. Catalog lock precedes run lock;
+release the run-only probe first. Explicit catalog rebuild is required after
+publication. Formal filesystem/power-loss/load, Windows/Linux file:// browser,
+production target and release acceptance remain #28.

@@ -2135,3 +2135,529 @@ def test_cb2b2_crypto_page_capacity(root, monkeypatch):
         crypto._render_crypto_projection(p, pivots=ctx, page_limit=limit-1)
     assert faults[-1][:2] == (name, limit-1)
     assert pub == snapshot and c1._c2_tree(root) == before
+
+
+# C-C: activate only the complete private payload from the actual Store.
+def _cc_row(root, rid):
+    return next(row for row in json.loads((root / 'run_catalog.json').read_bytes())['rows']
+                if row['run_id'] == rid)
+
+
+def _cc_bytes(run):
+    import stat
+    return {p.relative_to(run).as_posix(): (p.read_bytes(), p.lstat().st_ino,
+            p.lstat().st_mtime_ns, stat.S_IMODE(p.lstat().st_mode))
+            for p in run.rglob('*') if p.is_file() and not p.is_symlink()}
+
+
+def _cc_receipt(pub, full):
+    # Independent receipt oracle from the already verified private A buffer.
+    return rs._json_bytes({'format': 5, 'run_id': pub.manifest['run_id'],
+        'manifest_sha256': hashlib.sha256(rs._json_bytes(pub.manifest)).hexdigest(),
+        'index_sha256': hashlib.sha256(b'<!-- PQC portal-v5 -->\n' + full.index).hexdigest(),
+        'css_sha256': hashlib.sha256(full.css).hexdigest(),
+        'pages': [{'name': n, 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+                  for n, raw in sorted(full.files.items())]}, 1024**2)
+
+
+def _cc_assert_published(root, pub, full):
+    from tools import run_catalog as cat
+    rid = pub.manifest['run_id']; run = root / rid
+    assert (run / 'index.html').read_bytes() == b'<!-- PQC portal-v5 -->\n' + full.index
+    assert (run / 'portal.css').read_bytes() == full.css
+    expected = {**full.files, 'portal_receipt.json': _cc_receipt(pub, full)}
+    assert set(p.name for p in (run / 'portal-v5').iterdir()) == set(expected)
+    assert len(expected) == 14 + 3 * len(pub.manifest['expected_host_ids'])
+    assert {p.name: p.read_bytes() for p in (run / 'portal-v5').iterdir()} == expected
+    assert (run / 'portal-v5').stat().st_mode & 0o777 == 0o700
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in (run / 'portal-v5').iterdir())
+    assert (run / 'index.html').stat().st_mode & 0o777 == 0o600
+    _cb2b1_check(pub, full)
+    with rs.RunStore(root) as store:
+        assert store.open(rid) == pub
+    cat.build_catalog(root)
+    row = _cc_row(root, rid)
+    assert row['publication_status'] == 'PUBLISHED'
+    assert row['portal_status'] == 'AVAILABLE' and row['portal_generation'] == 'portal-v5'
+    assert row['href'] == rid + '/index.html' and row['manifest_sha256'] == hashlib.sha256(rs._json_bytes(pub.manifest)).hexdigest()
+    assert row['run_state'] == pub.manifest['run_state']
+    assert cat.check_catalog(root) == json.loads((root / cat.JSON).read_bytes())['generation']
+    return row
+
+
+@pytest.mark.parametrize('kind', ['c1-assessed', 'c1-unassessed', 'recovery', 'native-v1', 's1', 'legacy', 'zero'])
+def test_cc_actual_store_catalog_publication(root, tmp_path, monkeypatch, kind):
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, kind)
+    rid = pub.manifest['run_id']; run = root / rid
+    before = _cc_bytes(run)
+    with pytest.raises(rs.StoreError):
+        portal.render_run(root, rid, with_portal_v5=True)
+    assert _cc_bytes(run) == before and not (root / cat.LOCK).exists()
+    cat.build_catalog(root)
+    row = _cc_row(root, rid)
+    assert row['publication_status'] == 'PUBLISHED' and row['portal_status'] == 'NOT_GENERATED'
+    catalog_before = _cc_bytes(root / cat.GENERATIONS)
+    stable = (root / cat.JSON).read_bytes(), (root / cat.HTML).read_bytes()
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    calls = Counter()
+    with monkeypatch.context() as m:
+        for module, name in ((rs.RunStore, 'open'), (ca, '_assemble_v5_render_payload'),
+                             (validator, 'validate_cbom_bytes'), (gen, '_verified_taxonomy')):
+            actual = getattr(module, name)
+            def tracked(*args, _name=name, _actual=actual, **kwargs):
+                calls[_name] += 1
+                if _name == '_assemble_v5_render_payload':
+                    assert kwargs == {'navigation': True, 'reverse_pivots': True}
+                return _actual(*args, **kwargs)
+            m.setattr(module, name, tracked)
+        assert portal.render_run(root, rid, with_portal_v5=True) == run / 'index.html'
+        assert calls == {'open': 1, '_assemble_v5_render_payload': 1,
+                         'validate_cbom_bytes': len(pub.manifest['expected_host_ids']), '_verified_taxonomy': 1}
+    assert {n: v for n, v in _cc_bytes(run).items() if n in before} == before
+    assert (root / cat.JSON).read_bytes() == stable[0] and (root / cat.HTML).read_bytes() == stable[1]
+    _cc_assert_published(root, pub, full)
+    assert all(_cc_bytes(root / cat.GENERATIONS)[n] == v for n, v in catalog_before.items())
+    portal.render_run(root, rid)
+    assert _cc_row(root, rid)['portal_generation'] == 'portal-v5'
+
+
+@pytest.mark.parametrize('version', [1, 2, 3, 4])
+def test_cc_upgrade_exact_prior_and_no_downgrade(root, tmp_path, version):
+    from tools import render_portal as portal, run_catalog as cat
+    from test_run_catalog import v1
+    import itertools
+    pub = _cb2a_publication(root, tmp_path, 's1' if version == 3 else 'zero')
+    rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root)
+    if version == 1:
+        v1(root, rid, pub)
+    else:
+        portal.render_run(root, rid, with_history=version == 3, with_crypto_indexes=version == 4)
+    cat.build_catalog(root)
+    assert _cc_row(root, rid)['portal_generation'] == 'portal-v' + str(version)
+    before = _cc_bytes(run)
+    with pytest.raises(rs.StoreError, match='PORTAL_OUTPUT_COLLISION'):
+        portal.render_run(root, rid, with_portal_v5=True)
+    assert _cc_bytes(run) == before
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    portal.render_run(root, rid, refresh_portal=True, with_portal_v5=True,
+                      with_history=True, with_crypto_indexes=True)
+    after = _cc_bytes(run)
+    assert {n: after[n] for n in before if n != 'index.html'} == {n: v for n, v in before.items() if n != 'index.html'}
+    assert after['index.html'][1] != before['index.html'][1]
+    _cc_assert_published(root, pub, full)
+    (root / cat.JSON).unlink(); (root / cat.HTML).unlink(); (root / cat.LOCK).unlink()
+    flags = itertools.product((False, True), repeat=4) if version == 4 else [(False,)*4, (True,)*4]
+    snapshot = _cc_bytes(root)
+    for refresh, history, crypto_mode, v5 in flags:
+        portal.render_run(root, rid, refresh_portal=refresh, with_history=history,
+                          with_crypto_indexes=crypto_mode, with_portal_v5=v5)
+        assert _cc_bytes(root) == snapshot
+
+
+def test_cc_cli_and_exact_flag(root, tmp_path):
+    import subprocess
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']
+    for value in (1, None, 'true', []):
+        with pytest.raises(rs.StoreError, match='INVALID_PORTAL_V5_FLAG'):
+            portal.render_run(root, rid, with_portal_v5=value)
+    cat.build_catalog(root)
+    def cli(*flags):
+        return subprocess.run([sys.executable, '-B', '-m', 'tools.render_portal',
+            '--report-root', str(root), '--run-id', rid, *flags], cwd=ROOT,
+            capture_output=True, timeout=40)
+    assert cli('--with-portal-v').returncode == 2
+    p = cli('--with-portal-v5', '--with-history', '--with-crypto-indexes')
+    assert (p.returncode, p.stdout, p.stderr) == (0, b'PORTAL_RENDERED\n', b'')
+    assert (root / rid / 'index.html').read_bytes().startswith(b'<!-- PQC portal-v5 -->\n')
+    cat.build_catalog(root)
+    assert _cc_row(root, rid)['portal_generation'] == 'portal-v5'
+
+
+@pytest.mark.parametrize('boundary', ['page', 'receipt', 'stable', 'after-switch'])
+def test_cc_actual_interruption_resume(root, tmp_path, monkeypatch, boundary):
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root)
+    portal.render_run(root, rid)
+    old = _cc_bytes(run); full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    actual_write, actual_replace, actual_sync = rs._write, portal._replace_v1_index, rs._sync
+    injected = []
+    with monkeypatch.context() as m:
+        def write(fd, name, raw, device, **kwargs):
+            if (boundary == 'page' and name == 'hosts.html' or
+                    boundary == 'receipt' and name == 'portal_receipt.json'):
+                injected.append(name)
+                raise rs.StoreError('STORE_IO')
+            return actual_write(fd, name, raw, device, **kwargs)
+        def replace(*args, **kwargs):
+            if boundary == 'stable':
+                injected.append('stable')
+                raise rs.StoreError('STORE_IO')
+            return actual_replace(*args, **kwargs)
+        def sync(fd):
+            if (boundary == 'after-switch' and portal._identity(fd) == (run.stat().st_dev, run.stat().st_ino)
+                    and (run / 'index.html').read_bytes().startswith(portal._V5_MARKER)):
+                injected.append('after-switch')
+                raise rs.StoreError('DURABILITY_UNCONFIRMED')
+            return actual_sync(fd)
+        m.setattr(rs, '_write', write); m.setattr(portal, '_replace_v1_index', replace); m.setattr(rs, '_sync', sync)
+        with pytest.raises(rs.StoreError, match='DURABILITY_UNCONFIRMED' if boundary == 'after-switch' else 'STORE_IO'):
+            portal.render_run(root, rid, with_portal_v5=True, refresh_portal=True)
+    assert injected
+    if boundary != 'after-switch':
+        assert _cc_bytes(run)['index.html'] == old['index.html']
+    else:
+        assert (run / 'index.html').read_bytes() == portal._V5_MARKER + full.index
+    stage = _cc_bytes(run / 'portal-v5')
+    if boundary in ('stable', 'after-switch'):
+        assert 'portal_receipt.json' in stage
+    else:
+        assert 'portal_receipt.json' not in stage
+    portal.render_run(root, rid, with_portal_v5=True, refresh_portal=True)
+    after = _cc_bytes(run / 'portal-v5')
+    assert all(after[n] == v for n, v in stage.items())
+    assert all(_cc_bytes(run)[n] == v for n, v in old.items() if n != 'index.html')
+    _cc_assert_published(root, pub, full)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'extra', 'receipt', 'payload', 'symlink', 'hardlink',
+                                   'mode', 'directory-mode', 'foreign-receipt', 'missing-css', 'marker'])
+def test_cc_active_tamper_no_link_no_repair(root, tmp_path, fault):
+    import os
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid, with_portal_v5=True); cat.build_catalog(root)
+    stage = run / 'portal-v5'; target = stage / 'hosts.html'; receipt = stage / 'portal_receipt.json'
+    if fault == 'missing': target.unlink()
+    elif fault == 'extra': (stage / 'foreign').write_bytes(b'ignored'); (stage / 'foreign').chmod(0o600)
+    elif fault == 'receipt': receipt.write_bytes(receipt.read_bytes() + b' ')
+    elif fault == 'payload': target.write_bytes(target.read_bytes() + b' ')
+    elif fault == 'symlink': target.unlink(); target.symlink_to(run / 'portal.css')
+    elif fault == 'hardlink': os.link(target, tmp_path / 'dummy-link')
+    elif fault == 'mode': target.chmod(0o644)
+    elif fault == 'directory-mode': stage.chmod(0o755)
+    elif fault == 'foreign-receipt':
+        value = json.loads(receipt.read_bytes()); value['pages'][0]['name'] = '../foreign'
+        receipt.write_bytes(rs._json_bytes(value))
+    elif fault == 'missing-css': (run / 'portal.css').unlink()
+    else: (run / 'index.html').write_bytes(b'<!-- PQC portal-v999 -->\n')
+    before = _cc_bytes(run)
+    with pytest.raises(rs.StoreError):
+        portal.render_run(root, rid, with_portal_v5=True, refresh_portal=True)
+    assert _cc_bytes(run) == before
+    cat.build_catalog(root)
+    row = _cc_row(root, rid)
+    assert row['publication_status'] == 'PUBLISHED' and row['portal_status'] == 'INVALID'
+    assert row['href'] is None and row['portal_generation'] is None
+    assert _cc_bytes(run) == before
+
+
+@pytest.mark.parametrize('cap', ['marker-html', 'receipt', 'bundle'])
+def test_cc_exact_generated_limits_before_writes(root, tmp_path, monkeypatch, cap):
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root)
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    html = len(full.index) + len(portal._V5_MARKER) + sum(len(raw) for name, raw in full.files.items() if name.endswith('.html'))
+    receipt = _cc_receipt(pub, full)
+    bundle = len(full.index) + len(portal._V5_MARKER) + len(full.css) + len(receipt) + sum(map(len, full.files.values()))
+    module, key, exact = {'marker-html': (portal, '_MAX_TOTAL_HTML', html),
+                         'receipt': (portal, '_MAX_V5_RECEIPT', len(receipt)),
+                         'bundle': (ca, '_MAX_BUNDLE', bundle)}[cap]
+    before = _cc_bytes(root)
+    with monkeypatch.context() as m:
+        m.setattr(module, key, exact - 1)
+        with pytest.raises(rs.StoreError, match='PORTAL_PAYLOAD_SIZE_LIMIT'):
+            portal.render_run(root, rid, with_portal_v5=True)
+        assert _cc_bytes(root) == before and not (run / 'portal-v5').exists()
+        m.setattr(module, key, exact)
+        portal.render_run(root, rid, with_portal_v5=True)
+        cat.build_catalog(root)
+        assert _cc_row(root, rid)['portal_status'] == 'AVAILABLE'
+    assert (run / 'portal-v5' / 'portal_receipt.json').read_bytes() == receipt
+
+
+@pytest.mark.parametrize('slot', ['hosts.html', 'scan_summary.json', 'summary.csv', 'cbom', 'portal_receipt.json'])
+def test_cc_actual_oversized_slot_preserves_catalog(root, tmp_path, monkeypatch, slot):
+    import os
+    from tools import render_portal as portal, run_catalog as cat
+    from test_run_catalog import catalog_state
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid, with_portal_v5=True); cat.build_catalog(root)
+    before = catalog_state(root)
+    caps, *_ = portal._v5_layout(pub)
+    name = pub.manifest['expected_host_ids'][0] + '.cbom.json' if slot == 'cbom' else slot
+    target = run / 'portal-v5' / name
+    # Actual safe inode size is the capacity witness, not a fake valid payload.
+    with target.open('r+b') as f: f.truncate(caps[name] + 1)
+    original = rs._read; parent = target.parent.stat().st_ino
+    def read(fd, n, *args, **kwargs):
+        assert not (n == name and os.fstat(fd).st_ino == parent)
+        return original(fd, n, *args, **kwargs)
+    monkeypatch.setattr(rs, '_read', read)
+    with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'):
+        cat.build_catalog(root)
+    assert catalog_state(root) == before and cat.check_catalog(root) == json.loads((root / cat.JSON).read_bytes())['generation']
+
+
+def test_cc_class_and_pair_aggregate_exact_sizes(root, tmp_path, monkeypatch):
+    from tools import render_portal as portal
+    pub = _cb2a_publication(root, tmp_path, 'native-v1')
+    full = ca._assemble_v5_render_payload(pub, navigation=True, reverse_pivots=True)
+    sizes = {n: len(raw) for n, raw in full.files.items()}
+    sizes.update({'index.html': len(full.index) + len(portal._V5_MARKER), 'portal.css': len(full.css),
+                  'portal_receipt.json': len(_cc_receipt(pub, full))})
+    _, html, csv, pairs = portal._v5_layout(pub)
+    pairsizes = [sum(sizes[n] for n in pair) for pair in pairs]
+    # Test-only reduced caps over a genuine complete buffer, not oversized
+    # invalid payloads passed off as valid maximal certificate data.
+    for module, cap, exact in [(ca, '_MAX_HTML', max(sizes[n] for n in html)),
+          (ca, '_MAX_JSON', max(sizes[n] for n in ca._JSON + ('crypto_indexes.json',))),
+          (ca, '_MAX_CSV', max(sizes[n] for n in csv)),
+          (ca, '_MAX_CSV_TOTAL', sum(sizes[n] for n in csv)),
+          (ca, '_MAX_CBOM_PAIR', max(pairsizes)), (ca, '_MAX_CBOM_TOTAL', sum(pairsizes)),
+          (portal, '_MAX_CSS', sizes['portal.css'])]:
+        with monkeypatch.context() as m:
+            m.setattr(module, cap, exact)
+            portal._v5_check_sizes(portal._v5_layout(pub), sizes)
+            m.setattr(module, cap, exact - 1)
+            with pytest.raises(rs.StoreError, match='PORTAL_PAYLOAD_SIZE_LIMIT'):
+                portal._v5_check_sizes(portal._v5_layout(pub), sizes)
+
+
+@pytest.mark.parametrize('fault', ['typed-size', 'typed-actual', 'malformed', 'unsupported'])
+def test_cc_c1_admission_capacity_not_marker_authority(root, tmp_path, monkeypatch, fault):
+    from tools import run_catalog as cat, render_portal as portal
+    from test_run_catalog import catalog_state
+    pub = _cb2a_publication(root, tmp_path, 'c1-assessed'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); assert _cc_row(root, rid)['publication_status'] == 'PUBLISHED'
+    old = catalog_state(root); marker = run / 'run_manifest.json'; header = json.loads(marker.read_bytes())
+    row = next(x for x in header['artifacts'] if x['kind'] == 'detail' and x['slot'] == 'certificate-assets-v1')
+    _, cap = rs._slot(row['kind'], row['host_id'], row['slot'], producer_v2=True)
+    if fault == 'typed-actual':
+        with (run / row['path']).open('r+b') as f: f.truncate(cap + 1)
+    else:
+        if fault == 'unsupported': header['manifest_version'] = '1.1.0'
+        else:
+            row['size'] = cap + 1
+            if fault == 'malformed': row['collection_ids'] = ['foreign-invalid-ref']
+        marker.write_bytes(rs._json_bytes(header))
+    if fault in ('typed-size', 'typed-actual'):
+        actual = rs._read
+        def guarded(fd, name, *args, **kwargs):
+            assert name not in {rs.FILES['evidence'][0], rs._PRODUCER_RULES_FILE, 'certificate-assets-v1.json'}
+            return actual(fd, name, *args, **kwargs)
+        monkeypatch.setattr(rs, '_read', guarded)
+        with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'): cat.build_catalog(root)
+        assert catalog_state(root) == old
+    else:
+        cat.build_catalog(root); row = _cc_row(root, rid)
+        assert row['publication_status'] == 'INVALID' and row['href'] is None
+        with pytest.raises(rs.StoreError): portal.render_run(root, rid, with_portal_v5=True)
+        assert not (run / 'portal-v5').exists()
+
+
+def test_cc_actual_catalog_budget_and_inactive_stage(root, tmp_path, monkeypatch):
+    from tools import run_catalog as cat, render_portal as portal
+    from test_run_catalog import catalog_state
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid, with_portal_v5=True); cat.build_catalog(root)
+    old = catalog_state(root)
+    # Indexed bytes + marker/journal + complete fixed derived bytes, not the
+    # independent frozen rules or any inactive generation or catalog files.
+    total = sum(row['size'] for row in pub.manifest['artifacts'])
+    total += sum((run / name).stat().st_size for name in ('run_manifest.json', 'journal.json', 'index.html', 'portal.css'))
+    total += sum(p.stat().st_size for p in (run / 'portal-v5').iterdir())
+    inactive = run / 'portal-v4'; inactive.mkdir(mode=0o700)
+    (inactive / 'foreign').symlink_to(run / 'index.html')
+    actual = rs._open_dir
+    def guarded(fd, name, *args, **kwargs):
+        assert name != 'portal-v4'
+        return actual(fd, name, *args, **kwargs)
+    monkeypatch.setattr(rs, '_open_dir', guarded)
+    monkeypatch.setattr(cat, 'MAX_ADMITTED', total)
+    cat.build_catalog(root); assert catalog_state(root) == old
+    monkeypatch.setattr(cat, 'MAX_ADMITTED', total - 1)
+    with pytest.raises(rs.StoreError, match='CATALOG_CAPACITY'): cat.build_catalog(root)
+    assert catalog_state(root) == old
+
+
+def test_cc_catalog_lock_order_and_stable_switch(root, tmp_path, monkeypatch):
+    import fcntl, os
+    from contextlib import contextmanager
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid)
+    observed = []; ctx, render, replace = cat._history_root, portal._render_v5, os.replace
+    def probe(path, held):
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            if held:
+                with pytest.raises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally: os.close(fd)
+    @contextmanager
+    def history(path):
+        probe(run / '.writer.lock', False); observed.append('probe-released')
+        with ctx(path) as value: yield value
+    def assembly(*args):
+        probe(root / cat.LOCK, True); observed.append('catalog-held')
+        return render(*args)
+    def switch(src, dst, **kwargs):
+        if dst == 'index.html':
+            probe(root / cat.LOCK, True); probe(run / '.writer.lock', True); observed.append('switch-held')
+        return replace(src, dst, **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(cat, '_history_root', history); m.setattr(portal, '_render_v5', assembly); m.setattr(os, 'replace', switch)
+        portal.render_run(root, rid, refresh_portal=True, with_portal_v5=True)
+    assert observed == ['probe-released', 'catalog-held', 'switch-held']
+    probe(root / cat.LOCK, False); probe(run / '.writer.lock', False)
+    before = _cc_bytes(run)
+    with rs.RunStore(root) as store, store._locked_run(rid, shared=False):
+        with pytest.raises(rs.StoreError, match='RUN_BUSY'): portal.render_run(root, rid)
+    fd = os.open(root / cat.LOCK, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portal.render_run(root, rid, with_portal_v5=True)
+    finally: os.close(fd)
+    assert _cc_bytes(run) == before
+
+
+@pytest.mark.parametrize('fault', ['catalog-lock', 'run-lock', 'root', 'index', 'core', 'catalog-slot'])
+def test_cc_identity_drift_before_output(root, tmp_path, monkeypatch, fault):
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid)
+    old = (run / 'index.html').read_bytes(); moved = root.parent / 'old-root'; render = portal._render_v5
+    def drift(*args):
+        output = render(*args)
+        if fault == 'root': root.rename(moved); root.mkdir(mode=0o700)
+        else:
+            target = {'catalog-lock': root / cat.LOCK, 'run-lock': run / '.writer.lock',
+                      'index': run / 'index.html', 'core': run / 'evidence.json', 'catalog-slot': root / cat.JSON}[fault]
+            raw = target.read_bytes(); target.rename(root.parent / 'old-inode')
+            target.write_bytes(raw); target.chmod(0o600)
+        return output
+    monkeypatch.setattr(portal, '_render_v5', drift)
+    with pytest.raises(rs.StoreError): portal.render_run(root, rid, refresh_portal=True, with_portal_v5=True)
+    if fault == 'root': run = moved / rid; assert not list(root.iterdir())
+    assert not (run / 'portal-v5').exists() and (run / 'index.html').read_bytes() == old
+
+
+@pytest.mark.parametrize('fault', ['old-page', 'sealed-incomplete', 'css', 'target-page'])
+def test_cc_refuses_prior_or_sealed_target_drift(root, tmp_path, monkeypatch, fault):
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid)
+    old = _cc_bytes(run)['index.html']; replace = portal._replace_v1_index
+    if fault == 'old-page':
+        p = run / 'portal-v2' / 'hosts.html'; p.write_bytes(p.read_bytes() + b' ')
+    else:
+        def drift(*args, **kwargs):
+            if fault == 'sealed-incomplete': (run / 'portal-v5' / 'hosts.html').unlink()
+            else:
+                p = run / ('portal.css' if fault == 'css' else 'portal-v5/hosts.html')
+                raw = p.read_bytes(); p.rename(root.parent / 'old-inode'); p.write_bytes(raw); p.chmod(0o600)
+            return replace(*args, **kwargs)
+        monkeypatch.setattr(portal, '_replace_v1_index', drift)
+    with pytest.raises(rs.StoreError): portal.render_run(root, rid, refresh_portal=True, with_portal_v5=True)
+    assert _cc_bytes(run)['index.html'] == old
+    cat.build_catalog(root); row = _cc_row(root, rid)
+    assert row['portal_generation'] != 'portal-v5'
+
+
+def test_cc_mixed_history_and_relocated_links(root, tmp_path, monkeypatch):
+    import shutil
+    from urllib.parse import urlsplit, unquote
+    from tools import render_portal as portal, run_catalog as cat
+    from test_run_catalog import publish, v1
+    cat.build_catalog(root)
+    for version in range(1, 6):
+        rid = 'fixture-v' + str(version); pub = publish(root, monkeypatch, rid)
+        if version == 1: v1(root, rid, pub)
+        else: portal.render_run(root, rid, with_history=version == 3, with_crypto_indexes=version == 4, with_portal_v5=version == 5)
+    cat.build_catalog(root)
+    rows = json.loads((root / cat.JSON).read_bytes())['rows']
+    assert {r['run_id']: r['portal_generation'] for r in rows} == {'fixture-v' + str(v): 'portal-v' + str(v) for v in range(1, 6)}
+    before = _cc_bytes(root); inactive = root / 'fixture-v4' / 'portal-v5'; inactive.mkdir(mode=0o700)
+    (inactive / 'foreign').symlink_to(root / 'fixture-v4' / 'index.html')
+    cat.build_catalog(root); assert _cc_bytes(root) == before
+    (inactive / 'foreign').unlink(); inactive.rmdir()
+    moved = tmp_path / 'relocated'; shutil.copytree(root, moved)
+    assert cat.check_catalog(moved) == json.loads((root / cat.JSON).read_bytes())['generation']
+    run = moved / 'fixture-v5'
+    for page in [run / 'index.html', *(run / 'portal-v5').glob('*.html')]:
+        for href in _cb2a_parse(page.read_bytes()).links:
+            u = urlsplit(href); assert not u.scheme and not u.netloc
+            if u.path:
+                dest = (page.parent / unquote(u.path)).resolve()
+                assert dest.is_relative_to(moved.resolve()) and dest.is_file(), (page.name, href)
+
+
+def test_cc_fresh_stable_noreplace_race(root, tmp_path, monkeypatch):
+    import os
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); before = _cc_bytes(run)
+    rename = rs._rename_noreplace; raced = []
+    def collide(src_fd, src, dst_fd, dst):
+        if dst == 'index.html':
+            assert (run / 'portal-v5' / 'portal_receipt.json').is_file()
+            assert not (run / 'index.html').exists()
+            fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=dst_fd)
+            try: os.write(fd, b'foreign-stable-index'); os.fsync(fd)
+            finally: os.close(fd)
+            raced.append(True)
+        return rename(src_fd, src, dst_fd, dst)
+    with monkeypatch.context() as m:
+        m.setattr(rs, '_rename_noreplace', collide)
+        with pytest.raises(rs.StoreError): portal.render_run(root, rid, with_portal_v5=True)
+    assert raced and (run / 'index.html').read_bytes() == b'foreign-stable-index'
+    assert all(_cc_bytes(run)[n] == raw for n, raw in before.items())
+    assert not list(run.glob('.portal-index-*'))
+    with pytest.raises(rs.StoreError): portal.render_run(root, rid, with_portal_v5=True, refresh_portal=True)
+    cat.build_catalog(root); assert _cc_row(root, rid)['portal_status'] == 'INVALID'
+
+
+def test_cc_invalid_catalog_no_fresh_output_existing_v5_noop(root, tmp_path, monkeypatch):
+    from tools import render_portal as portal, run_catalog as cat
+    from test_run_catalog import publish
+    first = _cb2a_publication(root, tmp_path, 'zero'); rid = first.manifest['run_id']
+    publish(root, monkeypatch, 'fixture-new'); cat.build_catalog(root)
+    portal.render_run(root, rid, with_portal_v5=True)
+    (root / cat.JSON).write_bytes(b'{}')
+    before = _cc_bytes(root)
+    with pytest.raises(rs.StoreError): portal.render_run(root, 'fixture-new', with_portal_v5=True)
+    portal.render_run(root, rid)
+    portal.render_run(root, rid, with_portal_v5=True, refresh_portal=True)
+    assert _cc_bytes(root) == before
+    assert not (root / 'fixture-new' / 'portal-v5').exists()
+
+
+@pytest.mark.parametrize('attribute', ['st_uid', 'st_dev'])
+def test_cc_unsafe_inode_stat_rejected_not_capacity(root, tmp_path, monkeypatch, attribute):
+    import os
+    from types import SimpleNamespace
+    from tools import render_portal as portal, run_catalog as cat
+    pub = _cb2a_publication(root, tmp_path, 'zero'); rid = pub.manifest['run_id']; run = root / rid
+    cat.build_catalog(root); portal.render_run(root, rid, with_portal_v5=True); cat.build_catalog(root)
+    target = run / 'portal-v5' / 'hosts.html'; identity = target.stat().st_dev, target.stat().st_ino
+    actual = os.fstat
+    def wrong_identity(fd):
+        info = actual(fd)
+        if (info.st_dev, info.st_ino) == identity:
+            # Test-only injected stat evidence; no chown, mount or privilege.
+            attrs = {n: getattr(info, n) for n in dir(info) if n.startswith('st_')}
+            attrs[attribute] += 1
+            attrs['st_size'] = portal._MAX_HTML + 1
+            return SimpleNamespace(**attrs)
+        return info
+    before = _cc_bytes(run)
+    monkeypatch.setattr(os, 'fstat', wrong_identity)
+    with pytest.raises(rs.StoreError): portal.render_run(root, rid, with_portal_v5=True)
+    cat.build_catalog(root); row = _cc_row(root, rid)
+    assert row['publication_status'] == 'PUBLISHED' and row['portal_status'] == 'INVALID' and row['href'] is None
+    assert _cc_bytes(run) == before

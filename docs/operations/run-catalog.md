@@ -30,7 +30,7 @@ busy/recovery/durability failure; exit 2 denotes invalid arguments.
 Open `reports/index.html` locally. The table works with JavaScript disabled; no
 server, external styles, fonts, network or local JSON fetch. Move or archive and
 extract the **whole** report root, including `catalog.generations`, preserving
-private permissions for further Controller operations. Existing Portal v1/v2/v3/v4
+private permissions for further Controller operations. Existing Portal v1/v2/v3/v4/v5
 pages are not changed by a catalog rebuild.
 
 ## Opt-in Portal v3 history navigation
@@ -169,6 +169,48 @@ invalid unlinked row. No output truncation or implicit downgrade. Actual
 filesystem/power-loss/load and Windows/Linux file-browser acceptance remain
 release QA; an engineering relative-link check is not browser certification.
 
+## Opt-in Portal v5 complete offline navigation
+
+V5 includes history, crypto indexes, certificates, services, findings,
+coverage, reverse pivots and the verified JSON/CSV/CBOM downloads. It operates
+on an existing legitimate Public Store run; it does not enable a V3 Store
+manifest reader or trigger a scan. Explicitly build the catalog, render the
+approved run, then rebuild the catalog to verify the active V5 generation:
+
+```sh
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --with-portal-v5
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.run_catalog --report-root /approved/private/reports --check
+```
+
+For an existing exact v1-v4 portal, add `--refresh-portal` to the render
+command. A new run without the opt-in retains v2 by default. History and
+crypto-index flags may be combined with V5; the equivalent API keyword is
+`with_portal_v5=True` (exact bool). Exact existing V5 is a verified no-op for
+all valid flag combinations, including when the catalog is missing or invalid.
+It cannot be downgraded. The renderer does not rebuild or recover the catalog.
+Open the complete relocated report root's `index.html` using `file://`.
+
+The marked stable run index points to `portal-v5/`. Format 5 receipt binds
+the original manifest, marked index, CSS and every sorted fixed nested file
+by size and SHA-256. The entire derived publication is limited to 512 MiB
+including the marker, receipt and CSS; the receipt limit is 1 MiB (older
+versions retain 256 KiB). The existing page, JSON, CSV and CBOM pair and
+aggregate limits apply. Safe exact partial generation can resume under the
+original locks and no-replace/fsync rules. Seal the receipt before switching
+the index last. No overwriting old generation or core files. Do not repair
+unknown staging; a durability error is not success or guaranteed rollback.
+
+Catalog admission verifies active V5, including all fixed download files,
+against the actual immutable Store publication. Only verified active V5 is
+AVAILABLE with a link; an incomplete or tampered generation is unlinked.
+Unreferenced stages are not opened or charged. C1 V2 producer rules and
+certificate typed details are admitted using the original verified slot
+contract; other producer formats are not enabled. The original catalog
+capacity and lock-order contract remains. Actual browser and filesystem/load
+qualification are release QA, not inferred from an offline link test.
+
 ## Interpretation
 
 `run_catalog.json` is canonical catalog version 1 / render format 1, with
@@ -187,12 +229,12 @@ zero or a guessed failed scan.
 | INVALID | Unsafe/casefold collision or unverified marker, lock or core. |
 | BUSY | Could not obtain the run's shared lock. Outcome unknown. |
 
-The separate `portal_status` is AVAILABLE (exact verified v1, v2, v3 or v4),
+The separate `portal_status` is AVAILABLE (exact verified v1, v2, v3, v4 or v5),
 NOT_GENERATED (no derived slots), INVALID (incomplete, unsafe, unknown or
 inconsistent derived output), or NOT_VERIFIED (publication not verified).
 Only AVAILABLE has a relative `run_id/index.html` link. Only the version
-referenced by the stable run index is verified; unreferenced v2/v3/v4 retained
-or staging directories are not opened. A v2/v3/v4 index needs the complete
+referenced by the stable run index is verified; unreferenced v2/v3/v4/v5 retained
+or staging directories are not opened. A v2/v3/v4/v5 index needs the complete
 expected generation and matching receipt/manifest/CSS bytes. V4 also verifies
 the exact canonical crypto index JSON with its separate cap.
 The catalog schema, version, render format and immutable snapshot contract

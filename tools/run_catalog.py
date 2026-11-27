@@ -93,18 +93,7 @@ def _same_entry(parent, name, fd):
     rs.require(_entry_identity(parent, name) == _identity(fd), 'ARTIFACT_CHANGED')
 
 
-class _CatalogStore(rs.RunStore):
-    # Public open() is inherited, including the real _read_publication. Bind
-    # its nested shared lock to the outer directory AND lock identity.
-    expected = None
-
-    @contextmanager
-    def _locked_run(self, rid, *, shared):
-        with super()._locked_run(rid, shared=shared) as (fd, lock):
-            if self.expected is not None:
-                rs.require(shared and self.expected == (rid, _identity(fd), _identity(lock)),
-                           'ARTIFACT_CHANGED')
-            yield fd, lock
+_CatalogStore = portal._PinnedStore
 
 
 def _unknown(rid, status, reason):
@@ -113,22 +102,118 @@ def _unknown(rid, status, reason):
             'portal_generation': None, 'href': None, 'reason_code': reason}
 
 
+def _v5_portal_status(fd, device, published, marker, budget, current, index_signature,
+                      index_size, has_css):
+    """Verify only the fixed active V5 generation under the pinned run lock.
+
+    Admit safe actual sizes before reading nested buffers or rendering. A
+    receipt is never a path/size authority. Invalid safe slots still count.
+    """
+    layout = portal._v5_layout(published)
+    caps = layout[0]
+    sizes = {'index.html': index_size}
+    signatures = {}
+    invalid = False
+
+    def admit(parent, name):
+        nonlocal invalid
+        try:
+            signature = portal._file_signature(parent, name, device)
+            sizes[name] = budget.file(parent, name, device, caps[name])
+            rs.require(portal._file_signature(parent, name, device) == signature and
+                       sizes[name] == signature[5], 'ARTIFACT_CHANGED')
+            signatures[name] = signature
+        except CapacityError:
+            raise
+        except (rs.StoreError, OSError):
+            invalid = True
+
+    if has_css:
+        admit(fd, 'portal.css')
+    expected = set(caps) - {'index.html', 'portal.css'}
+    with rs._directory(fd, (portal._V5_GENERATION,), device) as gen:
+        # Stat only known fixed names. Unknown entries never authorize a
+        # read or a size charge, even in a directory with excessive extras.
+        present = {name for name in expected if rs._exists(gen, name)}
+        for name in sorted(present):
+            admit(gen, name)
+        try:
+            portal._v5_check_sizes(layout, sizes)
+        except rs.StoreError as exc:
+            if exc.code == 'PORTAL_PAYLOAD_SIZE_LIMIT':
+                raise CapacityError('CATALOG_CAPACITY') from None
+            raise
+        rs.require(not invalid and present == expected and sizes.keys() == caps.keys() and
+                   set(rs._entries(gen, len(expected))) == expected,
+                   'PORTAL_GENERATION_INCOMPLETE')
+        css_signature = signatures.pop('portal.css')
+        css = rs._read(fd, 'portal.css', device, caps['portal.css'], sizes['portal.css'])
+        core = portal._v5_core_signatures(fd, device, published)
+        try:
+            index, expected_css, pages, receipt = portal._render_v5(published, marker)
+        except rs.StoreError as exc:
+            if exc.code == 'PORTAL_PAYLOAD_SIZE_LIMIT':
+                raise CapacityError('CATALOG_CAPACITY') from None
+            raise
+        rs.require(current == index and css == expected_css, 'PORTAL_OUTPUT_COLLISION')
+        portal._generation(gen, device, pages, receipt, complete=True,
+                           signatures=signatures, caps=caps)
+        rs.require(portal._v5_core_signatures(fd, device, published) == core,
+                   'ARTIFACT_CHANGED')
+        # Reuse the original complete immutable core/frozen-scope check,
+        # without a second Store.open or a new assessment/projection.
+        journal_raw = rs._read(fd, 'journal.json', device, rs.MAX_MANIFEST)
+        journal = rs._journal(rs._unseal(journal_raw, rs.MAX_MANIFEST),
+                              published.manifest['run_id'])
+        rs._read_publication(fd, device, published.manifest, published.manifest['run_id'],
+                             frozen_scope=journal['scope'], verified=published)
+        rs.require(portal._v5_core_signatures(fd, device, published) == core,
+                   'ARTIFACT_CHANGED')
+        _same_entry(fd, portal._V5_GENERATION, gen)
+        rs.require(portal._index_stat(fd, device) == index_signature and
+                   rs._read(fd, HTML, device, caps['index.html'], index_size) == index and
+                   portal._index_stat(fd, device) == index_signature and
+                   portal._file_signature(fd, 'portal.css', device) == css_signature and
+                   rs._read(fd, 'portal.css', device, caps['portal.css'], sizes['portal.css']) == css and
+                   portal._file_signature(fd, 'portal.css', device) == css_signature,
+                   'ARTIFACT_CHANGED')
+        # Identity and closed set still match at the end of all verification.
+        rs._check_dir(gen, device)
+        rs.require(set(rs._entries(gen, len(expected))) == expected and
+                   all(portal._file_signature(gen, name, device) == signatures[name]
+                       for name in expected), 'ARTIFACT_CHANGED')
+        _same_entry(fd, portal._V5_GENERATION, gen)
+    return 'AVAILABLE', portal._V5_GENERATION
+
+
 def _portal_status(fd, device, published, marker, budget):
     has_index = rs._exists(fd, HTML)
     has_css = rs._exists(fd, 'portal.css')
     has_v2 = rs._exists(fd, portal._GENERATION)
     has_v3 = rs._exists(fd, portal._HISTORY_GENERATION)
     has_v4 = rs._exists(fd, portal._CRYPTO_GENERATION)
-    if not (has_index or has_css or has_v2 or has_v3 or has_v4):
+    has_v5 = rs._exists(fd, portal._V5_GENERATION)
+    if not (has_index or has_css or has_v2 or has_v3 or has_v4 or has_v5):
         return 'NOT_GENERATED', None
     try:
         index_size = budget.file(fd, HTML, device, portal._MAX_HTML) if has_index else None
+        if has_v5 and has_index:
+            index_signature = portal._index_stat(fd, device)
+            current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
+            rs.require(portal._index_stat(fd, device) == index_signature, 'ARTIFACT_CHANGED')
+            if current.startswith(portal._V5_MARKER):
+                return _v5_portal_status(fd, device, published, marker, budget, current,
+                                         index_signature, index_size, has_css)
         css_size = budget.file(fd, 'portal.css', device, portal._MAX_CSS) if has_css else None
         rs.require(has_index and has_css, 'PORTAL_GENERATION_INCOMPLETE')
         index_signature = portal._index_stat(fd, device)
         css_signature = portal._file_signature(fd, 'portal.css', device)
         current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
         css = rs._read(fd, 'portal.css', device, portal._MAX_CSS, css_size)
+        if current.startswith(portal._V5_MARKER):
+            # Missing active generation (or a concurrent marker change).
+            # Never classify a V5 marker as legacy.
+            raise rs.StoreError('PORTAL_GENERATION_INCOMPLETE')
         crypto = current.startswith(portal._CRYPTO_MARKER)
         history = current.startswith(portal._HISTORY_MARKER)
         try:
@@ -189,8 +274,8 @@ def _portal_status(fd, device, published, marker, budget):
         return 'INVALID', None
 
 
-def _core_slot(key, kind):
-    parts, cap = rs._slot(*key)
+def _core_slot(key, kind, *, producer_v2=False):
+    parts, cap = rs._slot(*key, producer_v2=producer_v2)
     if key[0] == 'cff':
         cap = min(cap, rs.MAX_CFF)
         if kind == 'LEGACY_IMPORT':
@@ -198,6 +283,69 @@ def _core_slot(key, kind):
             from tools import cff
             cap = min(cap, cff.MAX_BYTES)
     return parts, cap
+
+
+def _c1_entry_metadata(header, entries):
+    """Closed C1 metadata on the original Store-admitted scope and slots.
+
+    No extra producer grammar or V3 selector is introduced. The actual
+    Store still proves all payload semantics and cross-document membership.
+    """
+    required = {(x['host_id'], x['slot']) for x in header['requirements']['details']}
+    rules = entries.get((rs._PRODUCER_RULES_KIND, None, None))
+    rs.require(rules is not None and ('evidence', None, None) in entries and
+               rules['sha256'] == header['producer_rules_sha256'], 'INVALID_SLOT')
+    for key, row in entries.items():
+        kind, hid, slot = key
+        rs.require(kind in ('evidence', 'assessed', 'rules', 'batch', 'detail',
+                            rs._PRODUCER_RULES_KIND), 'INVALID_SLOT')
+        version = (header['evidence_schema_version'] if kind in ('evidence', 'assessed') else
+                   header['rule_version'] if kind == 'rules' else
+                   header['producer_rules_version'] if kind == rs._PRODUCER_RULES_KIND else rs.VERSION)
+        rs.require(type(version) is str and row['format_version'] == version and
+                   row['required'] is (kind != 'detail' or (hid, slot) in required), 'INVALID_SLOT')
+        if kind == 'detail':
+            rs.require((hid, slot) in required, 'INVALID_DETAIL_REQUIREMENT')
+        for field, ref_kind in (('collection_ids', 'collection'), ('asset_ids', 'asset'),
+                                ('evidence_ids', 'evidence')):
+            refs = row[field]
+            rs.require(type(refs) is list and (kind == 'detail' or not refs), 'INVALID_REFS')
+            for ref in refs:
+                rs._id(ref, ref_kind)
+            rs.require(refs == sorted(set(refs)), 'INVALID_REFS')
+    rs.require((('assessed', None, None) in entries) == (('rules', None, None) in entries),
+               'MISSING_ASSESSMENT_PAIR')
+    if ('rules', None, None) in entries:
+        rs.require(entries['rules', None, None]['sha256'] == rules['sha256'] and
+                   header['rule_version'] == header['producer_rules_version'], 'INVALID_SLOT')
+
+
+def _declared_c1_capacity(header, rid):
+    """A C1 size diagnostic only, after the real scope/slot grammar admits it.
+
+    C1 has at most ten hosts and its exact required detail set. Do not split
+    that producer scope or admit invalid host/slot counts through a marker.
+    Probe with only admitted size fields normalized; never read or publish
+    from the probe. Invalid C1 structure is not positive capacity evidence.
+    """
+    rs._keys(header, rs.MANIFEST_KEYS + ' ' + rs._PRODUCER_SCOPE_FIELDS)
+    rs.require(header['manifest_version'] == '1.0.0', 'UNSUPPORTED_MANIFEST_VERSION')
+    rows = header['artifacts']
+    rs.require(type(rows) is list and 0 < len(rows) <= rs.MAX_SLOTS, 'SLOT_LIMIT')
+    for row in rows:
+        rs._keys(row, rs.ENTRY_KEYS)
+        rs.require(type(row['size']) is int and row['size'] > 0, 'INVALID_INTEGER')
+    # Reuse the entire original C1 scope, including closed flags and exact
+    # requirements, for the diagnostic. The probe changes sizes only.
+    scope, _, admitted = rs._manifest_header(
+        {**header, 'artifacts': [{**row, 'size': 1} for row in rows]}, rid)
+    rs.require(rs._is_producer_v2(scope), 'BATCH_CONTRACT')
+    entries = {(row['kind'], row['host_id'], row['slot']): row for row in rows}
+    rs.require(entries.keys() == admitted.keys(), 'INVALID_SLOT')
+    _c1_entry_metadata(header, entries)
+    return (any(row['size'] > _core_slot(key, header['run_kind'], producer_v2=True)[1]
+                for key, row in entries.items()) or
+            sum(row['size'] for row in rows) > rs.MAX_CORE)
 
 
 def _declared_capacity(header, rid):
@@ -208,6 +356,8 @@ def _declared_capacity(header, rid):
     the actual Store header/scope validators for all other scope constraints;
     no projected header is passed to open(), used for a row, or written.
     """
+    if type(header) is dict and rs._is_producer_v2(header):
+        return _declared_c1_capacity(header, rid)
     rs._keys(header, rs.MANIFEST_KEYS)
     rs.require(header['manifest_version'] == rs.VERSION and
                header['publication_state'] == 'PUBLISHED' and header['run_id'] == rid,
@@ -297,8 +447,12 @@ def _declared_capacity(header, rid):
 
 
 def _admitted_entries(header, rid):
+    # Public Catalog admission stays on manifest 1.0.0 even if a separate
+    # private Store implementation learns a later producer contract.
+    if type(header) is dict and 'manifest_version' in header:
+        rs.require(header['manifest_version'] == '1.0.0', 'UNSUPPORTED_MANIFEST_VERSION')
     try:
-        _, _, entries = rs._manifest_header(header, rid)
+        scope, _, entries = rs._manifest_header(header, rid)
     except rs.StoreError as exc:
         if exc.code in ('INVALID_INTEGER', 'HOST_LIMIT', 'SLOT_LIMIT', 'CORE_SIZE_LIMIT'):
             try:
@@ -310,7 +464,10 @@ def _admitted_entries(header, rid):
     # A CFF declaration can fit the generic Store header limit but exceed the
     # stricter actual projection byte limit. Apply the same typed proof, not
     # the ambiguous CFF_PROJECTION_LIMIT from later content validation.
-    if any(row['size'] > _core_slot(key, header['run_kind'])[1]
+    producer_v2 = rs._is_producer_v2(scope)
+    if producer_v2:
+        _c1_entry_metadata(header, entries)
+    if any(row['size'] > _core_slot(key, header['run_kind'], producer_v2=producer_v2)[1]
            for key, row in entries.items()):
         _capacity_if(_declared_capacity(header, rid))
         raise rs.StoreError('INVALID_SLOT')
@@ -320,8 +477,10 @@ def _admitted_entries(header, rid):
 def _admit_core(fd, device, header, entries):
     # Stat only: indexed declarations have already been charged once.
     total, invalid = 0, None
+    # entries comes only from _admitted_entries / the real manifest header.
+    producer_v2 = rs._is_producer_v2(header)
     for key, row in entries.items():
-        parts, cap = _core_slot(key, header['run_kind'])
+        parts, cap = _core_slot(key, header['run_kind'], producer_v2=producer_v2)
         _capacity_if(row['size'] > cap)
         try:
             with rs._directory(fd, parts[:-1], device) as parent:
@@ -476,7 +635,7 @@ def _validate_row(row):
     rs._int(row['missing_artifact_count'], 0, rs.MAX_SLOTS)
     rs.require(rs._match(row['manifest_sha256'], rs.HEX), 'INVALID_CATALOG')
     if pstatus == 'AVAILABLE':
-        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3', 'portal-v4'))
+        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3', 'portal-v4', 'portal-v5'))
         rs.require(row['href'] == rid + '/index.html' and row['reason_code'] == 'PUBLISHED', 'INVALID_CATALOG')
     else:
         rs.require(pstatus in ('NOT_GENERATED', 'INVALID') and row['portal_generation'] is None and
