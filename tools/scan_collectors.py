@@ -1343,6 +1343,16 @@ def validate_bindings(manifest, doc, companions, projections):
     serialized manifest. The final document/companions must preserve their rows.
     """
     evidence.validate_document(doc)
+    return _bind_validated(manifest, doc, companions, projections)
+
+
+def _validate_v3_bindings(manifest, doc, companions, projections):
+    """Fixed private Store V3 path; never selected by a wire field or caller cap."""
+    evidence._validate_v3_raw(doc)
+    return _bind_validated(manifest, doc, companions, projections)
+
+
+def _bind_validated(manifest, doc, companions, projections):
     require(doc['schema_version'] == '1.1.0' and doc['run']['run_state'] == manifest['run_state']
             and not doc['claims'] and not doc['findings'])
     rid = doc['run']['run_id']

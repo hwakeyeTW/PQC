@@ -1,0 +1,1713 @@
+{
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "evidence"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "evidence.json"
+              },
+              "size": {
+                "maximum": 67108864
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "assessed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "assessed_evidence.json"
+              },
+              "size": {
+                "maximum": 100663296
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "rules"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "assessment_rules.json"
+              },
+              "size": {
+                "maximum": 65536
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "batch"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "batch_manifest.json"
+              },
+              "size": {
+                "maximum": 16777216
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cff"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "cff_projection.json"
+              },
+              "size": {
+                "maximum": 134217728
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "producer-rules"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "const": null
+              },
+              "path": {
+                "const": "producer_rules.json"
+              },
+              "size": {
+                "maximum": 65536
+              },
+              "slot": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "detail"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "host_id": {
+                "maxLength": 66,
+                "minLength": 1,
+                "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+                "type": "string"
+              },
+              "slot": {
+                "enum": [
+                  "producer-handoff-v2",
+                  "platform-v2",
+                  "certificate-assets-v1",
+                  "openssl-runtime-v2",
+                  "crypto-policy-v2",
+                  "ssh-posture-v2"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "producer-handoff-v2"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 1048576
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "platform-v2"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 1048576
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "certificate-assets-v1"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 2097152
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "openssl-runtime-v2"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 1048576
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "crypto-policy-v2"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 1048576
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "const": "ssh-posture-v2"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "size": {
+                "maximum": 2097152
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "asset_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:a-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "evidence_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:e-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "format_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "host_id": {
+          "anyOf": [
+            {
+              "maxLength": 66,
+              "minLength": 1,
+              "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "evidence",
+            "assessed",
+            "rules",
+            "batch",
+            "cff",
+            "producer-rules",
+            "detail"
+          ]
+        },
+        "path": {
+          "maxLength": 150,
+          "pattern": "^(?:evidence\\.json|assessed_evidence\\.json|assessment_rules\\.json|batch_manifest\\.json|cff_projection\\.json|producer_rules\\.json|details/h-[0-9a-f]{64}/(?:producer-handoff-v2|platform-v2|certificate-assets-v1|openssl-runtime-v2|crypto-policy-v2|ssh-posture-v2)\\.json)$(?![\\s\\S])",
+          "type": "string"
+        },
+        "required": {
+          "const": true
+        },
+        "sha256": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 134217728,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "slot": {
+          "anyOf": [
+            {
+              "enum": [
+                "producer-handoff-v2",
+                "platform-v2",
+                "certificate-assets-v1",
+                "openssl-runtime-v2",
+                "crypto-policy-v2",
+                "ssh-posture-v2"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "format_version",
+        "host_id",
+        "slot",
+        "path",
+        "size",
+        "sha256",
+        "required",
+        "collection_ids",
+        "asset_ids",
+        "evidence_ids"
+      ],
+      "type": "object"
+    },
+    "collector_flags": {
+      "additionalProperties": false,
+      "properties": {
+        "crypto_policy": {
+          "type": "boolean"
+        },
+        "nginx_certs": {
+          "const": false
+        },
+        "openssl": {
+          "type": "boolean"
+        },
+        "packages": {
+          "type": "boolean"
+        },
+        "ssh_host_keys": {
+          "type": "boolean"
+        },
+        "sshd": {
+          "type": "boolean"
+        },
+        "system_certs": {
+          "type": "boolean"
+        },
+        "tls_services": {
+          "const": false
+        }
+      },
+      "required": [
+        "packages",
+        "openssl",
+        "sshd",
+        "ssh_host_keys",
+        "system_certs",
+        "crypto_policy",
+        "nginx_certs",
+        "tls_services"
+      ],
+      "type": "object"
+    },
+    "collector_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 20000,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "packages",
+            "openssl",
+            "sshd",
+            "ssh_host_keys",
+            "system_certs",
+            "crypto_policy",
+            "nginx_certs",
+            "tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "detail_requirement": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "maxLength": 66,
+          "minLength": 1,
+          "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "slot": {
+          "enum": [
+            "producer-handoff-v2",
+            "platform-v2",
+            "certificate-assets-v1",
+            "openssl-runtime-v2",
+            "crypto-policy-v2",
+            "ssh-posture-v2"
+          ]
+        }
+      },
+      "required": [
+        "host_id",
+        "slot"
+      ],
+      "type": "object"
+    },
+    "host": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_status": {
+          "enum": [
+            "ATTEMPTED",
+            "NOT_ATTEMPTED",
+            "UNKNOWN"
+          ]
+        },
+        "attempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checkpoint_recorded_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "maxLength": 40,
+              "minLength": 1,
+              "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dispatch_intent": {
+          "type": "boolean"
+        },
+        "dispatch_intent_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "maxLength": 40,
+              "minLength": 1,
+              "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "maxLength": 66,
+          "minLength": 1,
+          "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "identity_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "identity_scope": {
+          "const": "RUN_SCOPED"
+        },
+        "inventory_authority_id": {
+          "const": null
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/v3_terminal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "host_id",
+        "target_id",
+        "identity_scope",
+        "inventory_authority_id",
+        "identity_key",
+        "host_state",
+        "reason_code",
+        "attempted",
+        "dispatch_intent",
+        "attempt_status",
+        "terminal",
+        "dispatch_intent_at",
+        "checkpoint_recorded_at"
+      ],
+      "type": "object"
+    },
+    "limits": {
+      "additionalProperties": false,
+      "properties": {
+        "command_timeout_s": {
+          "const": 30
+        },
+        "forks": {
+          "maximum": 2,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_hosts": {
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "serial": {
+          "const": 2
+        },
+        "ssh_timeout_s": {
+          "const": 15
+        }
+      },
+      "required": [
+        "max_hosts",
+        "forks",
+        "serial",
+        "ssh_timeout_s",
+        "command_timeout_s"
+      ],
+      "type": "object"
+    },
+    "missing": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 150,
+          "pattern": "^(?:evidence\\.json|assessed_evidence\\.json|assessment_rules\\.json|batch_manifest\\.json|cff_projection\\.json|producer_rules\\.json|details/h-[0-9a-f]{64}/(?:producer-handoff-v2|platform-v2|certificate-assets-v1|openssl-runtime-v2|crypto-policy-v2|ssh-posture-v2)\\.json)$(?![\\s\\S])",
+          "type": "string"
+        },
+        "reason_code": {
+          "enum": [
+            "BATCH_MANIFEST_UNAVAILABLE",
+            "REQUIRED_ARTIFACT_MISSING",
+            "REQUIRED_DETAIL_MISSING"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "reason_code"
+      ],
+      "type": "object"
+    },
+    "native_collector_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "pqc_collect_packages",
+            "pqc_collect_openssl",
+            "pqc_collect_sshd",
+            "pqc_collect_ssh_host_keys",
+            "pqc_collect_system_certs",
+            "pqc_collect_crypto_policy",
+            "pqc_collect_nginx_certs",
+            "pqc_collect_tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "native_terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/native_collector_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors"
+      ],
+      "type": "object"
+    },
+    "requirements": {
+      "additionalProperties": false,
+      "properties": {
+        "assessment": {
+          "const": true
+        },
+        "cff": {
+          "const": true
+        },
+        "details": {
+          "items": {
+            "$ref": "#/$defs/detail_requirement"
+          },
+          "maxItems": 60,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "assessment",
+        "cff",
+        "details"
+      ],
+      "type": "object"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "input_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "producer_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "producer_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_kind": {
+          "enum": [
+            "NATIVE_COLLECTOR",
+            "LEGACY_IMPORT",
+            "SYNTHETIC"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_kind",
+        "producer_id",
+        "producer_version",
+        "origin_ref",
+        "input_sha256"
+      ],
+      "type": "object"
+    },
+    "terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/collector_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors"
+      ],
+      "type": "object"
+    },
+    "v3_outcome": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_packages"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_openssl"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 261
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_crypto_policy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 9
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_sshd"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 8
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_ssh_host_keys"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_system_certs"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 3
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_nginx_certs"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "collector_id": {
+                "const": "pqc_collect_tls_services"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "collection_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 261,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "enum": [
+            "pqc_collect_packages",
+            "pqc_collect_openssl",
+            "pqc_collect_sshd",
+            "pqc_collect_ssh_host_keys",
+            "pqc_collect_system_certs",
+            "pqc_collect_crypto_policy",
+            "pqc_collect_nginx_certs",
+            "pqc_collect_tls_services"
+          ],
+          "type": "string"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "v3_platform_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_ids": {
+          "items": {
+            "maxLength": 66,
+            "minLength": 1,
+            "pattern": "^(?:c-[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collector_id": {
+          "const": "pqc-platform"
+        },
+        "rc": {
+          "anyOf": [
+            {
+              "maximum": 255,
+              "minimum": -255,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "requested": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "COLLECTED",
+            "PARTIAL",
+            "UNKNOWN",
+            "NOT_SCANNED",
+            "NOT_APPLICABLE",
+            "PERMISSION_DENIED",
+            "ERROR",
+            "UNREACHABLE"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "collector_id",
+        "requested",
+        "state",
+        "reason_code",
+        "rc",
+        "collection_ids"
+      ],
+      "type": "object"
+    },
+    "v3_terminal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "collectors": {
+          "items": {
+            "$ref": "#/$defs/v3_outcome"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "host_state": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "ERROR",
+            "UNREACHABLE",
+            "NOT_ATTEMPTED"
+          ],
+          "type": "string"
+        },
+        "platform": {
+          "$ref": "#/$defs/v3_platform_outcome"
+        },
+        "reason_code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9_:][A-Za-z0-9_.:@+-]{0,511})$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_id",
+        "host_state",
+        "attempted",
+        "reason_code",
+        "collectors",
+        "platform"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:pqc:run-manifest:1.1.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "batch_canonical_sha256": {
+            "const": null
+          },
+          "batch_missing_reason": {
+            "const": "BATCH_MANIFEST_UNAVAILABLE"
+          },
+          "batch_rc": {
+            "const": null
+          },
+          "finished_at": {
+            "const": null
+          },
+          "recovered_at": {
+            "format": "date-time",
+            "maxLength": 40,
+            "minLength": 1,
+            "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+            "type": "string"
+          },
+          "rule_version": {
+            "const": null
+          },
+          "rules_sha256": {
+            "const": null
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "recovery": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "batch_canonical_sha256": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "batch_missing_reason": {
+            "const": null
+          },
+          "batch_rc": {
+            "enum": [
+              0,
+              5,
+              6,
+              7
+            ],
+            "type": "integer"
+          },
+          "finished_at": {
+            "format": "date-time",
+            "maxLength": 40,
+            "minLength": 1,
+            "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+            "type": "string"
+          },
+          "hosts": {
+            "items": {
+              "properties": {
+                "attempted": {
+                  "type": "boolean"
+                },
+                "checkpoint_recorded_at": {
+                  "format": "date-time",
+                  "maxLength": 40,
+                  "minLength": 1,
+                  "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+                  "type": "string"
+                },
+                "terminal": {
+                  "$ref": "#/$defs/v3_terminal"
+                }
+              }
+            }
+          },
+          "recovered_at": {
+            "const": null
+          },
+          "rule_version": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+            "type": "string"
+          },
+          "rules_sha256": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "description": "Local closed shape; Run Store also validates hashes, references, ownership, exact counts and publication state.",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "maxItems": 66,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "batch_canonical_sha256": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_contract": {
+      "const": "B04_PRODUCER_V3"
+    },
+    "batch_missing_reason": {
+      "anyOf": [
+        {
+          "const": "BATCH_MANIFEST_UNAVAILABLE"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_rc": {
+      "anyOf": [
+        {
+          "enum": [
+            0,
+            5,
+            6,
+            7
+          ],
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "capacity_profile": {
+      "const": "B04_V3_CAPACITY_R2"
+    },
+    "counts": {
+      "additionalProperties": false,
+      "properties": {
+        "COMPLETE": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ERROR": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "NOT_ATTEMPTED": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "PARTIAL": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "UNREACHABLE": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "COMPLETE",
+        "PARTIAL",
+        "ERROR",
+        "UNREACHABLE",
+        "NOT_ATTEMPTED"
+      ],
+      "type": "object"
+    },
+    "evidence_schema_version": {
+      "const": "1.1.0"
+    },
+    "expected_host_ids": {
+      "items": {
+        "maxLength": 66,
+        "minLength": 1,
+        "pattern": "^(?:h-[0-9a-f]{64})$(?![\\s\\S])",
+        "type": "string"
+      },
+      "maxItems": 10,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "finished_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "flags": {
+      "additionalProperties": false,
+      "maxProperties": 10,
+      "patternProperties": {
+        "^(?:h-[0-9a-f]{64})$(?![\\s\\S])": {
+          "$ref": "#/$defs/collector_flags"
+        }
+      },
+      "type": "object"
+    },
+    "hosts": {
+      "items": {
+        "$ref": "#/$defs/host"
+      },
+      "maxItems": 10,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    },
+    "manifest_version": {
+      "const": "1.1.0"
+    },
+    "missing_artifacts": {
+      "items": {
+        "$ref": "#/$defs/missing"
+      },
+      "maxItems": 64,
+      "minItems": 0,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "producer_rules_sha256": {
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "producer_rules_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "profile": {
+      "enum": [
+        "baseline",
+        "extended"
+      ]
+    },
+    "publication_state": {
+      "const": "PUBLISHED"
+    },
+    "reason_code": {
+      "maxLength": 96,
+      "minLength": 1,
+      "pattern": "^(?:[A-Z][A-Z0-9_]{0,95})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "recorded_at": {
+      "format": "date-time",
+      "maxLength": 40,
+      "minLength": 1,
+      "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+      "type": "string"
+    },
+    "recovered_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recovery": {
+      "type": "boolean"
+    },
+    "requirements": {
+      "$ref": "#/$defs/requirements"
+    },
+    "reserved_at": {
+      "format": "date-time",
+      "maxLength": 40,
+      "minLength": 1,
+      "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+      "type": "string"
+    },
+    "rule_version": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.+-]{0,127})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rules_sha256": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?:[0-9a-f]{64})$(?![\\s\\S])",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "run_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "not": {
+        "pattern": "^(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])$(?![\\s\\S])"
+      },
+      "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,63})$(?![\\s\\S])",
+      "type": "string"
+    },
+    "run_kind": {
+      "const": "SYNTHETIC"
+    },
+    "run_state": {
+      "enum": [
+        "COMPLETE",
+        "PARTIAL",
+        "ERROR"
+      ],
+      "type": "string"
+    },
+    "source": {
+      "const": {
+        "input_sha256": null,
+        "origin_ref": "i1a-synthetic",
+        "producer_id": "pqc-producer-bridge",
+        "producer_version": "1.0.0",
+        "source_kind": "SYNTHETIC"
+      }
+    },
+    "started_at": {
+      "format": "date-time",
+      "maxLength": 40,
+      "minLength": 1,
+      "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|\\+00:00))$(?![\\s\\S])",
+      "type": "string"
+    }
+  },
+  "required": [
+    "manifest_version",
+    "publication_state",
+    "run_id",
+    "run_kind",
+    "run_state",
+    "reason_code",
+    "recovery",
+    "source",
+    "started_at",
+    "finished_at",
+    "recorded_at",
+    "expected_host_ids",
+    "hosts",
+    "counts",
+    "limits",
+    "profile",
+    "flags",
+    "requirements",
+    "evidence_schema_version",
+    "rule_version",
+    "rules_sha256",
+    "batch_rc",
+    "batch_contract",
+    "batch_canonical_sha256",
+    "batch_missing_reason",
+    "artifacts",
+    "missing_artifacts",
+    "capacity_profile",
+    "reserved_at",
+    "recovered_at",
+    "producer_rules_sha256",
+    "producer_rules_version"
+  ],
+  "title": "PQC private five-producer V3 Run Store manifest",
+  "type": "object"
+}
