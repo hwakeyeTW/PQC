@@ -208,3 +208,40 @@ Fixed invalid/size-limit errors return no partial result. Focused engineering
 uses real Store publications, an independent fixed M byte oracle, actual
 links/fragments/metadata, pair binding faults and exact/+1 streaming caps.
 Formal file://, full-load and production environment QA remain #28.
+
+## C-B2b-2 private reverse pivots and crypto navigation
+
+The exact bool `reverse_pivots=True` requires the complete private V5 buffer
+path with `navigation=True`. Omitting it or passing False retains the fixed
+F modes, bytes and errors. Algorithms and Libraries share the seven Run
+sections, preserving existing breadcrumbs, anchors and cross-index links.
+Only those two pages and host pages with new recorded backlinks may change.
+Root, Hosts, the B1 asset/summary pages, CSS, JSON, CSV and CBOM/provenance
+pairs retain their bytes. No new files, publication marker or receipt exist.
+
+The assembler reuses the actual crypto, asset and summary projections and
+verified publication. A private render-only inverted index checks their
+run/host/record identity, ownership and explicit membership. Certificate and
+service pivots use exact shared evidence IDs, consistent with C2 algorithm
+links; library pivots independently use shared evidence IDs. Occurrence
+pivots require the matching recorded role evidence, not all occurrences of
+that fingerprint. Saved Finding pivots use explicit claim/evidence references
+or an exact subject asset ID. Collection pivots identify the member evidence
+and its recorded collection. Host coverage is host coverage, not a group
+coverage verdict. Host collection and Finding rows link back to precisely
+those crypto groups; existing B1 host/evidence/claim links provide the return
+path. Unresolved or missing references do not imply a match, use or readiness.
+Neither same host, same name, same fingerprint nor transitive relations imply
+membership. No additional assessment, Store open or CBOM validation occurs.
+
+The render-only index charges input memberships, candidate visits, accepted
+references, edges and backlinks before retaining them, under the existing
+32 MiB / 66 membership limit. Rows are deterministic and deduplicated; no
+caller-selected URLs, raw diagnostics or new serialized fields are retained.
+The original HTML/bundle limits apply before each encoded chunk extension.
+Invalid or oversized private assembly returns the fixed invalid/size-limit
+error, never partial output. Focused tests use actual synthetic Store runs,
+fixed F and prior M/K oracles, precise reverse href/fragment checks, recorded
+occurrence subsets, binding defects and exact/+1 capacity boundaries. Formal
+browser, filesystem, target OS and full-load acceptance remain #28; C-C still
+owns activation and publication.

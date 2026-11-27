@@ -458,7 +458,7 @@ def _v5_download_context(downloads, rid, ids, raw):
     return batch, pairs
 
 
-def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_limit, json_limit, downloads=None):
+def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_limit, json_limit, downloads=None, reverse_inputs=None):
     """Fixed private root/nested buffers, no receipt, marker, or publication.
 
     Only the trusted assembler supplies the existing verified projection and
@@ -492,8 +492,16 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
                 downloads, v['run']['run_id'], published.manifest['expected_host_ids'], raw)
         else:
             batch_downloads, host_downloads = (), {}
+        pivots = None
+        if reverse_inputs is not None:
+            run_store.require(navigation and type(reverse_inputs) is tuple and len(reverse_inputs) == 2,
+                              'PORTAL_PAYLOAD_INVALID')
+            pivots = indexes._reverse_pivot_context(published, projection, *reverse_inputs)
+            run_store.require(pivots.run_id == v['run']['run_id'] and
+                              pivots.expected_hosts == tuple(published.manifest['expected_host_ids']),
+                              'PORTAL_PAYLOAD_INVALID')
         crypto_pages = indexes._render_crypto_projection(projection, page_limit=page_cap,
-                                                       total_limit=min(html, remaining))
+                                                       total_limit=min(html, remaining), pivots=pivots)
         run_store.require(set(crypto_pages) == set(_CRYPTO_PAGES), 'INVALID_CRYPTO_INDEX_PUBLICATION')
         for name in _CRYPTO_PAGES:
             raw = crypto_pages[name]
@@ -524,7 +532,8 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
         for host in views:
             pages[host['host_id'] + '.html'] = page('host.html.j2', nested=True, host=host,
                 batch_downloads=batch_downloads,
-                host_downloads=host_downloads[host['host_id']] if navigation else ())
+                host_downloads=host_downloads[host['host_id']] if navigation else (),
+                reverse_backlinks=pivots.host_links.get(host['host_id'], {}) if pivots is not None else {})
         return index, css, pages
     except (OSError, TemplateError, UnicodeError):
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None

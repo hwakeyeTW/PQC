@@ -134,8 +134,9 @@ class _Buffers:
         self.cbom += size
 
 
-def _assemble(published, *, portal_v5=False, complete=False, navigation=False):
-    _require(type(navigation) is bool and (not navigation or complete)
+def _assemble(published, *, portal_v5=False, complete=False, navigation=False, reverse_pivots=False):
+    _require(type(reverse_pivots) is bool and (not reverse_pivots or navigation)
+             and type(navigation) is bool and (not navigation or complete)
              and type(portal_v5) is bool and type(complete) is bool and (not complete or portal_v5)
              and type(published) is run_store.PublishedRun)
     m, doc, _, _ = published
@@ -201,7 +202,8 @@ def _assemble(published, *, portal_v5=False, complete=False, navigation=False):
                      if navigation else None)
         index, css, core = render_portal._render_v5_core(
             published, crypto, page_limit=_MAX_HTML, html_limit=_MAX_HTML_TOTAL - out.html,
-            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON, downloads=downloads)
+            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON, downloads=downloads,
+            reverse_inputs=(assets, summary) if reverse_pivots else None)
         core_html = {'hosts.html', 'algorithms.html', 'libraries.html'} | {hid + '.html' for hid in ids}
         _require(set(core) == core_html | {'crypto_indexes.json'} and not (set(core) & expected))
         out.add('portal.css', css, render_portal._MAX_CSS)
@@ -236,17 +238,19 @@ def _assemble_payload(published, *, portal_v5=False):
     return _checked_assemble(published, portal_v5=portal_v5)
 
 
-def _assemble_v5_render_payload(published, *, navigation=False):
+def _assemble_v5_render_payload(published, *, navigation=False, reverse_pivots=False):
     """Internal complete render buffers for a pinned verified publication.
 
     No generation marker, receipt, catalog operation or file write.
     """
-    return _checked_assemble(published, portal_v5=True, complete=True, navigation=navigation)
+    return _checked_assemble(published, portal_v5=True, complete=True, navigation=navigation,
+                             reverse_pivots=reverse_pivots)
 
 
-def _checked_assemble(published, *, portal_v5, complete=False, navigation=False):
+def _checked_assemble(published, *, portal_v5, complete=False, navigation=False, reverse_pivots=False):
     try:
-        return _assemble(published, portal_v5=portal_v5, complete=complete, navigation=navigation)
+        return _assemble(published, portal_v5=portal_v5, complete=complete, navigation=navigation,
+                         reverse_pivots=reverse_pivots)
     except (run_store.StoreError, cbom_generation.CBOMGenerationError) as exc:
         if exc.code in ('PORTAL_PAYLOAD_SIZE_LIMIT', 'SUMMARY_SIZE_LIMIT', 'ASSET_INDEX_SIZE_LIMIT',
                         'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT', 'PORTAL_SIZE_LIMIT'):
