@@ -134,8 +134,10 @@ class _Buffers:
         self.cbom += size
 
 
-def _assemble(published, *, portal_v5=False, complete=False, navigation=False, reverse_pivots=False):
-    _require(type(reverse_pivots) is bool and (not reverse_pivots or navigation)
+def _assemble(published, *, portal_v5=False, complete=False, navigation=False, reverse_pivots=False,
+              portal_v6=False):
+    _require(type(portal_v6) is bool and (not portal_v6 or (portal_v5 and complete and
+             navigation and reverse_pivots)) and type(reverse_pivots) is bool and (not reverse_pivots or navigation)
              and type(navigation) is bool and (not navigation or complete)
              and type(portal_v5) is bool and type(complete) is bool and (not complete or portal_v5)
              and type(published) is run_store.PublishedRun)
@@ -200,10 +202,16 @@ def _assemble(published, *, portal_v5=False, complete=False, navigation=False, r
     if complete:
         downloads = (_download_metadata(published, out.files, batch.evidence_sha256)
                      if navigation else None)
+        # Reserve the fixed root marker before rendering V6 buffers; V1-V5
+        # retain their exact existing accounting and template context.
+        marker_size = len(render_portal._V6_MARKER) if portal_v6 else 0
+        mode = {'portal_v6': True} if portal_v6 else {}
+        page_cap = min(_MAX_HTML, render_portal._MAX_HTML) if portal_v6 else _MAX_HTML
+        html_cap = min(_MAX_HTML_TOTAL, render_portal._MAX_TOTAL_HTML) if portal_v6 else _MAX_HTML_TOTAL
         index, css, core = render_portal._render_v5_core(
-            published, crypto, page_limit=_MAX_HTML, html_limit=_MAX_HTML_TOTAL - out.html,
-            bundle_limit=_MAX_BUNDLE - out.total, json_limit=_MAX_JSON, downloads=downloads,
-            reverse_inputs=(assets, summary) if reverse_pivots else None)
+            published, crypto, page_limit=page_cap, html_limit=html_cap - out.html - marker_size,
+            bundle_limit=_MAX_BUNDLE - out.total - marker_size, json_limit=_MAX_JSON, downloads=downloads,
+            reverse_inputs=(assets, summary) if reverse_pivots else None, **mode)
         core_html = {'hosts.html', 'algorithms.html', 'libraries.html'} | {hid + '.html' for hid in ids}
         _require(set(core) == core_html | {'crypto_indexes.json'} and not (set(core) & expected))
         out.add('portal.css', css, render_portal._MAX_CSS)
@@ -211,12 +219,26 @@ def _assemble(published, *, portal_v5=False, complete=False, navigation=False, r
         for name, raw in [('index.html', index)] + [(name, core[name]) for name in sorted(core_html)]:
             out.add(name, raw, min(_MAX_HTML, _MAX_HTML_TOTAL - out.html))
             out.html += len(raw)
+        if portal_v6:
+            # The same verified publication and already computed projections.
+            # Lazy fixed import avoids the assembler/search dependency cycle.
+            # The renderer charges the exact final receipt before publication.
+            from tools import portal_search
+            remaining_html = html_cap - out.html - marker_size
+            remaining_bundle = _MAX_BUNDLE - out.total - marker_size
+            raw = portal_search._render_search_page(
+                published, crypto, assets, summary, page_limit=page_cap,
+                html_limit=remaining_html, bundle_limit=remaining_bundle)
+            out.add('search.html', raw, min(page_cap, remaining_html, remaining_bundle))
+            out.html += len(raw)
+            expected.add('search.html')
         _require(set(out.files) == expected | set(core) | {'index.html', 'portal.css'})
         files = dict(sorted((name, raw) for name, raw in out.files.items()
                             if name not in ('index.html', 'portal.css')))
-        _require(len(files) == 13 + 3 * len(ids))
+        _require(len(files) == (14 if portal_v6 else 13) + 3 * len(ids))
+        prefix = 'portal-v6/' if portal_v6 else 'portal-v5/'
         entries = _entries({'index.html': index, 'portal.css': css,
-                            **{'portal-v5/' + name: raw for name, raw in files.items()}})
+                            **{prefix + name: raw for name, raw in files.items()}})
         return _RenderPayload(rid, index, css, files, entries)
     files = dict(sorted(out.files.items()))
     return _Payload(rid, files, _entries(files))
@@ -247,10 +269,17 @@ def _assemble_v5_render_payload(published, *, navigation=False, reverse_pivots=F
                              reverse_pivots=reverse_pivots)
 
 
-def _checked_assemble(published, *, portal_v5, complete=False, navigation=False, reverse_pivots=False):
+def _assemble_v6_render_payload(published):
+    """Fixed complete V6 buffers, only for the pinned publication path."""
+    return _checked_assemble(published, portal_v5=True, complete=True, navigation=True,
+                             reverse_pivots=True, portal_v6=True)
+
+
+def _checked_assemble(published, *, portal_v5, complete=False, navigation=False, reverse_pivots=False,
+                      portal_v6=False):
     try:
         return _assemble(published, portal_v5=portal_v5, complete=complete, navigation=navigation,
-                         reverse_pivots=reverse_pivots)
+                         reverse_pivots=reverse_pivots, portal_v6=portal_v6)
     except (run_store.StoreError, cbom_generation.CBOMGenerationError) as exc:
         if exc.code in ('PORTAL_PAYLOAD_SIZE_LIMIT', 'SUMMARY_SIZE_LIMIT', 'ASSET_INDEX_SIZE_LIMIT',
                         'CRYPTO_INDEX_SIZE_LIMIT', 'CBOM_SIZE_LIMIT', 'CBOM_MEMBERSHIP_LIMIT', 'PORTAL_SIZE_LIMIT'):
