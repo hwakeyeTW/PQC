@@ -5,6 +5,7 @@ The private Run Store remains the authority for publication and artifact links.
 """
 import argparse
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 import hashlib
 import os
 import re
@@ -26,6 +27,9 @@ _HISTORY_GENERATION = "portal-v3"
 _HISTORY_MARKER = b"<!-- PQC portal-v3 -->\n"
 _CRYPTO_GENERATION = "portal-v4"
 _CRYPTO_MARKER = b"<!-- PQC portal-v4 -->\n"
+_V5_GENERATION = "portal-v5"
+_V5_MARKER = b"<!-- PQC portal-v5 -->\n"
+_MAX_V5_RECEIPT = 1024 * 1024
 _CRYPTO_JSON = "crypto_indexes.json"
 _MAX_CRYPTO_JSON = evidence.MAX_BYTES
 _CRYPTO_PAGES = ("algorithms.html", "libraries.html")
@@ -539,6 +543,83 @@ def _render_v5_core(published, projection, *, page_limit, html_limit, bundle_lim
         raise run_store.StoreError('PORTAL_RENDER_ERROR') from None
 
 
+def _v5_layout(published):
+    """Fixed derived names and limits, never obtained from a receipt/path."""
+    from tools import portal_generation_c as assembler
+    ids = published.manifest['expected_host_ids']
+    run_store.require(type(ids) is list and 0 < len(ids) <= 1000,
+                      'PORTAL_PAYLOAD_INVALID')
+    for hid in ids:
+        run_store._id(hid)
+    run_store.require(ids == sorted(set(ids)), 'PORTAL_PAYLOAD_INVALID')
+    html = {'index.html', 'hosts.html', 'algorithms.html', 'libraries.html',
+            'certificates.html', 'services.html', 'findings.html', 'coverage.html',
+            *(hid + '.html' for hid in ids)}
+    json_names = {'crypto_indexes.json', 'asset_indexes.json', 'scan_summary.json'}
+    csv = {'summary.csv', 'algorithms.csv', 'certificates.csv'}
+    pairs = [(hid + '.cbom.json', hid + '.cbom.provenance.json') for hid in ids]
+    caps = {name: min(_MAX_HTML, assembler._MAX_HTML) for name in html}
+    caps.update({name: assembler._MAX_JSON for name in json_names})
+    caps.update({name: assembler._MAX_CSV for name in csv})
+    caps.update({name: assembler._MAX_CBOM_PAIR for pair in pairs for name in pair})
+    caps.update({'portal.css': _MAX_CSS, _RECEIPT: _MAX_V5_RECEIPT})
+    run_store.require(len(caps) == 16 + 3 * len(ids), 'PORTAL_PAYLOAD_INVALID')
+    return caps, html, csv, pairs
+
+
+def _v5_check_sizes(layout, sizes):
+    """Also accepts a partial admitted set; count each fixed slot once."""
+    from tools import portal_generation_c as assembler
+    caps, html, csv, pairs = layout
+    run_store.require(sizes.keys() <= caps.keys() and
+                      all(type(n) is int and n >= 0 for n in sizes.values()),
+                      'PORTAL_PAYLOAD_INVALID')
+    pair_sizes = [sum(sizes.get(name, 0) for name in pair) for pair in pairs]
+    run_store.require(all(n <= caps[name] for name, n in sizes.items()) and
+                      sum(sizes.get(name, 0) for name in html) <=
+                      min(_MAX_TOTAL_HTML, assembler._MAX_HTML_TOTAL) and
+                      sum(sizes.get(name, 0) for name in csv) <= assembler._MAX_CSV_TOTAL and
+                      all(n <= assembler._MAX_CBOM_PAIR for n in pair_sizes) and
+                      sum(pair_sizes) <= assembler._MAX_CBOM_TOTAL and
+                      sum(sizes.values()) <= assembler._MAX_BUNDLE,
+                      'PORTAL_PAYLOAD_SIZE_LIMIT')
+    run_store.require(all(n > 0 for n in sizes.values()), 'PORTAL_PAYLOAD_INVALID')
+
+
+def _render_v5(published, marker):
+    # The sole public V5 mode is the complete, navigable reverse-pivot
+    # payload. Import lazily: the assembler imports this renderer.
+    from tools import portal_generation_c as assembler
+    layout = _v5_layout(published)
+    full = assembler._assemble_v5_render_payload(published, navigation=True,
+                                                 reverse_pivots=True)
+    pages = full.files
+    run_store.require(full.run_id == published.manifest['run_id'] and
+                      set(pages) == set(layout[0]) - {'index.html', 'portal.css', _RECEIPT} and
+                      all(type(raw) is bytes and raw for raw in
+                          (full.index, full.css, *pages.values())), 'PORTAL_PAYLOAD_INVALID')
+    # Charge the marker before allocating the marked index. The original
+    # assembler has already bounded all private buffers. No full-bundle copy.
+    sizes = {name: len(raw) for name, raw in pages.items()}
+    sizes.update({'index.html': len(full.index) + len(_V5_MARKER), 'portal.css': len(full.css)})
+    _v5_check_sizes(layout, sizes)
+    index = _V5_MARKER + full.index
+    receipt_value = {'format': 5, 'run_id': full.run_id, 'manifest_sha256': _digest(marker),
+                     'index_sha256': _digest(index), 'css_sha256': _digest(full.css),
+                     'pages': [{'name': name, 'size': len(raw), 'sha256': _digest(raw)}
+                               for name, raw in sorted(pages.items())]}
+    try:
+        receipt = run_store._json_bytes(receipt_value, min(_MAX_V5_RECEIPT,
+                                        assembler._MAX_BUNDLE - sum(sizes.values())))
+    except run_store.StoreError as exc:
+        if exc.code == 'SIZE_LIMIT':
+            raise run_store.StoreError('PORTAL_PAYLOAD_SIZE_LIMIT') from None
+        raise
+    sizes[_RECEIPT] = len(receipt)
+    _v5_check_sizes(layout, sizes)
+    return index, full.css, pages, receipt
+
+
 def _digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
@@ -557,9 +638,12 @@ def _replace_v1_index(fd, device, old, new, signature, *, recheck=None):
     def check():
         if recheck is not None:
             recheck()
-        run_store.require(_index_stat(fd, device) == signature and
-                          run_store._read(fd, 'index.html', device, _MAX_HTML) == old and
-                          _index_stat(fd, device) == signature, 'PORTAL_OUTPUT_COLLISION')
+        if old is None:
+            run_store.require(not run_store._exists(fd, 'index.html'), 'PORTAL_OUTPUT_COLLISION')
+        else:
+            run_store.require(_index_stat(fd, device) == signature and
+                              run_store._read(fd, 'index.html', device, _MAX_HTML) == old and
+                              _index_stat(fd, device) == signature, 'PORTAL_OUTPUT_COLLISION')
     check()
     temp = '.portal-index-' + secrets.token_hex(16)
     out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW |
@@ -577,7 +661,10 @@ def _replace_v1_index(fd, device, old, new, signature, *, recheck=None):
         finally:
             os.close(out)
         check()
-        os.replace(temp, 'index.html', src_dir_fd=fd, dst_dir_fd=fd)
+        if old is None:
+            run_store._rename_noreplace(fd, temp, fd, 'index.html')
+        else:
+            os.replace(temp, 'index.html', src_dir_fd=fd, dst_dir_fd=fd)
         run_store._sync(fd)  # failure is DURABILITY_UNCONFIRMED, never rollback
     finally:
         if run_store._exists(fd, temp):
@@ -593,7 +680,7 @@ def _page_cap(name):
     return _MAX_HTML
 
 
-def _generation(fd, device, pages, receipt, *, complete, signatures=None):
+def _generation(fd, device, pages, receipt, *, complete, signatures=None, caps=None):
     expected = set(pages) | {_RECEIPT}
     present = set(run_store._entries(fd, len(expected)))
     run_store.require(present <= expected, 'PORTAL_GENERATION_COLLISION')
@@ -604,19 +691,31 @@ def _generation(fd, device, pages, receipt, *, complete, signatures=None):
         if signatures is not None:
             signature = _file_signature(fd, name, device)
             run_store.require(signature == signatures.setdefault(name, signature), 'ARTIFACT_CHANGED')
-        run_store.require(run_store._read(fd, name, device, _page_cap(name)) == raw,
+        cap = _page_cap(name) if caps is None else caps[name]
+        run_store.require(run_store._read(fd, name, device, cap) == raw,
                           'PORTAL_OUTPUT_COLLISION')
         if signatures is not None:
             run_store.require(_file_signature(fd, name, device) == signature, 'ARTIFACT_CHANGED')
+    if caps is not None:
+        run_store._check_dir(fd, device)
+        run_store.require(set(run_store._entries(fd, len(expected))) == present and
+                          all(_file_signature(fd, name, device) == signatures[name]
+                              for name in present), 'ARTIFACT_CHANGED')
     return present
 
 
 def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
-                    generation=_GENERATION, recheck=None, previous=None):
-    run_store.require(generation in (_GENERATION, _HISTORY_GENERATION, _CRYPTO_GENERATION),
-                      'PORTAL_OUTPUT_COLLISION')
-    strict = generation == _CRYPTO_GENERATION
+                    generation=_GENERATION, recheck=None, previous=None, caps=None, expected_index=None):
+    run_store.require(generation in (_GENERATION, _HISTORY_GENERATION, _CRYPTO_GENERATION,
+                                     _V5_GENERATION), 'PORTAL_OUTPUT_COLLISION')
+    v5 = generation == _V5_GENERATION
+    run_store.require(v5 == (caps is not None), 'PORTAL_PAYLOAD_INVALID')
+    strict = generation == _CRYPTO_GENERATION or v5
     signatures = {} if strict else None
+    def verify(gen, *, complete):
+        kwargs = {'caps': caps} if v5 else {}
+        return _generation(gen, device, pages, receipt, complete=complete,
+                           signatures=signatures, **kwargs)
     # Preflight the entire fixed output set before creating anything. Receipt
     # bytes are compared with our deterministic expected value, not parsed as
     # an authority for opening paths.
@@ -639,6 +738,8 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
         current = run_store._read(fd, 'index.html', device, _MAX_HTML)
         run_store.require(_index_stat(fd, device) == signature, 'ARTIFACT_CHANGED')
         run_store.require(current == index or (refresh and current == old), 'PORTAL_OUTPUT_COLLISION')
+    if v5:
+        run_store.require(((current, signature) if index_exists else None) == expected_index, 'ARTIFACT_CHANGED')
     complete = current == index
     if previous is not None:
         previous()
@@ -649,7 +750,7 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
         present = set()
         if run_store._exists(fd, generation):
             gen = run_store._open_dir(fd, generation, device)
-            present = _generation(gen, device, pages, receipt, complete=complete, signatures=signatures)
+            present = verify(gen, complete=complete)
         else:
             run_store.require(not complete, 'PORTAL_GENERATION_INCOMPLETE')
         if complete:
@@ -664,7 +765,7 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
                 recheck()
             if strict:
                 check_css()
-                _generation(gen, device, pages, receipt, complete=True, signatures=signatures)
+                verify(gen, complete=True)
                 run_store.require(_entry_identity(fd, generation) == _identity(gen) and
                                   _current_index(fd, device) == (current, signature), 'ARTIFACT_CHANGED')
             return
@@ -678,11 +779,11 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
             if name not in present:
                 run_store._write(gen, name, content, device)
         # Verify exact page bytes and closed set before sealing the receipt.
-        present = _generation(gen, device, pages, receipt, complete=False, signatures=signatures)
+        present = verify(gen, complete=False)
         run_store.require(set(pages) <= present, 'PORTAL_GENERATION_INCOMPLETE')
         if _RECEIPT not in present:
             run_store._write(gen, _RECEIPT, receipt, device)
-        _generation(gen, device, pages, receipt, complete=True, signatures=signatures)
+        verify(gen, complete=True)
         run_store._sync(gen)
         # Ensure the generation is still the directory pinned above.
         check = run_store._open_dir(fd, generation, device)
@@ -702,13 +803,17 @@ def _publish_portal(fd, device, old, index, css, pages, receipt, refresh, *,
             try:
                 run_store.require(_identity(check) == _identity(gen), 'ARTIFACT_CHANGED')
                 if strict:
-                    _generation(check, device, pages, receipt, complete=True, signatures=signatures)
+                    verify(check, complete=True)
                     run_store.require(_entry_identity(fd, generation) == _identity(check),
                                       'ARTIFACT_CHANGED')
             finally:
                 os.close(check)
         if index_exists:
             _replace_v1_index(fd, device, old, index, signature, recheck=before_index)
+        elif v5:
+            # Recheck after the new index temp is fsynced, immediately before
+            # the no-replace stable switch, just as on an upgrade.
+            _replace_v1_index(fd, device, None, index, None, recheck=before_index)
         else:
             before_index()
             run_store._write(fd, 'index.html', index, device)
@@ -788,8 +893,36 @@ def _slot_signatures(fd, device, published, *, portal_v5=False):
     return result
 
 
+def _v5_core_signatures(fd, device, published):
+    signatures = _core_signatures(fd, device, published, portal_v5=True)
+    if run_store._is_producer_v2(published.manifest):
+        # The independent frozen rules are not an indexed output slot, but
+        # Store.open binds them to the public rules. Preserve their identity too.
+        name = run_store._PRODUCER_RULES_FROZEN
+        sig = _file_signature(fd, name, device)
+        raw = run_store._read(fd, name, device, run_store._MAX_PRODUCER_RULES)
+        run_store.require(raw == published.artifacts[run_store._PRODUCER_RULES_FILE] and
+                          _file_signature(fd, name, device) == sig, 'ARTIFACT_CHANGED')
+        signatures[name] = sig
+    return signatures
+
+
+class _PinnedStore(run_store.RunStore):
+    # The actual inherited Store.open must use the same run AND lock inode as
+    # its outer pinned reader. Shared with Catalog; no new reader contract.
+    expected = None
+
+    @contextmanager
+    def _locked_run(self, rid, *, shared):
+        with super()._locked_run(rid, shared=shared) as (fd, lock):
+            if self.expected is not None:
+                run_store.require(shared and self.expected == (rid, _identity(fd), _identity(lock)),
+                                  'ARTIFACT_CHANGED')
+            yield fd, lock
+
+
 def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=False,
-                     catalog_check=None):
+                     portal_v5=False, catalog_check=None):
     """One run-only attempt, or a fresh attempt under a pinned catalog lock.
 
     False requests the catalog-first path. It is returned only before any
@@ -800,8 +933,11 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
         current = _current_index(fd, device)
         existing_v3 = current is not None and current[0].startswith(_HISTORY_MARKER)
         existing_v4 = current is not None and current[0].startswith(_CRYPTO_MARKER)
-        strict = crypto or existing_v4
-        if not existing_v4 and (crypto or (history and not existing_v3)) and catalog_check is None:
+        existing_v5 = current is not None and current[0].startswith(_V5_MARKER)
+        v5 = portal_v5 or existing_v5
+        strict = v5 or crypto or existing_v4
+        if catalog_check is None and not existing_v5 and (
+                v5 or (not existing_v4 and (crypto or (history and not existing_v3)))):
             return False
         identity, lock_identity = _identity(fd), _identity(lock)
         run_store.require(run_store._exists(fd, 'run_manifest.json'), 'INCOMPLETE_RUN')
@@ -810,8 +946,26 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
         if strict:
             # A nested shared Store.open is still the actual authority. The
             # outer pinned run and lock remain held during the identity capture.
-            published = store.open(run_id)
-            core_signatures = _core_signatures(fd, device, published)
+            if v5:
+                header = run_store._loads(marker)
+                run_store.require(type(header) is dict and header.get('manifest_version') == '1.0.0',
+                                  'UNSUPPORTED_MANIFEST_VERSION')
+                run_store.require(_entry_identity(store._fd, run_id) == identity and
+                                  _entry_identity(fd, '.writer.lock') == lock_identity,
+                                  'ARTIFACT_CHANGED')
+                # Bind the actual Store.open nested lock to the pinned lease.
+                store.expected = (run_id, identity, lock_identity)
+                try:
+                    published = store.open(run_id)
+                finally:
+                    store.expected = None
+                run_store.require(_entry_identity(store._fd, run_id) == identity and
+                                  _entry_identity(fd, '.writer.lock') == lock_identity,
+                                  'ARTIFACT_CHANGED')
+            else:
+                published = store.open(run_id)
+            core_signatures = (_v5_core_signatures(fd, device, published) if v5 else
+                               _core_signatures(fd, device, published))
             run_store.require(run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST) == marker and
                               run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST) == journal_raw,
                               'ARTIFACT_CHANGED')
@@ -820,7 +974,26 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
     run_store.require(marker == run_store._json_bytes(published.manifest), 'ARTIFACT_CHANGED')
     old = None
     previous_generation = None
-    if existing_v4:
+    if v5:
+        generation = _V5_GENERATION
+        if current is not None and not existing_v5:
+            run_store.require(refresh, 'PORTAL_OUTPUT_COLLISION')
+            if existing_v4 or existing_v3:
+                css = _render_css()
+                render = _render_v4 if existing_v4 else _render_v3
+                old, old_pages, old_receipt = render(published, marker, css)
+                previous_generation = (_CRYPTO_GENERATION if existing_v4 else _HISTORY_GENERATION,
+                                       old_pages, old_receipt)
+            else:
+                old, css = _render(published)
+                if current[0] != old:
+                    old, old_pages, old_receipt = _render_v2(published, marker, css)
+                    previous_generation = _GENERATION, old_pages, old_receipt
+            run_store.require(current[0] == old, 'PORTAL_OUTPUT_COLLISION')
+        index, css, pages, receipt = _render_v5(published, marker)
+        if existing_v5:
+            run_store.require(current[0] == index, 'PORTAL_OUTPUT_COLLISION')
+    elif existing_v4:
         css = _render_css()
         index, pages, receipt = _render_v4(published, marker, css)
         run_store.require(current[0] == index, 'PORTAL_OUTPUT_COLLISION')
@@ -876,10 +1049,12 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
                               'ARTIFACT_CHANGED')
             if catalog_check is not None:
                 catalog_check()
+        def current_core():
+            return (_v5_core_signatures(fd, device, published) if v5 else
+                    _core_signatures(fd, device, published))
         def recheck_core():
             if strict:
-                run_store.require(_core_signatures(fd, device, published) == core_signatures,
-                                  'ARTIFACT_CHANGED')
+                run_store.require(current_core() == core_signatures, 'ARTIFACT_CHANGED')
             run_store.require(run_store._read(fd, 'run_manifest.json', device, run_store.MAX_MANIFEST)
                               == marker, 'ARTIFACT_CHANGED')
             run_store.require(run_store._read(fd, 'journal.json', device, run_store.MAX_MANIFEST)
@@ -890,8 +1065,7 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
             run_store._read_publication(fd, device, published.manifest, run_id,
                                         frozen_scope=journal['scope'], verified=published)
             if strict:
-                run_store.require(_core_signatures(fd, device, published) == core_signatures,
-                                  'ARTIFACT_CHANGED')
+                run_store.require(current_core() == core_signatures, 'ARTIFACT_CHANGED')
         recheck()
         run_store.require(_current_index(fd, device) == current, 'ARTIFACT_CHANGED')
         recheck_core()
@@ -915,27 +1089,30 @@ def _render_in_store(report_root, store, run_id, refresh, history, *, crypto=Fal
             recheck()
             if strict:
                 recheck_core()
+        kwargs = {'caps': _v5_layout(published)[0], 'expected_index': current} if v5 else {}
         _publish_portal(fd, device, old, index, css, pages, receipt, refresh,
-                        generation=generation, recheck=checked, previous=previous)
+                        generation=generation, recheck=checked, previous=previous, **kwargs)
     return True
 
 
 @run_store._public
 def render_run(report_root, run_id, *, refresh_portal=False, with_history=False,
-               with_crypto_indexes=False):
-    """Default v2; opt-in v3/v4 require a coherent, shared-locked catalog.
+               with_crypto_indexes=False, with_portal_v5=False):
+    """Default v2; explicit v3/v4/v5 require a coherent, shared-locked catalog.
 
-    Exact current v4 is never downgraded and needs no catalog for no-op proof.
+    Exact current v5 is never downgraded and needs no catalog for no-op proof.
+    Exact current v4 retains that behavior unless explicitly upgraded to v5.
     Exact current v3 retains its no-op unless explicitly upgraded to v4.
     Only an authorized refresh can replace a proven old stable index.
     """
     run_store.require(type(refresh_portal) is bool, 'INVALID_REFRESH_FLAG')
     run_store.require(type(with_history) is bool, 'INVALID_HISTORY_FLAG')
     run_store.require(type(with_crypto_indexes) is bool, 'INVALID_CRYPTO_INDEXES_FLAG')
-    with run_store.RunStore(report_root) as store:
+    run_store.require(type(with_portal_v5) is bool, 'INVALID_PORTAL_V5_FLAG')
+    with _PinnedStore(report_root) as store:
         root_identity = _identity(store._fd)
         done = _render_in_store(report_root, store, run_id, refresh_portal, with_history,
-                                crypto=with_crypto_indexes)
+                                crypto=with_crypto_indexes, portal_v5=with_portal_v5)
     if not done:
         # Lazy fixed import: Catalog also imports this renderer for exact proof.
         # All run locks from the probe have been released, before taking the
@@ -944,7 +1121,8 @@ def render_run(report_root, run_id, *, refresh_portal=False, with_history=False,
         with run_catalog._history_root(report_root) as (store, check):
             run_store.require(_identity(store._fd) == root_identity, 'ARTIFACT_CHANGED')
             run_store.require(_render_in_store(report_root, store, run_id, refresh_portal,
-                                               with_history, crypto=with_crypto_indexes, catalog_check=check),
+                                               with_history, crypto=with_crypto_indexes,
+                                               portal_v5=with_portal_v5, catalog_check=check),
                               'CATALOG_RECOVERY_REQUIRED')
     return Path(report_root) / run_id / 'index.html'
 
@@ -957,10 +1135,12 @@ def main(argv=None):
     parser.add_argument('--refresh-portal', action='store_true')
     parser.add_argument('--with-history', action='store_true')
     parser.add_argument('--with-crypto-indexes', action='store_true')
+    parser.add_argument('--with-portal-v5', action='store_true')
     args = parser.parse_args(argv)
     try:
         render_run(args.report_root, args.run_id, refresh_portal=args.refresh_portal,
-                   with_history=args.with_history, with_crypto_indexes=args.with_crypto_indexes)
+                   with_history=args.with_history, with_crypto_indexes=args.with_crypto_indexes,
+                   with_portal_v5=args.with_portal_v5)
     except run_store.StoreError as exc:
         print(exc.code, file=sys.stderr)
         return 1
