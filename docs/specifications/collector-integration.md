@@ -509,3 +509,46 @@ are unchanged. Raw native frames never enter the handoff or queue. Legal
 payload stress and independent exact/+1 serializer controls are distinct;
 no invalid padding is accepted as typed evidence. No Store/C3/live integration
 or production acquisition is granted by this restricted bridge.
+
+## I2 C3b: private native Worker-to-Store bridge
+
+The five-producer staged registry remains empty by default. Only the trusted
+Controller private `tools.scan_workflow._execute_scan_workflow(ctx, store,
+producer_rules_raw)` path consumes the actual V3 Store. The exact original
+one-shot Context, effective host flags, stage adapters, frozen rules bytes,
+run identity, guard and native WorkerProcess/TaskExecutor apply. A generic
+adapter, unsupported or absent requested producer, Active intent, invalid
+scope or preflight denial is not a new execution route. All-disabled scope
+retains its original zero-dispatch terminal and may be published privately.
+
+After normalizing each verified, consumed-once Handoff, C3b reconstructs its
+canonical wire bytes and checks the same receipt size and SHA-256. Retention
+is bounded by the existing 1 MiB per host and 10 MiB total, and is atomic with
+the accepted projection, metrics and provisional terminal. No additional
+IPC, raw frames, second Handoff read, new producer or inference is allowed.
+Only actual companion presence determines the detail slots. A valid earlier
+projection survives an original lifecycle downgrade; it does not authorize
+a successful terminal or imply remote cleanup.
+
+The original final-terminal path decides the full batch after worker and
+Handoff cleanup. C3b branches before the old 32 MiB aggregate path and
+persists one immutable V3 checkpoint per expected host from those final
+rows. Each fragment uses the original run identity and started time, actual
+host identity/state/reason, original raw registry rows, and no fabricated
+claims/findings. Handoff and present companion bytes go to the existing V3
+slots. The single sampled post-cleanup finish time for attempted hosts is
+a confirmed Controller terminal-decision time, not an observation or actual
+worker exit time. Unattempted fragments have no finish time. Recorded time
+is sampled before each checkpoint, and the Store enforces ordering, exact
+refs, original binding, canonical bytes and capacity.
+
+Only the existing V3 finalize path builds the aggregate Evidence, Assessment
+and CFF, with its accepted R2-P/R2-S capacity limits and manifest-last commit.
+PARTIAL, ERROR and INTERRUPTED normal outcomes require the same mandatory
+core artifacts as COMPLETE. A storage or validation failure is not a new
+native rc and does not authorize retry, fallback, truncate, rescan or rollback.
+The private result retains the original batch rc/manifest and actual published
+receipt, plus the late-interruption flag. The original V1/V2/default behavior,
+public readers and CLI remain unchanged; no V3 Portal, public scan entry,
+production or live transport is enabled. See batch-execution.md for the
+reservation, dispatch, freeze, deadline and recovery boundaries.

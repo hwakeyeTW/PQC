@@ -767,3 +767,64 @@ and default legacy grammar, bounded host/wave cancellation, peer cleanup,
 receipt queue and exclusive handoff slots are unchanged. No production or
 active dispatch is authorized. Formal Controller/OL9.7-9.9/transport/load and
 remote lifetime verification remain in #28.
+
+## I2 C3b: private Controller persistence boundary
+
+The private C3b invocation uses an exact one-shot native Context and a trusted
+pinned RunStore held by its caller. The Controller is exclusive, Linux fork,
+main-thread and single-thread, with no other Store writer/extra Store FD.
+It owns only this invocation's V3 writer and closes it on every exit; the
+caller owns the root Store. The original rules loader and V3 frozen-rules
+validation use the same bytes. Original scope, expected host identities,
+effective flags, limits and preflight are frozen before durable reservation
+and before TQM or a worker starts. Neither reservation nor dispatch-intent
+failure may authorize a fork. The reservation ownership-transfer window
+latches an expired alarm without granting a new worker budget; expiry still
+fails the reservation. No storage I/O is placed in the native fork critical
+section.
+
+At the original BaseProcess.start boundary, after the actual worker identity
+is checked, the parent durably commits the host's intent using the V3 writer.
+The original timer is not renewed. Poll/stop/cancel, exact worker/task/slot,
+original guard, active phase, lease and earliest remaining deadline are
+checked before the original fork. A failed or expired intent stops subsequent
+starts and uses original owned-worker cleanup; no normal checkpoint/finalize
+is attempted. A committed intent with a known unstarted worker is distinct
+from an attempted host. An ambiguous start receipt without a known PID is
+not converted into NOT_ATTEMPTED; recovery retains UNKNOWN. A known PID is
+tracked and cleaned even if the native start reports an error afterwards.
+
+C3b validates the distinct root, run and writer-lock descriptors and pins
+their identities; aliases or extra descriptors under that Store root reject.
+The scoped original WorkerProcess.run hook is limited to actual fork and the
+expected WorkerProcess. Its child raw-closes just those three inherited FDs
+and verifies closure before the original run/TaskExecutor/adapter, never
+calling writer.close or LOCK_UN and never sweeping unrelated descriptors.
+Failure exits the child before acquisition. Parent methods, signal handlers,
+masks and owned lifecycle are restored; the parent retains Store authority
+and its lock. This is not a sandbox for malicious same-UID Python.
+
+The masked final-terminal freeze follows owned-worker and Handoff cleanup
+and the original ledger decision/validation. Acquisition cancellation already
+observed at this boundary participates in the original rc7 decision; later
+SIGINT/SIGTERM only latch persistence cancellation. Every immutable checkpoint
+uses the same final decision; late signals never rewrite that terminal. The
+post-cleanup persistence phase has one fixed 1200 s monotonic deadline, not
+per-host timers or a renewed worker/lease allowance. Stop at the next safe
+checkpoint boundary or before finalize if interrupted; preserve committed
+checkpoints. After admission of the single atomic finalize, allow it to
+complete or fail closed. A returned, confirmed PublishedRun retains the
+original native rc and sets late_interrupted when applicable. A failure after
+admission may have committed a marker and reports publication unconfirmed;
+no blind retry, rollback or re-dispatch. A blocked capacity stage is reported
+with the original code/stage. Poison and close on failed persistence. An
+uninterruptible filesystem operation is not promised a hard real-time bound.
+
+Recovery is explicit through the existing private V3 API: prepared commit
+resumes exact bytes; an intent without final checkpoint is UNKNOWN, a host
+with neither is NOT_ATTEMPTED, and submitted checkpoints retain their exact
+terminal/bytes. No per-wave crash-durable observation guarantee is made.
+This restricted private synthetic workflow changes no legacy V1/V2/default
+entry or public API, transport or CLI, and does not qualify live dispatch.
+Actual Controller, OL versions, real transport/FS/load and offline deployment
+verification remain in #28.

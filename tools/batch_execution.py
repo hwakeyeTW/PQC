@@ -2439,7 +2439,7 @@ def execute_batch(ctx):
     return _execute_batch(ctx)
 
 
-def _execute_batch(ctx, producer_session=None):
+def _execute_batch(ctx, producer_session=None, *, workflow=None):
     import threading
     import ctypes
     from ansible import context
@@ -2451,6 +2451,11 @@ def _execute_batch(ctx, producer_session=None):
             and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
             and not {signal.SIGALRM, signal.SIGINT, signal.SIGTERM}
             & signal.pthread_sigmask(signal.SIG_BLOCK, ()), 3, 'NATIVE_CONTEXT_UNVERIFIED')
+    if workflow is not None:
+        from tools.scan_workflow import _Control
+        require(type(workflow) is _Control and workflow.ctx is ctx
+                and type(producer_session) is _ProducerSession
+                and workflow.session is producer_session, 3, 'NATIVE_CONTEXT_UNVERIFIED')
     ctx._batch_used = True
     started = time.monotonic()
     deadline = started + _GUARD_SECONDS
@@ -2468,9 +2473,18 @@ def _execute_batch(ctx, producer_session=None):
 
     def interrupt(signum, frame):
         nonlocal interrupted
-        if os.getpid() != controller_pid or interrupted:
+        if os.getpid() != controller_pid:
+            return
+        if workflow is not None and workflow.frozen:
+            workflow.late_interrupted = True
+            return
+        if interrupted:
             return
         interrupted = True
+        # Complete the bounded Store call's ownership/durability handoff
+        # before observing cancellation. The original alarm is not renewed.
+        if workflow is not None and workflow.storage_active:
+            return
         if phase_active and not fork_critical:
             # Disarm before unwinding a bounded child/guard's own finally.
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -2505,7 +2519,10 @@ def _execute_batch(ctx, producer_session=None):
         remaining = end - time.monotonic()
         if remaining <= 0:
             raise _Deadline()
-        with _deadline(remaining, lambda: fork_critical):
+        with _deadline(remaining, lambda: fork_critical or
+                       (workflow is not None and workflow.reserving)):
+            # Reservation has its own ownership-transfer window. A latched
+            # expiration still rejects the reservation, never grants dispatch.
             phase_active = True
             active_phase_end = end
             try:
@@ -2568,13 +2585,47 @@ def _execute_batch(ctx, producer_session=None):
                         raise _Deadline()
                     if remaining < timer:
                         signal.setitimer(signal.ITIMER_REAL, remaining)
+                    if workflow is not None:
+                        workflow.check_worker(worker, host, task)
+                        workflow.intent(name, min(end, launch_end))
+                        # The durable intent is not a start receipt. Recheck
+                        # the original proof and every live horizon after I/O.
+                        if not poll():
+                            raise _Cancelled() if interrupted else Denied(3, 'INVALID_NATIVE_RESULT')
+                        try:
+                            _guard(ctx, name)
+                        except Denied:
+                            ledger.fail('GUARD_REJECTED')
+                            raise
+                        workflow.check_worker(worker, host, task)
+                        require(worker is tqm._workers[slot], 3, 'INVALID_NATIVE_RESULT')
+                        if not poll():
+                            raise _Cancelled() if interrupted else Denied(3, 'INVALID_NATIVE_RESULT')
                     if producer_session is not None and producer_session.staged:
                         wave.lease.reserve(name, end)
-                    fork_critical = True
-                    try:
-                        original_start(worker)
-                    finally:
-                        fork_critical = False
+                    isolation = (contextlib.nullcontext() if workflow is None else
+                                 workflow.isolate_child(worker))
+                    with isolation:
+                        if workflow is not None:
+                            launch_end = min(launch_end, end, active_phase_end, wave.limit(),
+                                             wave.lease.limit(name))
+                            remaining = launch_end - time.monotonic()
+                            timer = signal.getitimer(signal.ITIMER_REAL)[0]
+                            if interrupted:
+                                raise _Cancelled()
+                            if remaining <= 0 or timer <= 0:
+                                raise _Deadline()
+                            if remaining < timer:
+                                signal.setitimer(signal.ITIMER_REAL, remaining)
+                        fork_critical = True
+                        try:
+                            original_start(worker)
+                        except BaseException:
+                            if workflow is not None and worker.pid is None:
+                                workflow.mark_failure('DISPATCH', 'START_UNCONFIRMED')
+                            raise
+                        finally:
+                            fork_critical = False
                     if interrupted:
                         raise _Cancelled()
                     if time.monotonic() >= launch_end:
@@ -2612,6 +2663,8 @@ def _execute_batch(ctx, producer_session=None):
                     ledger = _Ledger(ctx, registry)
                 else:
                     registry, ledger = producer_session.prepare(ctx)
+                    if workflow is not None:
+                        workflow.check_registry(registry, ledger)
         except _Deadline:
             if not interrupted:
                 raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
@@ -2636,6 +2689,12 @@ def _execute_batch(ctx, producer_session=None):
                 if not interrupted:
                     raise Denied(3, 'BATCH_GUARD_TIMEOUT') from None
                 raise _Cancelled()
+            if workflow is not None:
+                try:
+                    with phase():
+                        workflow.reserve(ledger)
+                except _Deadline:
+                    workflow.reject('RESERVATION', 'STORAGE_DEADLINE')
             scheduling = True
             # Keep a reference even if native initialization partially fails.
             # TQM installs its own CLI handlers, so restore ours before
@@ -2707,6 +2766,12 @@ def _execute_batch(ctx, producer_session=None):
                         wave = None
                     if interrupted:
                         ledger.fail('INTERRUPTED')
+        elif workflow is not None:
+            try:
+                with phase():
+                    workflow.reserve(ledger)
+            except _Deadline:
+                workflow.reject('RESERVATION', 'STORAGE_DEADLINE')
     except _Cancelled:
         if ledger is None:
             ledger = (_Ledger(ctx, {}) if producer_session is None else
@@ -2753,6 +2818,8 @@ def _execute_batch(ctx, producer_session=None):
     if interrupted:
         ledger.fail('INTERRUPTED')
     if producer_session is not None:
+        if workflow is not None:
+            return producer_session.finish(ctx, ledger, lambda: interrupted, workflow=workflow)
         return producer_session.finish(ctx, ledger, lambda: interrupted)
     return _manifest(ctx, ledger.finish(), ledger.stop)
 
@@ -2924,6 +2991,8 @@ class _ProducerLedger(_Ledger):
         self.ids = set()
         self.projections = {}
         self.metrics = {}
+        self.wires = {}
+        self.wire_total = 0
 
     def accept(self, message):
         require(type(message) is dict and message.keys() == {'target_id', 'task_uuid', 'row'}
@@ -2956,6 +3025,14 @@ class _ProducerLedger(_Ledger):
             # through the queue. Known earlier valid hosts remain available.
             self.fail('INVALID_NATIVE_RESULT')
             raise Denied(3, 'INVALID_NATIVE_RESULT') from None
+        wire = None
+        if self.session.retain_wire:
+            wire = self.session.bridge.wire_bytes(envelope)
+            require(len(wire) == receipt['byte_count'] <= self.session.bridge.MAX_WIRE
+                    and hashlib.sha256(wire).hexdigest() == receipt['sha256']
+                    and n not in self.wires
+                    and self.wire_total + len(wire) <= self.session.bridge.MAX_WIRE * self.session.bridge.MAX_HOSTS,
+                    3, 'INVALID_NATIVE_RESULT')
         row = _host(n, True, [projection.outcomes[f] for f in _COLLECTORS], projection.special)
         row['platform'] = projection.outcomes[self.session.bridge.PLATFORM]
         ids = {i for c in [row['platform'], *row['collectors']] for i in c['collection_ids']}
@@ -2973,6 +3050,9 @@ class _ProducerLedger(_Ledger):
             self.ids = merged_ids
             self.projections[n] = projection
             self.metrics[n] = metrics
+            if wire is not None:
+                self.wires[n] = wire
+                self.wire_total += len(wire)
             self.rows[n] = row
             if row['reason_code'] in _FATAL:
                 self.fail(row['reason_code'])
@@ -3014,6 +3094,7 @@ class _ProducerSession:
         self.policy_staged = False
         self.ssh_staged = False
         self.cert_staged = False
+        self.retain_wire = False
 
     def _identity(self, ctx):
         import uuid
@@ -3221,19 +3302,52 @@ class _ProducerSession:
                 return False
         return True
 
-    def finish(self, ctx, ledger, interrupted):
+    def finish(self, ctx, ledger, interrupted, *, workflow=None):
         if not self.close():
             ledger.fail('CONTROLLER_CLEANUP_UNCONFIRMED')
             for name in ledger.started:
                 ledger.worker_failed(name, 'CONTROLLER_CLEANUP_UNCONFIRMED')
-        if interrupted():
-            ledger.fail('INTERRUPTED')
-        rows = ledger.finish()
-        # Use the original B05 classification with platform excluded. Only
-        # the actual V2 row contains expanded collection references.
-        rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
-        manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
-        validate_producer_manifest(manifest, rc)
+        # Freeze only after all original lifecycle and Handoff cleanup
+        # decisions. The private path never enters the legacy aggregation.
+        cancellation = {signal.SIGINT, signal.SIGTERM}
+        mask = None if workflow is None else signal.pthread_sigmask(
+            signal.SIG_BLOCK, cancellation)
+
+        def validated_terminal():
+            rows = ledger.finish()
+            # Use the original B05 classification with platform excluded.
+            rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
+            manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
+            validate_producer_manifest(manifest, rc)
+            return rows, rc, manifest
+
+        try:
+            if interrupted():
+                ledger.fail('INTERRUPTED')
+            rows, rc, manifest = validated_terminal()
+            if workflow is not None:
+                pending = cancellation & signal.sigpending()
+                if pending and rc != 7:
+                    # Cancellation is sticky. Rebuild and validate the rc7
+                    # terminal at most once, including arrivals during validation.
+                    ledger.fail('INTERRUPTED')
+                    rows, rc, manifest = validated_terminal()
+                    pending = cancellation & signal.sigpending()
+                # The LAST snapshot, after the applicable validation, is the
+                # masked linearization point. Consume only that observed set,
+                # once per signal, without waiting or sampling it again. New
+                # distinguishable pending signals survive to the storage latch
+                # on unmask; ordinary same-signal coalescing is unavoidable.
+                for sig in sorted(pending):
+                    info = signal.sigtimedwait({sig}, 0)
+                    require(info is not None and info.si_signo == sig,
+                            3, 'NATIVE_CONTEXT_UNVERIFIED')
+                workflow.freeze(rc)
+        finally:
+            if mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if workflow is not None:
+            return workflow.persist(manifest, ledger)
         b = self.bridge
         hosts = [b.host_record(self.run_id, r['target_id'], r['host_state'], r['reason_code']) for r in rows]
         doc = b.document(self.run_id, self.started_at, hosts, manifest['run_state'], b.stamp())
