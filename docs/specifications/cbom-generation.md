@@ -240,3 +240,47 @@ actual normalization and mandatory detail validation before publishing only
 its generic S1 rows. Actual production Controller and OL9.7-9.9,
 Windows/Linux file:// and operational load/scale acceptance remain
 NOT_TESTED or out of scope for #27/#28. No Ansible runtime is needed.
+
+## SK-A: verified standalone public key projection (private V3)
+
+The private `_project_verified_v3_keys(published, host_id)` provider in
+`tools/cbom_ssh_keys.py` is restricted to an untouched snapshot owned by a
+trusted caller after actual V3 RunStore replay, with an expected host ID.
+The `PublishedRun` type and matching hashes are not an authentication or
+admission mechanism. There is no new public reader, CLI, path input, receipt,
+or caller-supplied proof. SK-A does not change the existing B2 generator or
+its fail-closed standalone omission, certificate identities or role references.
+
+* Only the existing synthetic V3 manifest 1.1.0, native producer contract,
+  R2 capacity profile, original source and run-scoped identities qualify.
+  Check the closed artifact inventory, exact mandatory slots, versions,
+  sizes, hashes, canonical details, expected host, terminal/attempt state,
+  recorded observation and collection/evidence/asset memberships. A missing
+  legitimate proof is an omission, not permission to fall back to generic
+  evidence. Inconsistent retained proof is an error with a fixed diagnostic.
+* Match the original producer handoff's SSH record and typed snapshot to the
+  retained `ssh-posture-v2` companion. Reuse the existing paired SSH validator
+  and original frozen rules on the host fragment. No filesystem reread,
+  network access, new assessment or conversion to the old whole-run size cap.
+  Preserve the existing slot, host, key, entry and core capacity limits.
+* Only KNOWN key observations with usable key collection and host state
+  qualify. Use the original run/host-scoped `public_key` asset ID and exact
+  fingerprint, key type, bits, evidence and collection IDs. Deduplicate
+  within a host by asset identity, sort keys and memberships, and keep hosts,
+  runs and certificate-bound subjects separate. Conflicting rows are not
+  resolved by choosing a winner. Return no source_ref, raw key bytes, config
+  values, paths, target identifiers, private material, or inferred algorithm
+  or negotiation claims.
+* The closed internal projection records host/attempt/collection state and
+  recovery, with fixed omission reasons for disabled, unattempted, unknown
+  outcome, unusable host, missing proof, unavailable collection, unknown key
+  type, partial coverage and empty observations. A committed, usable
+  checkpoint in explicit recovery retains its verified keys without
+  inventing proof for other hosts or assessment for the recovered run.
+
+SK-A is tested using actual V3 publication, reopen and explicit recovery,
+including tampering rejected by Store before projection. Existing V3 and B2
+focused compatibility cases remain unchanged. SK-B must separately integrate
+this provider into a verified V3 consumer and the existing CBOM reference,
+capacity and official schema contracts. No V3 CBOM or Portal publication,
+public V3 admission, real transport, or release QA acceptance is enabled here.
