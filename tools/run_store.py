@@ -460,7 +460,7 @@ def _rename_noreplace(src_fd, src, dest_fd, dest):
         raise StoreError('STORE_IO')
 
 
-def _write(parent, name, raw, device, *, replace_journal=False):
+def _write(parent, name, raw, device, *, replace_journal=False, before_publish=None):
     # A temporary file is never a published artifact. Only journal.json may be
     # replaced, under the caller's exclusive per-run lock.
     temp = '.tmp-' + secrets.token_hex(16)
@@ -475,6 +475,10 @@ def _write(parent, name, raw, device, *, replace_journal=False):
             _sync(fd)
         finally:
             os.close(fd)
+        # V3 explicit recovery can recheck its pinned identities after the
+        # temporary file is durable, immediately before the atomic switch.
+        if before_publish is not None:
+            before_publish()
         if replace_journal:
             require(name == 'journal.json', 'INVALID_SLOT')
             check = _open_file(parent, name, device)
@@ -1293,7 +1297,9 @@ class RunStore:
     @_public
     def __init__(self, root):
         self._fd = _root(root)
-        self._device = os.fstat(self._fd).st_dev
+        root_stat = os.fstat(self._fd)
+        self._device = root_stat.st_dev
+        self._v3_root_identity = (root_stat.st_dev, root_stat.st_ino)
 
     def __enter__(self): return self
     def __exit__(self, *exc): self.close()
@@ -1411,14 +1417,60 @@ class RunStore:
                                   started_at=started_at)
 
     @_public
-    def _open_v3(self, run_id):
+    def open_v3(self, run_id):
+        """Explicit offline V3 core verification; return a verified snapshot."""
         from tools import run_store_v3
         return run_store_v3.open_run(self, run_id)
 
     @_public
-    def _recover_v3(self, run_id):
+    def recover_v3(self, run_id):
+        """Explicit offline V3 recovery only; never dispatch or replace a marker."""
         from tools import run_store_v3
         return run_store_v3.recover(self, run_id)
+
+    def _open_v3(self, run_id):
+        return self.open_v3(run_id)
+
+    def _recover_v3(self, run_id):
+        return self.recover_v3(run_id)
+
+    def _check_v3_root(self):
+        self._check()
+        root = _check_dir(self._fd, self._device)
+        require((root.st_dev, root.st_ino) == self._v3_root_identity and root.st_nlink > 0,
+                'STORE_IDENTITY_CHANGED')
+
+    @contextmanager
+    def _locked_v3_run(self, rid, *, shared):
+        # Keep the existing V1/V2/legacy locking and error contract untouched.
+        # The authority is the retained root FD, not a reopened caller path.
+        self._check_v3_root()
+        with self._locked_run(rid, shared=shared) as (fd, lock):
+            run = _check_dir(fd, self._device)
+            locked = _stat_file(lock, self._device)
+            run_identity = (run.st_dev, run.st_ino)
+            lock_identity = (locked.st_dev, locked.st_ino)
+
+            def recheck():
+                self._check_v3_root()
+                actual_run = _check_dir(fd, self._device)
+                actual_lock = _stat_file(lock, self._device)
+                try:
+                    named_run = os.stat(rid, dir_fd=self._fd, follow_symlinks=False)
+                    named_lock = _check_file_stat(os.stat('.writer.lock', dir_fd=fd,
+                                                         follow_symlinks=False), self._device)
+                except FileNotFoundError:
+                    raise StoreError('RUN_IDENTITY_CHANGED') from None
+                require(stat.S_ISDIR(named_run.st_mode) and actual_run.st_nlink > 0 and
+                        (actual_run.st_dev, actual_run.st_ino) == run_identity ==
+                        (named_run.st_dev, named_run.st_ino) and
+                        (actual_lock.st_dev, actual_lock.st_ino) == lock_identity ==
+                        (named_lock.st_dev, named_lock.st_ino), 'RUN_IDENTITY_CHANGED')
+
+            # A lock acquired on a detached/replaced inode is not authority.
+            recheck()
+            yield fd, lock, recheck
+            recheck()
 
     @contextmanager
     def _locked_run(self, rid, *, shared):

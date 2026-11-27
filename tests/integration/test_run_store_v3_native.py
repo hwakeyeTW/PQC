@@ -429,3 +429,405 @@ def test_r2s_duplicate_checkpoint_immutable(root,monkeypatch):
             _,r,d,ds,_=items[0]
             with pytest.raises(store.StoreError,match='TERMINAL_EXISTS'):w.record_host(d,attempted=True,terminal=r,details=ds)
             assert cp.read_bytes()==old and not (root/RID/'run_manifest.json').exists()
+
+
+# C4a: actual offline V3 API / recovery. No transport or fake Store objects.
+def _c4a_snapshot(path):
+    import stat
+    # Atime can legitimately change on read; namespace, content, mode,
+    # identity and modification timestamps must not.
+    return {str(p.relative_to(path)): (p.lstat().st_ino, p.lstat().st_mode,
+            p.lstat().st_mtime_ns, p.lstat().st_ctime_ns,
+            p.read_bytes() if stat.S_ISREG(p.lstat().st_mode) else None)
+            for p in path.rglob('*')}
+
+
+def _c4a_publish(s, monkeypatch, modes=('complete',)):
+    items = [small(i) if mode == 'complete' else blank(i, mode)
+             for i, mode in enumerate(modes)]
+    with start(s, items, monkeypatch) as w:
+        record(w, items, monkeypatch)
+        return publish(w, items), items
+
+
+def _c4a_prepare(s, monkeypatch):
+    items = [small()]
+    with start(s, items, monkeypatch) as w:
+        record(w, items, monkeypatch)
+        write = store._write
+        def stop(fd, name, raw, device, **kw):
+            if name == 'run_manifest.json':
+                raise store.StoreError('DURABILITY_UNCONFIRMED')
+            return write(fd, name, raw, device, **kw)
+        with monkeypatch.context() as fault:
+            fault.setattr(store, '_write', stop)
+            with pytest.raises(store.StoreError, match='DURABILITY_UNCONFIRMED'):
+                publish(w, items)
+    monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+    return items
+
+
+@pytest.mark.parametrize('modes', [('complete',), ('complete', 'connection', 'worker'), ('disabled',)])
+def test_c4a_actual_verified_snapshot(root, monkeypatch, modes):
+    with store.RunStore(root) as s:
+        result, items = _c4a_publish(s, monkeypatch, modes)
+        check(root, result, items)
+        before = _c4a_snapshot(root)
+        assert s.open_v3(RID) == result == s._open_v3(RID)
+        assert _c4a_snapshot(root) == before
+        for action in (s.open, s.recover, s.recover_v3, s._recover_v3):
+            with pytest.raises(store.StoreError):
+                action(RID)
+        # A returned snapshot is not mutable Store authority.
+        changed = s.open_v3(RID)
+        changed.manifest['run_state'] = 'bogus'
+        changed.artifacts.clear()
+        assert s.open_v3(RID) == result and _c4a_snapshot(root) == before
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+@pytest.mark.parametrize('private', [False, True])
+def test_c4a_actual_explicit_recovery(root, monkeypatch, prepared, private):
+    with store.RunStore(root) as s:
+        run = root / RID
+        if prepared:
+            items = _c4a_prepare(s, monkeypatch)
+            original_plan = (run / 'prepared.json').read_bytes()
+            expected = store._unseal(original_plan, v3.MANIFEST_BYTES)['manifest']
+        else:
+            items = [small(0), small(1), small(2)]
+            with start(s, items, monkeypatch) as w:
+                for item in items[:2]:
+                    w.dispatch_intent(item[2]['hosts'][0]['host_id'])
+                monkeypatch.setattr(v3, '_clock', lambda: f.FIN)
+                _, row, doc, details, _ = items[0]
+                w.record_host(doc, attempted=True, terminal=row, details=details)
+            monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+        before = _c4a_snapshot(run)
+        with pytest.raises(store.StoreError):
+            s.recover(RID)
+        assert _c4a_snapshot(run) == before
+        result = (s._recover_v3 if private else s.recover_v3)(RID)
+        assert result == s.open_v3(RID) == s._open_v3(RID)
+        assert (run / v2.FROZEN_FILE).read_bytes() == f.RULE_BYTES
+        for path, value in before.items():
+            if path.startswith('checkpoints/') or path in ('journal.json', v2.FROZEN_FILE):
+                assert _c4a_snapshot(run)[path] == value
+        if prepared:
+            assert result.manifest == expected and not result.manifest['recovery']
+            assert (run / 'prepared.json').read_bytes() == original_plan
+            check(root, result, items)
+        else:
+            assert result.manifest['recovery'] and result.assessed is None
+            by_target = {h['target_id']: h for h in result.manifest['hosts']}
+            assert by_target[items[0][1]['target_id']]['terminal'] == items[0][1]
+            assert by_target[items[1][1]['target_id']]['attempt_status'] == 'UNKNOWN'
+            assert by_target[items[2][1]['target_id']]['attempt_status'] == 'NOT_ATTEMPTED'
+            assert not {'batch_manifest.json', 'assessed_evidence.json', 'cff_projection.json',
+                        'assessment_rules.json'} & set(result.artifacts)
+        before = _c4a_snapshot(run)
+        with pytest.raises(store.StoreError, match='ALREADY_PUBLISHED'):
+            s.recover_v3(RID)
+        assert _c4a_snapshot(run) == before
+
+
+@pytest.mark.parametrize('operation', ['open', 'recover'])
+@pytest.mark.parametrize('defect', ['root', 'run', 'lock'])
+def test_c4a_identity_after_lock(root, monkeypatch, operation, defect):
+    import os
+    with store.RunStore(root) as s:
+        if operation == 'open':
+            _c4a_publish(s, monkeypatch, ('disabled',))
+        else:
+            with start(s, [blank(0, 'disabled')], monkeypatch):
+                pass
+        run = root / RID
+        alt = root.parent / 'other-root'; alt.mkdir(mode=0o700)
+        old_flock = store._flock
+        def drift(fd, **kw):
+            old_flock(fd, **kw)
+            if defect == 'root':
+                other = os.open(alt, os.O_RDONLY | os.O_DIRECTORY)
+                try: os.dup2(other, s._fd)
+                finally: os.close(other)
+            elif defect == 'run':
+                run.rename(root / 'detached'); run.mkdir(mode=0o700)
+            else:
+                (run / '.writer.lock').rename(run / 'detached-lock')
+                (run / '.writer.lock').touch(mode=0o600)
+        monkeypatch.setattr(store, '_flock', drift)
+        with pytest.raises(store.StoreError, match='IDENTITY_CHANGED'):
+            (s.open_v3 if operation == 'open' else s.recover_v3)(RID)
+        if operation == 'recover':
+            assert not (run / 'run_manifest.json').exists()
+            assert not (root / 'detached' / 'run_manifest.json').exists()
+            assert not (alt / RID / 'run_manifest.json').exists()
+
+
+def test_c4a_actual_lock_contention(root, monkeypatch):
+    with store.RunStore(root) as s, store.RunStore(root) as other:
+        result, _ = _c4a_publish(s, monkeypatch, ('disabled',))
+        with s._locked_run(RID, shared=True):
+            assert other.open_v3(RID) == result
+            with pytest.raises(store.StoreError, match='RUN_BUSY'):
+                other.recover_v3(RID)
+        with s._locked_run(RID, shared=False):
+            for action in (other.open_v3, other.recover_v3):
+                with pytest.raises(store.StoreError, match='RUN_BUSY'):
+                    action(RID)
+
+
+@pytest.mark.parametrize('defect', ['run', 'lock', 'stage', 'extra'])
+def test_c4a_read_rechecks_before_delivery(root, monkeypatch, defect):
+    with store.RunStore(root) as s:
+        _c4a_publish(s, monkeypatch, ('disabled',))
+        run = root / RID
+        plan = store._unseal((run / 'prepared.json').read_bytes(), v3.MANIFEST_BYTES)
+        replay = v3.Writer._replay
+        def drift(self, *args, **kw):
+            result = replay(self, *args, **kw)
+            if defect == 'run':
+                run.rename(root / 'detached'); run.mkdir(mode=0o700)
+            elif defect == 'lock':
+                (run / '.writer.lock').rename(run / 'detached-lock')
+                (run / '.writer.lock').touch(mode=0o600)
+            elif defect == 'stage':
+                (run / plan['stage']).rename(run / 'detached-stage')
+                (run / plan['stage']).mkdir(mode=0o700)
+            else:
+                (run / 'index.html').touch(mode=0o600)
+            return result
+        monkeypatch.setattr(v3.Writer, '_replay', drift)
+        with pytest.raises(store.StoreError):
+            s.open_v3(RID)
+
+
+@pytest.mark.parametrize('defect', ['derived', 'foreign', 'details', 'stage-link',
+                                  'temp-link', 'checkpoint-temp-link', 'rules', 'checkpoint'])
+def test_c4a_unprepared_rejection_before_staging(root, monkeypatch, defect):
+    with store.RunStore(root) as s:
+        with start(s, [small()], monkeypatch) as w:
+            record(w, [small()], monkeypatch)
+        run = root / RID
+        if defect == 'derived': (run / 'portal-v5').mkdir(mode=0o700)
+        elif defect == 'foreign': (run / 'foreign.json').touch(mode=0o600)
+        elif defect == 'details': (run / 'details').mkdir(mode=0o700)
+        elif defect == 'stage-link': (run / ('.stage-' + 'a'*32)).symlink_to('checkpoints')
+        elif defect == 'temp-link': (run / ('.tmp-' + 'a'*32)).symlink_to('journal.json')
+        elif defect == 'checkpoint-temp-link':
+            (run / 'checkpoints' / ('.tmp-' + 'a'*32)).symlink_to('../journal.json')
+        elif defect == 'rules': (run / v2.FROZEN_FILE).write_bytes(f.RULE_BYTES + b' ')
+        else:
+            cp = next((run / 'checkpoints').glob('*.json')); cp.write_bytes(cp.read_bytes()+b' ')
+        before = _c4a_snapshot(run)
+        monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+        with pytest.raises(store.StoreError):
+            s.recover_v3(RID)
+        assert _c4a_snapshot(run) == before and not (run / 'run_manifest.json').exists()
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+@pytest.mark.parametrize('defect', ['run', 'lock', 'stage', 'rules', 'checkpoint', 'foreign', 'marker', 'core', 'plan', 'journal'])
+def test_c4a_marker_boundary_rechecks(root, monkeypatch, prepared, defect):
+    with store.RunStore(root) as s:
+        if prepared:
+            _c4a_prepare(s, monkeypatch)
+        else:
+            items = [small()]
+            with start(s, items, monkeypatch) as w:
+                record(w, items, monkeypatch)
+            monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+        run = root / RID
+        write = store._write
+        triggered = []
+        def at_marker(fd, name, raw, device, **kw):
+            if name == 'run_manifest.json':
+                check = kw['before_publish']
+                def drift():
+                    triggered.append(True)
+                    if defect == 'run':
+                        run.rename(root / 'detached'); run.mkdir(mode=0o700)
+                    elif defect == 'lock':
+                        (run / '.writer.lock').rename(run / 'detached-lock')
+                        (run / '.writer.lock').touch(mode=0o600)
+                    elif defect == 'stage':
+                        plan = store._unseal((run / 'prepared.json').read_bytes(), v3.MANIFEST_BYTES)
+                        (run / plan['stage']).rename(run / 'detached-stage')
+                        (run / plan['stage']).mkdir(mode=0o700)
+                    elif defect == 'rules': (run / v2.FROZEN_FILE).write_bytes(f.RULE_BYTES + b' ')
+                    elif defect == 'checkpoint':
+                        cp = next((run / 'checkpoints').glob('*.json')); cp.write_bytes(cp.read_bytes()+b' ')
+                    elif defect == 'foreign': (run / 'portal.css').touch(mode=0o600)
+                    elif defect == 'core':
+                        path = run / 'evidence.json'; path.write_bytes(path.read_bytes()+b' ')
+                    elif defect == 'plan': (run / 'prepared.json').write_bytes(b'{}')
+                    elif defect == 'journal': (run / 'journal.json').write_bytes(b'{}')
+                    else:
+                        (run / 'run_manifest.json').write_bytes(b'foreign marker')
+                        (run / 'run_manifest.json').chmod(0o600)
+                    check()
+                kw['before_publish'] = drift
+            return write(fd, name, raw, device, **kw)
+        monkeypatch.setattr(store, '_write', at_marker)
+        with pytest.raises(store.StoreError):
+            s.recover_v3(RID)
+        assert triggered == [True]
+        if defect == 'marker':
+            assert (run / 'run_manifest.json').read_bytes() == b'foreign marker'
+        else:
+            assert not (run / 'run_manifest.json').exists()
+        assert not (root / 'detached' / 'run_manifest.json').exists()
+
+
+@pytest.mark.parametrize('defect', ['missing-core', 'tamper-core', 'unsafe-mode', 'hardlink',
+                                  'foreign', 'bad-journal', 'bad-plan', 'old-version',
+                                  'capacity', 'checkpoint-capacity'])
+def test_c4a_actual_read_closed_namespace(root, monkeypatch, defect):
+    with store.RunStore(root) as s:
+        result, _ = _c4a_publish(s, monkeypatch)
+        run = root / RID; path = run / 'evidence.json'
+        if defect == 'missing-core': path.unlink()
+        elif defect == 'tamper-core': path.write_bytes(path.read_bytes()+b' ')
+        elif defect == 'unsafe-mode': path.chmod(0o644)
+        elif defect == 'hardlink': (run / 'extra-link').hardlink_to(path)
+        elif defect == 'foreign': (run / 'portal.css').touch(mode=0o600)
+        elif defect == 'bad-journal': (run / 'journal.json').write_bytes(b'{}')
+        elif defect == 'bad-plan': (run / 'prepared.json').write_bytes(b'{}')
+        elif defect == 'old-version':
+            altered = copy.deepcopy(result.manifest); altered['manifest_version'] = '1.0.0'
+            (run / 'run_manifest.json').write_bytes(store._json_bytes(altered, v3.MANIFEST_BYTES))
+        elif defect == 'capacity':
+            # Actual safe sparse oversized file; fail before consuming bytes.
+            with path.open('r+b') as stream: stream.truncate(v3.RAW_BYTES+1)
+        else:
+            cp = next((run / 'checkpoints').glob('*.json'))
+            with cp.open('r+b') as stream: stream.truncate(v3.CHECKPOINT_BYTES+1)
+        with pytest.raises(store.StoreError):
+            s.open_v3(RID)
+
+
+def test_c4a_actual_old_v2_version_isolation(root):
+    import test_run_store_v2_certificate as old
+    args, doc, terminal_rows, rc, details = old.fixture(('complete',))
+    with store.RunStore(root) as s:
+        with s.begin(**args) as w:
+            old.record(w, doc, terminal_rows, details)
+        run = root / old.RID; before = _c4a_snapshot(run)
+        with pytest.raises(store.StoreError):
+            s.recover_v3(old.RID)
+        assert _c4a_snapshot(run) == before
+        result = s.recover(old.RID)
+        assert s.open(old.RID) == result
+        before = _c4a_snapshot(run)
+        with pytest.raises(store.StoreError):
+            s.open_v3(old.RID)
+        assert _c4a_snapshot(run) == before
+
+
+def test_c4a_post_marker_durability_uncertain(root, monkeypatch):
+    with store.RunStore(root) as s:
+        items = [small()]
+        with start(s, items, monkeypatch) as w:
+            record(w, items, monkeypatch)
+        monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+        write = store._write
+        def uncertain(fd, name, raw, device, **kw):
+            write(fd, name, raw, device, **kw)
+            if name == 'run_manifest.json':
+                raise store.StoreError('DURABILITY_UNCONFIRMED')
+        with monkeypatch.context() as fault:
+            fault.setattr(store, '_write', uncertain)
+            with pytest.raises(store.StoreError, match='DURABILITY_UNCONFIRMED'):
+                s.recover_v3(RID)
+        assert s.open_v3(RID).manifest['recovery']
+        before = _c4a_snapshot(root/RID)
+        with pytest.raises(store.StoreError, match='ALREADY_PUBLISHED'):
+            s.recover_v3(RID)
+        assert _c4a_snapshot(root/RID) == before
+
+
+@pytest.mark.parametrize('defect', ['run', 'lock', 'foreign'])
+def test_c4a_unprepared_recheck_after_derive(root, monkeypatch, defect):
+    with store.RunStore(root) as s:
+        items = [small()]
+        with start(s, items, monkeypatch) as w:
+            record(w, items, monkeypatch)
+        monkeypatch.setattr(v3, '_clock', lambda: RECOVER)
+        run = root / RID; derive = v3.Writer._derive
+        def drift(self, *args, **kw):
+            result = derive(self, *args, **kw)
+            if defect == 'run':
+                run.rename(root / 'detached'); run.mkdir(mode=0o700)
+            elif defect == 'lock':
+                (run / '.writer.lock').rename(run / 'detached-lock')
+                (run / '.writer.lock').touch(mode=0o600)
+            else: (run / 'index.html').touch(mode=0o600)
+            return result
+        monkeypatch.setattr(v3.Writer, '_derive', drift)
+        with pytest.raises(store.StoreError):
+            s.recover_v3(RID)
+        for d in (run, root / 'detached'):
+            assert not list(d.glob('.stage-*'))
+            assert not (d / 'prepared.json').exists() and not (d / 'run_manifest.json').exists()
+
+
+def test_c4a_pinned_root_not_reopened(root, monkeypatch):
+    with store.RunStore(root) as s:
+        result, _ = _c4a_publish(s, monkeypatch, ('disabled',))
+        moved = root.parent / 'moved-root'; root.rename(moved); root.mkdir(mode=0o700)
+        before = _c4a_snapshot(moved)
+        assert s.open_v3(RID) == result and _c4a_snapshot(moved) == before
+        with store.RunStore(root) as different:
+            with pytest.raises(store.StoreError, match='RUN_NOT_FOUND'):
+                different.open_v3(RID)
+
+
+@pytest.mark.parametrize('kind', ['native', 'legacy'])
+def test_c4a_actual_old_v1_legacy_version_isolation(root, kind):
+    target = 'old-fixture.example.invalid'
+    args = dict(run_id=RID, expected_hosts=[dict(target_id=target,
+                inventory_authority_id=None, identity_key=target)], recorded_at=f.FIN,
+                started_at=f.TIME, run_kind='SYNTHETIC', evidence_schema_version='1.1.0',
+                source=dict(v2.SOURCE), limits=LIMITS, profile='extended',
+                requested_flags={target: {key: False for key in store.NATIVE_COLLECTORS}},
+                batch_contract=store.NATIVE_BATCH_CONTRACT)
+    if kind == 'legacy':
+        raw = b'{"fixture":"legacy"}'
+        source = dict(source_kind='LEGACY_IMPORT', producer_id='legacy-ol-run-summary',
+                      producer_version=None, origin_ref='fixture-source',
+                      input_sha256=hashlib.sha256(raw).hexdigest())
+        args.pop('batch_contract')
+        args.update(run_kind='LEGACY_IMPORT', evidence_schema_version='1.0.0',
+                    source=source, started_at=None, limits=None, profile=None,
+                    requested_flags=None, legacy_raw=raw,
+                    legacy_provenance=dict(format_version='1.0.0', source=source,
+                        original_run_id='old-fixture', original_generated_at=f.TIME,
+                        diagnostics=[dict(reason_code='LEGACY_REPORT_MISSING', count=1)]))
+    with store.RunStore(root) as s:
+        with s.begin(**args):
+            pass
+        before = _c4a_snapshot(root/RID)
+        with pytest.raises(store.StoreError): s.recover_v3(RID)
+        assert _c4a_snapshot(root/RID) == before
+        recovered = s.recover(RID)
+        assert recovered.manifest['manifest_version'] == '1.0.0'
+        assert s.open(RID) == recovered
+        before = _c4a_snapshot(root/RID)
+        with pytest.raises(store.StoreError): s.open_v3(RID)
+        assert _c4a_snapshot(root/RID) == before
+
+
+@pytest.mark.parametrize('kind', ['regular', 'directory', 'symlink'])
+def test_c4a_refuse_any_existing_marker(root, monkeypatch, kind):
+    with store.RunStore(root) as s:
+        with start(s, [blank(0, 'disabled')], monkeypatch):
+            pass
+        marker = root / RID / 'run_manifest.json'
+        if kind == 'directory': marker.mkdir(mode=0o700)
+        elif kind == 'symlink': marker.symlink_to('journal.json')
+        else:
+            marker.write_bytes(b'invalid marker'); marker.chmod(0o600)
+        before = _c4a_snapshot(root/RID)
+        with pytest.raises(store.StoreError, match='ALREADY_PUBLISHED'):
+            s.recover_v3(RID)
+        assert _c4a_snapshot(root/RID) == before

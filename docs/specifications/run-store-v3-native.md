@@ -164,3 +164,51 @@ from the real legal positive fixture. R2-P source and schema bytes remain
 unchanged. C3b worker integration and a public V3 consumer require separate
 approval; actual Controller/OL 9.7/9.8/9.9, storage durability, load/RSS,
 Inventory/SSH and release QA remain #28 work.
+
+## C4a explicit offline verification and recovery
+
+`RunStore.open_v3(run_id)` explicitly selects manifest/journal 1.1.0 and
+`B04_PRODUCER_V3` / `B04_V3_CAPACITY_R2` with the existing synthetic source.
+`RunStore.recover_v3(run_id)` explicitly selects the corresponding recovery
+path; `_open_v3` and `_recover_v3` delegate to the same implementations.
+`open` and `recover` continue to reject V3; the V3 entry points do not fall
+back to 1.0.0. No new CLI, scan, producer registration or derived publication
+is enabled. `PublishedRun` is a verified snapshot of manifest, document,
+assessed document and exact fixed-slot bytes, not a capability token. A
+caller must not turn a constructed or mutated snapshot into file authority.
+
+The V3 reader holds the existing shared per-run lock and checks the retained
+root FD identity plus the pinned run and lock identities against their
+non-follow names relative to the pinned root/run after acquiring the lock
+and before delivering a result. It does not reopen the original caller root
+path. A renamed root remains the pinned authority; a replaced root FD or a
+replaced/detached run or lock is rejected. The active prepared stage is
+pinned and rechecked. Canonical sealed journal/plan, frozen rules, terminal
+checkpoint replay, fixed artifact index, size/hash/bytes and capacities
+remain the publication authority. Reading does not write or refresh anything.
+The core namespace stays closed: no stable HTML/CSS, portal generation,
+foreign core or arbitrary detail slot. Existing bounded abandoned stages and
+private temps are not adopted, traversed or automatically removed; unsafe
+metadata is rejected.
+
+Explicit recovery holds the exclusive lock, rejects any pre-existing marker,
+and checks the unprepared namespace before staging. It preserves the existing
+prepared plan and exact core bytes, or derives the original unprepared
+recovery outcome from existing frozen rules, intents and terminal checkpoints.
+An intent without terminal is UNKNOWN; no intent is NOT_ATTEMPTED. Missing
+batch, assessed/CFF and assessment rules artifacts remain explicitly absent.
+No scan, reconnection, re-assessment of an interrupted acquisition, automatic
+retry or cleanup of abandoned material occurs. Before recovery writes and at
+the final marker switch the pinned identities are rechecked. After the marker
+temp is durable and before no-replace publication, the original sealed plan,
+frozen journal/rules, checkpoint set/digests and exact final core are verified
+again, without generating another assessment/CFF. A failed post-publication
+sync is DURABILITY_UNCONFIRMED, not a rollback or a success; use explicit
+`open_v3` for subsequent verification. Existing size and slot ceilings remain
+unchanged. The Catalog's `--recover` is unrelated to run recovery.
+
+These guarantees assume cooperating trusted local UID/administrator and the
+existing local POSIX filesystem contract, not an adversarial same-UID sandbox
+or a physical power-loss guarantee. Actual Controller/Oracle Linux, storage
+and formal release verification remain #28. C4b is a separate derived
+consumer/publication contract.

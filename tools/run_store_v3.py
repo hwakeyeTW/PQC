@@ -1,6 +1,6 @@
 """Private B04 V3 Store policy. The existing RunStore owns locks and pinned I/O.
 
-No acquisition/dispatch, public selector, arbitrary capacity or path inputs.
+No acquisition/dispatch, automatic version selector, arbitrary capacity or path inputs.
 The only authoritative inputs are the frozen reservation, canonical typed
 handoffs and final terminal checkpoints. Recompute derived artifacts on read.
 """
@@ -12,6 +12,7 @@ import math
 import os
 import re
 import secrets
+import stat
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -438,9 +439,25 @@ def _operation(fn):
 
 
 class Writer(m.RunWriter):
-    def __init__(self, fd, lock, device, journal):
+    def __init__(self, fd, lock, device, journal, *, recovery_guard=None):
         super().__init__(fd, lock, device, journal)
         self._cache = {}  # only validated, same-byte committed checkpoints
+        # Only the explicitly locked recovery entry supplies this guard.
+        self._recovery_guard = recovery_guard
+        self._recovery_checkpoints = None
+
+    def _guard_recovery(self):
+        if self._recovery_guard is not None:
+            self._recovery_guard()
+            m.require(not m._exists(self._fd, 'run_manifest.json'), 'ALREADY_PUBLISHED')
+
+    def _persist(self, parent, name, raw, *, guard=None, **kwargs):
+        if self._recovery_guard is not None:
+            check = self._guard_recovery if guard is None else guard
+            check()
+            kwargs['before_publish'] = check
+        m._write(parent, name, raw, self._device, **kwargs)
+
 
     def close(self):
         self._cache.clear()
@@ -449,6 +466,7 @@ class Writer(m.RunWriter):
     def _check(self, *, mutable=True):
         m.require(self._fd is not None and not self._poisoned, 'WRITER_CLOSED_OR_FAILED')
         m._check_dir(self._fd, self._device)
+        self._guard_recovery()
         m.require(not m._exists(self._fd, 'run_manifest.json'), 'ALREADY_PUBLISHED')
         if mutable:
             m.require(not m._exists(self._fd, 'prepared.json'), 'PUBLICATION_PREPARED')
@@ -459,7 +477,7 @@ class Writer(m.RunWriter):
 
     def _set_journal(self, j):
         _journal(j, self.run_id)
-        m._write(self._fd, 'journal.json', m._seal(j, MANIFEST_BYTES), self._device, replace_journal=True)
+        self._persist(self._fd, 'journal.json', m._seal(j, MANIFEST_BYTES), replace_journal=True)
         self._j = j
 
     def _capacity_failure(self, stage):
@@ -526,7 +544,9 @@ class Writer(m.RunWriter):
         total = 0; found = {}
         with m._directory(self._fd, ('checkpoints',), self._device) as d:
             for name in m._entries(d, 3000):
-                if re.fullmatch(r'\.tmp-[0-9a-f]{32}', name): continue
+                if re.fullmatch(r'\.tmp-[0-9a-f]{32}', name):
+                    m._check_file_stat(os.stat(name, dir_fd=d, follow_symlinks=False), self._device)
+                    continue
                 hid = name[:-5]; m.require(name.endswith('.json') and hid in allowed, 'FOREIGN_CHECKPOINT')
                 # Check per-file and cumulative budgets before reading.
                 f = m._open_file(d, name, self._device)
@@ -541,6 +561,12 @@ class Writer(m.RunWriter):
                     body = m._unseal(raw, CHECKPOINT_BYTES)
                     found[hid] = _verify_checkpoint(self._j, body, hid, rules, sha)
         m.require(set(self._cache) <= set(found), 'MISSING_TERMINAL_CHECKPOINT')
+        if self._recovery_guard is not None:
+            hashes = {hid: cp.seal_sha for hid, cp in found.items()}
+            if self._recovery_checkpoints is not None:
+                m.require(hashes == self._recovery_checkpoints, 'CHECKPOINT_MISMATCH')
+            self._recovery_checkpoints = hashes
+            self._cache.update(found)
         return found
 
     @_operation
@@ -555,6 +581,9 @@ class Writer(m.RunWriter):
     @_operation
     def _recover_unprepared(self):
         self._check(mutable=False); m.require(not m._exists(self._fd, 'prepared.json'), 'PUBLICATION_PREPARED')
+        # Reject a foreign/unsafe root namespace before deriving or staging
+        # anything. Unprepared recovery cannot adopt existing core slots.
+        _check_index(self._fd, self._device, {}, None, final_only=False)
         checkpoints = self._checkpoints(); now = _clock(); _order(self._latest(checkpoints.values()), now)
         result = self._derive(checkpoints, recovery=True, recorded=now, finished=None,
                               batch_raw=None, batch_rc=None)
@@ -667,17 +696,25 @@ class Writer(m.RunWriter):
         m.require(not m._exists(self._fd, 'prepared.json') and
                   not any(m._exists(self._fd, name) for name, _ in FILES.values()) and
                   not m._exists(self._fd, 'details'), 'UNPREPARED_CORE_ARTIFACT')
+        if self._recovery_guard is not None:
+            _check_index(self._fd, self._device, {}, None, final_only=False)
         stages = [n for n in m._entries(self._fd, m.MAX_SLOTS) if n.startswith('.stage-')]
         m.require(len(stages) < m.MAX_STAGES, 'RECOVERY_STAGE_LIMIT')
+        self._guard_recovery()
         stage = '.stage-' + secrets.token_hex(16); fd = m._mkdir(self._fd, stage, self._device)
         try:
+            def guard_stage():
+                self._guard_recovery()
+                _recheck_directory(self._fd, stage, fd, self._device)
             prepared = dict(prepared_version=VERSION, stage=stage, manifest=result.manifest)
             sealed = m._seal(prepared, MANIFEST_BYTES)
             for entry in result.manifest['artifacts']:
                 parts, _ = _slot(entry['kind'], entry['host_id'], entry['slot'])
+                if self._recovery_guard is not None:
+                    guard_stage()
                 with m._directory(fd, parts[:-1], self._device, create=True) as d:
-                    m._write(d, parts[-1], result.artifacts[entry['path']], self._device)
-            m._write(self._fd, 'prepared.json', sealed, self._device)
+                    self._persist(d, parts[-1], result.artifacts[entry['path']], guard=guard_stage)
+            self._persist(self._fd, 'prepared.json', sealed, guard=guard_stage)
             return self._resume(verified=result)
         finally:
             os.close(fd)
@@ -714,16 +751,40 @@ class Writer(m.RunWriter):
         self._check(mutable=False)
         p = self._plan(); manifest = p['manifest']
         with m._directory(self._fd, (p['stage'],), self._device) as stage:
+            def guard_stage():
+                self._guard_recovery()
+                _recheck_directory(self._fd, p['stage'], stage, self._device)
             result = self._replay(manifest, stage, verified)
             for entry in manifest['artifacts']:
                 parts, _ = _slot(entry['kind'], entry['host_id'], entry['slot'])
+                if self._recovery_guard is not None:
+                    guard_stage()
                 with m._directory(stage, parts[:-1], self._device) as src:
                     with m._directory(self._fd, parts[:-1], self._device, create=True) as dest:
                         if not m._has_at(self._fd, parts, self._device):
+                            if self._recovery_guard is not None:
+                                guard_stage()
                             m._rename_noreplace(src, parts[-1], dest, parts[-1])
                         m._sync(dest); m._sync(src)
-            self._replay(manifest, None, result)
-            m._write(self._fd, 'run_manifest.json', m._json_bytes(manifest, MANIFEST_BYTES), self._device)
+            marker = m._json_bytes(manifest, MANIFEST_BYTES)
+            if self._recovery_guard is None:
+                self._replay(manifest, None, result)
+                m._write(self._fd, 'run_manifest.json', marker, self._device)
+            else:
+                def before_marker():
+                    # The marker temp is durable but not yet published. Verify
+                    # frozen inputs and the exact final core again, without
+                    # deriving another assessment/CFF or rewriting a terminal.
+                    guard_stage()
+                    self._check(mutable=False)
+                    m.require(m._same(self._plan(), p), 'MANIFEST_MISMATCH')
+                    self._checkpoints()
+                    self._replay(manifest, None, result)
+                    _check_published_stage(self._fd, self._device, manifest, self._j, stage)
+                    guard_stage()
+                guard_stage()
+                m._write(self._fd, 'run_manifest.json', marker, self._device,
+                         before_publish=before_marker)
             return result
 
 
@@ -770,9 +831,19 @@ def _check_index(fd, device, entries, stage, *, final_only):
         if not staged:
             stage_names = {n for n in names if re.fullmatch(r'\.stage-[0-9a-f]{32}', n)}
             m.require(len(stage_names) <= m.MAX_STAGES, 'RECOVERY_STAGE_LIMIT')
-            names -= stage_names | {n for n in names if re.fullmatch(r'\.tmp-[0-9a-f]{32}', n)}
+            temps = {n for n in names if re.fullmatch(r'\.tmp-[0-9a-f]{32}', n)}
+            # Orphan stages remain bounded and are not traversed or adopted.
+            # Their fixed names do not excuse unsafe directory/file metadata.
+            for name in stage_names:
+                info = os.stat(name, dir_fd=d, follow_symlinks=False)
+                m.require(stat.S_ISDIR(info.st_mode) and info.st_dev == device and
+                          info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                          'UNSAFE_DIRECTORY')
+            for name in temps:
+                m._check_file_stat(os.stat(name, dir_fd=d, follow_symlinks=False), device)
+            names -= stage_names | temps
             names -= {'journal.json', v2.FROZEN_FILE, 'prepared.json', 'run_manifest.json', '.writer.lock', 'checkpoints'}
-        m.require(names <= core | {'details'}, 'UNINDEXED_ARTIFACT')
+        m.require(names <= core | ({'details'} if details else set()), 'UNINDEXED_ARTIFACT')
         if 'details' in names:
             with m._directory(d, ('details',), device) as dd:
                 hosts = set(m._entries(dd, 10)); m.require(hosts <= set(details), 'UNINDEXED_ARTIFACT')
@@ -787,8 +858,28 @@ def _check_index(fd, device, entries, stage, *, final_only):
     if stage is not None: check(stage, True)
 
 
+def _recheck_directory(parent, name, fd, device):
+    actual = m._check_dir(fd, device)
+    try:
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        raise m.StoreError('RUN_IDENTITY_CHANGED') from None
+    m.require(stat.S_ISDIR(named.st_mode) and actual.st_nlink > 0 and
+              (named.st_dev, named.st_ino) == (actual.st_dev, actual.st_ino),
+              'RUN_IDENTITY_CHANGED')
+
+
+def _check_published_stage(fd, device, manifest, journal, stage):
+    _check_index(fd, device, _manifest(manifest, journal), stage, final_only=True)
+    # Current stage cannot retain any indexed core file after publication.
+    # Empty generated directories may remain.
+    for entry in manifest['artifacts']:
+        parts, _ = _slot(entry['kind'], entry['host_id'], entry['slot'])
+        m.require(not m._has_at(stage, parts, device), 'DUPLICATE_ARTIFACT')
+
+
 def open_run(store, run_id):
-    with store._locked_run(run_id, shared=True) as (fd, lock):
+    with store._locked_v3_run(run_id, shared=True) as (fd, lock, recheck):
         m.require(m._exists(fd, 'run_manifest.json'), 'INCOMPLETE_RUN')
         try:
             j = _read_journal(fd, store._device, run_id)
@@ -798,13 +889,16 @@ def open_run(store, run_id):
                 plan = reader._plan()
                 m.require(m._same(plan['manifest'], manifest), 'MANIFEST_MISMATCH')
                 with m._directory(fd, (plan['stage'],), store._device) as stage:
-                    _check_index(fd, store._device, _manifest(manifest, j), stage, final_only=True)
-                    # Current stage cannot retain any indexed core file after
-                    # publication. Empty generated directories may remain.
-                    for entry in manifest['artifacts']:
-                        parts, _ = _slot(entry['kind'], entry['host_id'], entry['slot'])
-                        m.require(not m._has_at(stage, parts, store._device), 'DUPLICATE_ARTIFACT')
-                return reader._replay(manifest, None)
+                    _check_published_stage(fd, store._device, manifest, j, stage)
+                    result = reader._replay(manifest, None)
+                    _recheck_directory(fd, plan['stage'], stage, store._device)
+                    _check_published_stage(fd, store._device, manifest, j, stage)
+                    m.require(m._same(_read_journal(fd, store._device, run_id), j) and
+                              m._same(reader._plan(), plan) and
+                              m._read(fd, 'run_manifest.json', store._device, MANIFEST_BYTES) == raw,
+                              'MANIFEST_MISMATCH')
+                    recheck()
+                    return result
         except evidence.V3CapacityError as exc:
             raise CapacityError(exc.stage) from None
         except FileNotFoundError:
@@ -814,14 +908,16 @@ def open_run(store, run_id):
 
 
 def recover(store, run_id):
-    with store._locked_run(run_id, shared=False) as (fd, lock):
+    with store._locked_v3_run(run_id, shared=False) as (fd, lock, recheck):
         m.require(not m._exists(fd, 'run_manifest.json'), 'ALREADY_PUBLISHED')
         try:
             j = _read_journal(fd, store._device, run_id)
-            with Writer(os.dup(fd), os.dup(lock), store._device, j) as writer:
+            with Writer(os.dup(fd), os.dup(lock), store._device, j, recovery_guard=recheck) as writer:
                 return writer._resume() if m._exists(fd, 'prepared.json') else writer._recover_unprepared()
         except FileNotFoundError:
             raise m.StoreError('INCOMPLETE_RUN') from None
+        except (bridge.BridgeError, KeyError, TypeError, IndexError, OverflowError, RecursionError):
+            raise m.StoreError('INVALID_STORE_DATA') from None
 
 
 def manifest_schema_v3():
