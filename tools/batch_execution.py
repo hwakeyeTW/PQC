@@ -3309,24 +3309,39 @@ class _ProducerSession:
                 ledger.worker_failed(name, 'CONTROLLER_CLEANUP_UNCONFIRMED')
         # Freeze only after all original lifecycle and Handoff cleanup
         # decisions. The private path never enters the legacy aggregation.
+        cancellation = {signal.SIGINT, signal.SIGTERM}
         mask = None if workflow is None else signal.pthread_sigmask(
-            signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM))
-        try:
-            if interrupted() or (workflow is not None and
-                    {signal.SIGINT, signal.SIGTERM} & signal.sigpending()):
-                # At the masked terminal-freeze boundary, pending acquisition
-                # signals belong to the original terminal decision. Consume
-                # those exact pending signals so they are not counted twice.
-                if workflow is not None:
-                    for sig in {signal.SIGINT, signal.SIGTERM} & signal.sigpending():
-                        signal.sigwait({sig})
-                ledger.fail('INTERRUPTED')
+            signal.SIG_BLOCK, cancellation)
+
+        def validated_terminal():
             rows = ledger.finish()
             # Use the original B05 classification with platform excluded.
             rc, base = _manifest(ctx, [_v2_base_row(r) for r in rows], ledger.stop)
             manifest = {**base, 'batch_manifest_version': 2, 'hosts': rows}
             validate_producer_manifest(manifest, rc)
+            return rows, rc, manifest
+
+        try:
+            if interrupted():
+                ledger.fail('INTERRUPTED')
+            rows, rc, manifest = validated_terminal()
             if workflow is not None:
+                pending = cancellation & signal.sigpending()
+                if pending and rc != 7:
+                    # Cancellation is sticky. Rebuild and validate the rc7
+                    # terminal at most once, including arrivals during validation.
+                    ledger.fail('INTERRUPTED')
+                    rows, rc, manifest = validated_terminal()
+                    pending = cancellation & signal.sigpending()
+                # The LAST snapshot, after the applicable validation, is the
+                # masked linearization point. Consume only that observed set,
+                # once per signal, without waiting or sampling it again. New
+                # distinguishable pending signals survive to the storage latch
+                # on unmask; ordinary same-signal coalescing is unavoidable.
+                for sig in sorted(pending):
+                    info = signal.sigtimedwait({sig}, 0)
+                    require(info is not None and info.si_signo == sig,
+                            3, 'NATIVE_CONTEXT_UNVERIFIED')
                 workflow.freeze(rc)
         finally:
             if mask is not None:

@@ -693,3 +693,195 @@ def test_c3b_final_terminal_boundary(native, monkeypatch, mode):
             assert f'details/{hid}/{v3.HANDOFF}.json' in p.artifacts
     assert len(launches) == 1
     check_stopped(launches, trap, before)
+
+
+# S-C3B-PENDING-SIGNAL-FREEZE: exercise the actual Controller handler,
+# producer ledger/validators and V3 writer with real blocked POSIX signals.
+@pytest.mark.parametrize('mode,signum', [
+    ('none', signal.SIGTERM), ('before-mask', signal.SIGTERM),
+    ('during-validation', signal.SIGTERM), ('during-validation', signal.SIGINT),
+    ('after-validation', signal.SIGTERM), ('after-validation', signal.SIGINT),
+    ('during-revalidation', signal.SIGTERM), ('prior-and-pending', signal.SIGTERM),
+    ('late-only', signal.SIGTERM), ('prior-and-late', signal.SIGTERM),
+    ('pending-and-late', signal.SIGTERM), ('after-sample', signal.SIGTERM),
+    ('after-consume', signal.SIGTERM),
+])
+def test_c3b_pending_signal_freeze(native, monkeypatch, mode, signum):
+    make, trace, trap, _, root = native
+    ctx, names = make(count=1, flags=original_batch.selected_flags())
+    control, validated, sent, checkpoints = [], [], [], []
+    frozen, inside = [], False
+    cancellation = {signal.SIGINT, signal.SIGTERM}
+    before = original_batch._signal_state()
+    reserve = workflow._Control.reserve
+    close = batch._ProducerSession.close
+    validator = batch.validate_producer_manifest
+    outcome = batch._valid_v2_outcome
+    freeze = workflow._Control.freeze
+    record = v3.Writer.record_host
+    pending = signal.sigpending
+    wait = signal.sigtimedwait
+
+    def send(label, sig, *, masked=True):
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        assert (cancellation <= mask) is masked
+        assert sig not in pending()
+        assert control[0].frozen is (label == 'after-freeze')
+        sent.append((label, sig, control[0].frozen))
+        os.kill(os.getpid(), sig)
+        assert (sig in pending()) is masked
+
+    def reserved(self, ledger):
+        reserve(self, ledger)
+        control.append(self)
+
+    def closed(self):
+        result = close(self)
+        if not sent and mode in ('before-mask', 'prior-and-pending', 'prior-and-late'):
+            assert result and not control[0].frozen
+            send('before-mask', signum, masked=False)
+        return result
+
+    def observed_outcome(*args, **kwargs):
+        if inside and not sent and mode == 'during-validation':
+            send('during-validation', signum)
+        if (inside and mode == 'during-revalidation' and validated == [6]
+                and len(sent) == 1):
+            send('during-revalidation', signal.SIGINT)
+        return outcome(*args, **kwargs)
+
+    def observed_validator(manifest, rc):
+        nonlocal inside
+        if control[0].frozen:
+            return validator(manifest, rc)
+        inside = True
+        try:
+            result = validator(manifest, rc)
+        finally:
+            inside = False
+        validated.append(rc)
+        if ((mode in ('after-validation', 'during-revalidation', 'pending-and-late',
+                      'after-sample', 'after-consume') and not sent)
+                or (mode == 'prior-and-pending' and len(sent) == 1)):
+            send('after-validation', signum)
+        return result
+
+    def observed_pending():
+        snapshot = pending()
+        # A distinct new signal arriving after the final snapshot is not
+        # part of the sampled acquisition set, even before frozen=True.
+        if (mode == 'after-sample' and validated == [6, 7]
+                and not control[0].frozen and len(sent) == 1):
+            assert snapshot == {signum}
+            send('after-sample', signal.SIGINT)
+        return snapshot
+
+    def observed_wait(sigset, timeout):
+        info = wait(sigset, timeout)
+        # A new instance of the same ordinary signal *after* the sampled
+        # instance was consumed is independently observable, not coalesced.
+        if mode == 'after-consume' and len(sent) == 1:
+            assert info is not None and info.si_signo == signum
+            send('after-consume', signum)
+        return info
+
+    def observed_freeze(self, rc):
+        assert self is control[0] and not self.frozen and validated[-1] == rc
+        freeze(self, rc)
+        frozen.append(rc)
+        if mode in ('late-only', 'prior-and-late', 'pending-and-late'):
+            send('after-freeze', signal.SIGINT if mode == 'pending-and-late' else signum)
+
+    def observed_record(self, fragment, **kwargs):
+        assert control[0].frozen and not cancellation & pending()
+        result = record(self, fragment, **kwargs)
+        checkpoints.append(kwargs['terminal'])
+        return result
+
+    monkeypatch.setattr(workflow._Control, 'reserve', reserved)
+    monkeypatch.setattr(batch._ProducerSession, 'close', closed)
+    monkeypatch.setattr(batch, '_valid_v2_outcome', observed_outcome)
+    monkeypatch.setattr(batch, 'validate_producer_manifest', observed_validator)
+    monkeypatch.setattr(workflow._Control, 'freeze', observed_freeze)
+    monkeypatch.setattr(v3.Writer, 'record_host', observed_record)
+    monkeypatch.setattr(signal, 'sigpending', observed_pending)
+    monkeypatch.setattr(signal, 'sigtimedwait', observed_wait)
+    launches = original_batch._observe_native_queue(monkeypatch)
+    late = mode in ('late-only', 'prior-and-late', 'pending-and-late', 'after-sample', 'after-consume')
+    rc = 6 if mode in ('none', 'late-only') else 7
+    expected_validated = [6, 7] if mode in ('during-validation', 'after-validation',
+        'during-revalidation', 'pending-and-late', 'after-sample', 'after-consume') else [rc]
+    with store.RunStore(root) as s:
+        if late:
+            with pytest.raises(workflow._WorkflowError) as err:
+                workflow._execute_scan_workflow(ctx, s, RULES_RAW)
+            assert (err.value.stage, err.value.reason, err.value.batch_rc) == (
+                'CHECKPOINT', 'PERSISTENCE_CANCELLED', rc)
+            assert not err.value.publication_unconfirmed and control[0].late_interrupted
+            run, j = journal(root)
+            assert not checkpoints and not list((run / 'checkpoints').iterdir())
+            assert not (run / 'run_manifest.json').exists() and not j['intents']
+            p = s._recover_v3(run.name)
+            assert p.manifest['recovery'] and p.manifest['hosts'][0]['attempt_status'] == 'NOT_ATTEMPTED'
+        else:
+            try:
+                result = workflow._execute_scan_workflow(ctx, s, RULES_RAW)
+            except workflow._WorkflowError as exc:
+                pytest.fail(f'expected acquisition rc{rc} publication, got {exc.stage}/{exc.reason}, '
+                            f'rc={exc.batch_rc}, validated={validated}, frozen={frozen}, sent={sent}')
+            assert result.batch_rc == rc and not result.late_interrupted
+            assert result.batch_manifest['reason_code'] == ('INTERRUPTED' if rc == 7 else 'NO_EXECUTABLE_COLLECTORS')
+            p = published(root, s, result)
+            run, j = journal(root)
+            assert (run / 'run_manifest.json').is_file() and not j['intents']
+            cp, = (run / 'checkpoints').glob('h-*.json')
+            body = store._unseal(cp.read_bytes(), v3.CHECKPOINT_BYTES)
+            assert checkpoints == result.batch_manifest['hosts'] == [body['terminal']]
+            assert body['attempted'] is False and p.manifest['hosts'][0]['attempted'] is False
+    assert validated == expected_validated and frozen == [rc]
+    assert len(sent) == (0 if mode == 'none' else 2 if mode in ('during-revalidation',
+        'prior-and-pending', 'prior-and-late', 'pending-and-late', 'after-sample', 'after-consume') else 1)
+    assert not launches and not cancellation & pending()
+    check_stopped(launches, trap, before)
+
+
+def test_c3b_pending_with_native_observations(native, monkeypatch):
+    make, trace, trap, _, root = native
+    ctx, names = make(count=1, flags=original_batch.selected_flags(bridge.CERT_FLAG))
+    fixtures._cert_s2_register(monkeypatch, ctx, trace)
+    reserve, validator = workflow._Control.reserve, batch.validate_producer_manifest
+    owned, decisions = [], []
+    launches = original_batch._observe_native_queue(monkeypatch)
+    before = original_batch._signal_state()
+
+    def reserved(self, ledger):
+        reserve(self, ledger)
+        owned.append((self, ledger))
+
+    def observe(manifest, rc):
+        result = validator(manifest, rc)
+        control, ledger = owned[0]
+        if not control.frozen:
+            assert control.session.handoff is None and len(launches) == 1
+            with pytest.raises(ProcessLookupError):
+                os.kill(launches[0][1], 0)
+            assert ledger.wires[names[0]] and ledger.projections[names[0]].document['collections']
+            decisions.append((rc, json.loads(json.dumps(manifest['hosts']))))
+            if len(decisions) == 1:
+                assert signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+                os.kill(os.getpid(), signal.SIGTERM)
+                assert signal.SIGTERM in signal.sigpending() and not control.frozen
+        return result
+
+    monkeypatch.setattr(workflow._Control, 'reserve', reserved)
+    monkeypatch.setattr(batch, 'validate_producer_manifest', observe)
+    with store.RunStore(root) as s:
+        result = workflow._execute_scan_workflow(ctx, s, RULES_RAW)
+        p = published(root, s, result)
+    assert len(decisions) == 2 and decisions[0][0] in (0, 5) and decisions[1][0] == 7
+    assert decisions[0][1] == decisions[1][1] == result.batch_manifest['hosts']
+    assert result.batch_rc == 7 and result.batch_manifest['reason_code'] == 'INTERRUPTED'
+    assert not result.late_interrupted and p.document['collections']
+    hid = p.manifest['expected_host_ids'][0]
+    assert p.artifacts[f'details/{hid}/{v3.HANDOFF}.json'] == owned[0][1].wires[names[0]]
+    check_stopped(launches, trap, before)
