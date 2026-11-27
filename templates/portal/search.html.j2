@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search | Run {{ run_id }}</title>
+<link rel="stylesheet" href="../portal.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="masthead"><div class="wrap"><p class="brand">PQC Report Portal</p>
+<nav aria-label="Breadcrumb"><a href="../../index.html">History</a> / <a href="../index.html">{{ run_id }}</a> / <span aria-current="page">Search</span></nav></div></header>
+<main id="main" class="wrap">
+<section class="hero"><h1>Search this run</h1>
+<p>Saved, verified offline data only. The seven tables use different record units. Matching hosts are not a coverage, security or PQC readiness score.</p>
+<p>Expected hosts: {{ ids|length }}. Source: {{ source|join(' / ') }}.</p>
+{% if not assessed %}<p id="not-assessed">Assessment not present; no assessment verdict or denominator inferred.</p>{% endif %}
+{% if not flags_known %}<p id="flags-unknown">No trusted frozen request flags; coverage lists actual collections, not invented terminal results.</p>{% endif %}
+<p id="inventory-group">Inventory group: not recorded. Group filtering is unavailable.</p>
+<nav class="jump" aria-label="Search categories">{% for t in tables %}<a href="#search-{{ t.name }}">{{ t.name|capitalize }}</a>{% endfor %}</nav>
+<nav class="jump" aria-label="Original sections">{% for t in tables %}<a href="{{ t.name }}.html">{{ t.name|capitalize }} overview</a>{% endfor %}</nav>
+<p>Search uses trimmed Unicode NFKC, case-insensitive literal text on visible fields. Each selector is single choice; different filters combine with AND. Observation and saved claim states are independent. Dates refer to recorded UTC calendar days (inclusive); no current-time calculation. Sort ties use fixed canonical IDs; missing or conflicting values sort last in either direction.</p>
+<noscript><p id="no-js">JavaScript is disabled. All saved rows and original links remain available below; interactive controls require JavaScript.</p></noscript>
+</section>
+{% for t in tables %}
+<section id="search-{{ t.name }}" data-category="{{ t.name }}">
+<h2>{{ t.name|capitalize }}</h2>
+{% if t.name in ('algorithms', 'libraries', 'certificates', 'services') %}<p>One row per recorded group and member host. Same-name records do not establish a relationship.</p>{% endif %}
+{% if t.unresolved %}<p>{{ t.unresolved }} unresolved saved claims are not assigned to invented groups. <a href="{{ t.name }}.html#unresolved-claims">Recorded unresolved claims</a>.</p>{% endif %}
+{% if t.name == 'findings' %}{% if not assessed %}<p>Not assessed; saved finding count unknown.</p>{% elif not t.total %}<p>Zero saved findings; this does not imply PASS.</p>{% endif %}{% endif %}
+{% if t.name == 'coverage' %}<p>Original counts and denominators: <a href="coverage.html#summary-metrics">recorded metrics</a>. Search does not recompute them.</p>{% endif %}
+<fieldset data-controls hidden><legend>Filter and sort {{ t.name }}</legend>
+<label>Search <input data-filter="query" type="search" autocomplete="off"></label>
+<label>Host <select data-filter="host"><option value="">All hosts</option>{% for hid in ids %}<option value="{{ hid }}">{{ hosts[hid].target_id }} ({{ hid }})</option>{% endfor %}</select></label>
+<label>State <select data-filter="state"><option value="">All states</option>{% for state in t.states %}<option value="{{ state }}">{{ state }}</option>{% endfor %}</select></label>
+{% if t.name == 'hosts' %}
+<label>OS family <input data-filter="family" type="search" autocomplete="off"></label>
+<label>Distribution <input data-filter="distribution" type="search" autocomplete="off"></label>
+<label>OS version <input data-filter="osversion" type="search" autocomplete="off"></label>
+{% endif %}
+{% if t.name in ('algorithms', 'libraries', 'certificates', 'services', 'findings') %}
+<label>Evidence level <select data-filter="level"><option value="">All levels</option>{% for level in ('L1','L2','L3','L4','L5') %}<option value="{{ level }}">{{ level }}</option>{% endfor %}</select></label>
+<label>Record type <select data-filter="basis"><option value="">Observation or claim</option><option value="observation">Typed observation</option><option value="claim">Saved claim</option></select></label>
+<label>Typed state <select data-filter="typed-state"><option value="">All typed states</option><option value="__NONE__">No recorded typed value</option>{% for state in ('PRESENT','ABSENT','SUPPORTED','UNSUPPORTED','ALLOWED','DISALLOWED','NEGOTIATED','REJECTED','OBSERVED','CONTRADICTED','PASS','FAIL','PARTIAL','UNKNOWN','NOT_SCANNED','NOT_APPLICABLE','ERROR','TIMEOUT','PERMISSION_DENIED','UNREACHABLE') %}<option value="{{ state }}">{{ state }}</option>{% endfor %}</select></label>
+{% endif %}
+{% if t.name == 'certificates' %}
+<label>Not before from (UTC) <input type="date" data-filter="before-min"></label>
+<label>Not before through (UTC) <input type="date" data-filter="before-max"></label>
+<label>Not after from (UTC) <input type="date" data-filter="after-min"></label>
+<label>Not after through (UTC) <input type="date" data-filter="after-max"></label>
+{% endif %}
+<label>Sort by <select data-filter="sort"><option value="key">Canonical ID</option><option value="name">Record name</option><option value="host">Host name</option><option value="state">State</option>{% if t.name in ('hosts','algorithms','libraries','findings') %}<option value="version">Version (text)</option>{% endif %}<option value="refs">Recorded references (integer)</option>{% if t.name == 'certificates' %}<option value="before">Paired not before (UTC)</option><option value="after">Paired not after (UTC)</option>{% endif %}</select></label>
+<label>Direction <select data-filter="direction"><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
+<button type="button" data-reset>Reset</button>
+<p role="alert" data-error hidden>Invalid date range. Correct the input or Reset.</p>
+</fieldset>
+<p role="status" aria-live="polite" data-count><span data-matched>{{ t.total }}</span> / <span data-total>{{ t.total }}</span> matched rows; <span data-hosts>{{ t.host_count }}</span> / <span data-expected>{{ ids|length }}</span> matched unique hosts / expected hosts.</p>
+{% if not t.total %}<p data-empty>No saved rows in this category. Missing records do not imply a successful scan.</p>{% endif %}
+<p data-no-results hidden>No matching rows for these filters.</p>
+<div class="scroll"><table><thead><tr><th>Host</th><th>Record / state</th><th>Saved fields</th><th>Typed records</th><th>Recorded source</th><th>Original references</th></tr></thead>
+<tbody>
+{% for r in t.rows %}<tr data-result data-key="{{ r.key }}" data-host="{{ r.host }}" data-target="{{ r.target }}" data-name="{{ r.name }}" data-state="{{ r.state }}" data-version="{{ r.version if r.version is not none else '' }}" data-refs="{{ r.ref_count }}" data-pairs="{{ r.typed }}" data-before="{{ r.interval[0] or '' }}" data-after="{{ r.interval[1] or '' }}"{% if t.name == 'hosts' %} data-family="{{ r.os_fields[0] }}" data-distribution="{{ r.os_fields[1] }}" data-osversion="{{ r.os_fields[2] }}"{% endif %}>
+<th scope="row"><a href="{{ r.host_href }}">{{ r.target }}</a><br>{{ r.host }}</th>
+<td>{{ r.name }}<br>{{ r.state }}</td>
+<td>{% for label,value in r.fields %}{{ label }}: {{ value }}<br>{% endfor %}</td>
+<td>{% for basis,level,state,ref in r.pairs %}{{ basis }} / {{ level }} / {{ state }} / {{ ref }}<br>{% else %}No recorded typed value / unknown{% endfor %}</td>
+<td>{% for src in r.sources %}{{ src|join(' / ') }}<br>{% else %}No recorded evidence source{% endfor %}</td>
+<td>{% for label,href in r.links %}<a href="{{ href }}">{{ label }}</a><br>{% endfor %}</td>
+</tr>{% endfor %}
+</tbody></table></div>
+</section>
+{% endfor %}
+</main>
+<footer class="wrap footer">Saved verified offline search preview. No new assessment, service probing or publication.</footer>
+<script>
+'use strict';
+(() => {
+  const norm = value => value.trim().normalize('NFKC').toLowerCase();
+  const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const missing = value => value === '' || ['unknown', 'conflict', 'unknown / not recorded', 'missing_metadata'].includes(norm(value));
+  const validDay = value => {
+    if (!value) return true;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const instant = new Date(value + 'T00:00:00Z');
+    return !Number.isNaN(instant.getTime()) && instant.toISOString().slice(0, 10) === value;
+  };
+  for (const section of document.querySelectorAll('section[data-category]')) {
+    const fieldset = section.querySelector('[data-controls]');
+    const fields = new Map();
+    for (const input of fieldset.querySelectorAll('[data-filter]')) fields.set(input.dataset.filter, input);
+    const get = key => fields.has(key) ? fields.get(key).value : '';
+    const body = section.querySelector('tbody');
+    // These are the actual pre-rendered rows, not a new data source. No
+    // selectors, HTML or URLs are constructed from any saved input.
+    const rows = Array.from(body.querySelectorAll('tr[data-result]'), node => ({
+      node, data: node.dataset, text: norm(node.textContent), pairs: JSON.parse(node.dataset.pairs)
+    }));
+    const matchPair = (row, basis, level, state) => {
+      if (!basis && !level && !state) return true;
+      if (state === '__NONE__') return !basis && !level && row.pairs.length === 0;
+      return row.pairs.some(pair => (!basis || pair[0] === basis) &&
+        (!level || pair[1] === level) && (!state || pair[2] === state));
+    };
+    const update = () => {
+      const query = norm(get('query')), host = get('host'), state = get('state');
+      const basis = get('basis'), level = get('level'), typed = get('typed-state');
+      const dates = [get('before-min'), get('before-max'), get('after-min'), get('after-max')];
+      const invalid = dates.some(value => !validDay(value)) ||
+        (dates[0] && dates[1] && dates[0] > dates[1]) || (dates[2] && dates[3] && dates[2] > dates[3]) ||
+        ['before-min','before-max','after-min','after-max'].some(k => fields.has(k) && fields.get(k).validity.badInput);
+      section.querySelector('[data-error]').hidden = !invalid;
+      const dateFilter = dates.some(Boolean);
+      const inRange = (value, low, high) => (!low || value >= low) && (!high || value <= high);
+      const hostMatches = new Set(); let matches = 0;
+      for (const row of rows) {
+        const d = row.data;
+        const osMatch = ['family','distribution','osversion'].every(k => !get(k) || norm(d[k] || '').includes(norm(get(k))));
+        const dateMatch = !dateFilter || (d.before && d.after && !['UNKNOWN','CONFLICT'].includes(d.state) &&
+          inRange(d.before.slice(0,10), dates[0], dates[1]) && inRange(d.after.slice(0,10), dates[2], dates[3]));
+        const visible = !invalid && (!query || row.text.includes(query)) && (!host || d.host === host) &&
+          (!state || d.state === state) && osMatch && dateMatch && matchPair(row, basis, level, typed);
+        row.node.hidden = !visible;
+        if (visible) { matches += 1; hostMatches.add(d.host); }
+      }
+      const key = get('sort'), direction = get('direction') === 'desc' ? -1 : 1;
+      const sortValue = d => {
+        switch (key) {
+          case 'name': return d.name;
+          case 'host': return d.target;
+          case 'state': return d.state;
+          case 'version': return d.version;
+          case 'refs': return d.refs;
+          case 'before': return d.before;
+          case 'after': return d.after;
+          default: return d.key;
+        }
+      };
+      const sorted = rows.slice().sort((a,b) => {
+        const x = sortValue(a.data), y = sortValue(b.data);
+        if (key === 'refs') return direction * cmp(Number(x), Number(y)) || cmp(a.data.key,b.data.key);
+        // Known dates are canonical UTC ISO strings. Unknown/conflict/null
+        // always sort last, independently of the selected direction.
+        const mx = missing(x), my = missing(y);
+        if (mx !== my) return mx ? 1 : -1;
+        return (!mx ? direction * cmp(norm(x),norm(y)) : 0) || cmp(a.data.key,b.data.key);
+      });
+      const fragment = document.createDocumentFragment();
+      for (const row of sorted) fragment.appendChild(row.node);
+      body.appendChild(fragment);
+      section.querySelector('[data-matched]').textContent = String(matches);
+      section.querySelector('[data-hosts]').textContent = String(hostMatches.size);
+      section.querySelector('[data-no-results]').hidden = invalid || matches !== 0 || rows.length === 0;
+    };
+    for (const input of fields.values()) {
+      input.addEventListener('input', update);
+      input.addEventListener('change', update);
+    }
+    section.querySelector('[data-reset]').addEventListener('click', () => {
+      for (const input of fields.values()) {
+        if (input.tagName === 'SELECT') input.selectedIndex = 0;
+        else input.value = '';
+      }
+      update();
+    });
+    update(); fieldset.hidden = false;
+  }
+})();
+</script>
+</body>
+</html>
