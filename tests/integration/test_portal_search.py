@@ -343,3 +343,451 @@ def test_search_rejects_bidi_at_original_store_boundary(tmp_path,monkeypatch):
         crypto_fixture.publish_crypto(root)
     assert exc.value.code=='STRING'
     assert not list(root.glob('*/run_manifest.json'))
+
+
+# SEARCH-B: actual publication of the unchanged SEARCH-A page. External
+# engineering oracle separately compares the original K renderers on the
+# same immutable input bytes, before any candidate modifications.
+
+def _search_b_setup(tmp_path, kind='zero', *, history=True):
+    root = tmp_path / 'reports'; root.mkdir(mode=0o700)
+    pub = (publish_assets(root, assessed=True, coverage_extra=True) if kind == 'assets'
+           else original._cb2a_publication(root, tmp_path, kind))
+    if history:
+        catalog.build_catalog(root)
+    rid = pub.manifest['run_id']
+    return root, pub, rid, root / rid
+
+
+def _search_b_receipt(run, pub):
+    gen = run / 'portal-v6'; names = set(p.name for p in gen.iterdir())
+    pages = {n: (gen / n).read_bytes() for n in names - {portal._RECEIPT}}
+    assert names == set(portal._v6_layout(pub)[0]) - {'index.html', 'portal.css'}
+    h = len(pub.manifest['expected_host_ids'])
+    assert len(pages) == 14 + 3*h and len(names) == 15 + 3*h
+    assert (run / 'index.html').read_bytes().startswith(b'<!-- PQC portal-v6 -->\n')
+    receipt = rs._json_bytes(dict(format=6, run_id=pub.manifest['run_id'],
+        manifest_sha256=digest((run / 'run_manifest.json').read_bytes()),
+        index_sha256=digest((run / 'index.html').read_bytes()),
+        css_sha256=digest((run / 'portal.css').read_bytes()),
+        pages=[dict(name=n,size=len(raw),sha256=digest(raw)) for n,raw in sorted(pages.items())]), 1024**2)
+    assert (gen / portal._RECEIPT).read_bytes() == receipt
+    assert gen.stat().st_mode & 0o777 == 0o700
+    assert all(p.stat().st_mode & 0o777 == 0o600 and p.stat().st_nlink == 1 for p in gen.iterdir())
+    return pages
+
+
+def _search_b_links(root, rid):
+    # Check the actual active files after relocation, not a synthetic URL map.
+    run = root / rid; gen = run / 'portal-v6'
+    anchors = {}
+    for path in [root/'index.html', run/'index.html', *sorted(gen.glob('*.html'))]:
+        parsed = HTML(path.read_bytes())
+        hrefs = parsed.links + [a['href'] for tag,a in parsed.tags if tag=='link' and 'href' in a]
+        for href in hrefs:
+            u = urlsplit(href)
+            assert not (u.scheme or u.netloc or u.query or u.path.startswith('/')), href
+            target = (path.parent/u.path).resolve() if u.path else path
+            assert target.is_relative_to(root) and target.is_file(), (path.name, href)
+            if u.fragment:
+                if target not in anchors: anchors[target] = HTML(target.read_bytes()).ids
+                assert u.fragment in anchors[target], (path.name,href)
+    root_html = HTML((run/'index.html').read_bytes())
+    assert 'portal-v6/search.html' in root_html.links
+    assert all(not u.startswith('portal-v5/') for u in root_html.links)
+    search_html=HTML((gen/'search.html').read_bytes())
+    assert '../index.html' in search_html.links and '../../index.html' in search_html.links
+    assert sum(tag=='script' for tag,a in search_html.tags)==1
+    assert all(tag!='script' for tag,a in root_html.tags)
+    assert any(tag=='noscript' for tag,a in search_html.tags)
+    assert all(not any(k.startswith('on') or k in ('src','srcset','action','formaction') for k in a)
+               for tag,a in search_html.tags)
+
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_search_b_actual_store_publication(tmp_path, monkeypatch, kind):
+    pub,pp,raw,root,old,_=fixture(tmp_path,monkeypatch,kind,history=True)
+    rid=pub.manifest['run_id'];run=root/rid;before=original._cc_bytes(run)
+    calls=defaultdict(int); captured={}
+    def watch(name, fn, unpack=lambda x:x):
+        def call(*args, **kwargs):
+            calls[name]+=1
+            result=fn(*args, **kwargs);captured[name]=unpack(result)
+            return result
+        return call
+    actual_search=search._render_search_page
+    def render_search(p,c,a,s,**limits):
+        calls['search']+=1
+        assert p is captured['open'] and c is captured['crypto'] and a is captured['asset'] and s is captured['summary']
+        assert limits['page_limit']==ca._MAX_HTML and 0<limits['html_limit']<ca._MAX_HTML_TOTAL
+        assert 0<limits['bundle_limit']<ca._MAX_BUNDLE
+        return actual_search(p,c,a,s,**limits)
+    with monkeypatch.context() as m:
+        for obj,name,label,unpack in [(rs.RunStore,'open','open',lambda x:x),
+            (crypto,'project_crypto_indexes','crypto',lambda x:x),
+            (assets,'_render_asset_indexes','asset',lambda x:x[0]),
+            (summary,'_render_summary_projection','summary',lambda x:x[0]),
+            (cbom_validation,'validate_cbom_bytes','cbom',lambda x:x)]:
+            m.setattr(obj,name,watch(label,getattr(obj,name),unpack))
+        m.setattr(search,'_render_search_page',render_search)
+        assert portal.render_run(root,rid,with_portal_search=True)==run/'index.html'
+    # Original C-C test_cb2b2_actual_call_through expects exactly two
+    # crypto projections: C2's internal membership check and the shared
+    # assembler projection. SEARCH-B must not add a third.
+    assert calls=={'open':1,'crypto':2,'asset':1,'summary':1,'cbom':len(pub.manifest['expected_host_ids']),'search':1}
+    after=original._cc_bytes(run)
+    assert all(after[n]==v for n,v in before.items())
+    pages=_search_b_receipt(run,pub)
+    assert pages.pop('search.html')==raw and pages==old[2]
+    assert (run/'portal.css').read_bytes()==old[1]
+    assert b'Verified generated downloads (published)' in (run/'index.html').read_bytes()
+    assert b'not published' not in (run/'index.html').read_bytes()
+    assert b'Private buffered report' not in (run/'index.html').read_bytes()
+    assert b'Use the History breadcrumb to return to the run catalog' in (run/'index.html').read_bytes()
+    assert {n:{r['data-key'] for r in HTML(raw).rows[n]} for n in search._CATEGORIES}==expected(pub,pp)
+    with rs.RunStore(root) as store: assert store.open(rid)==pub
+    catalog.build_catalog(root); row=original._cc_row(root,rid)
+    assert row['portal_status']=='AVAILABLE' and row['portal_generation']=='portal-v6' and row['href']==rid+'/index.html'
+    assert catalog.check_catalog(root)==json.loads((root/catalog.JSON).read_bytes())['generation']
+    relocated=tmp_path/'relocated archive';shutil.copytree(root,relocated)
+    _search_b_links(relocated,rid)
+    print('V6_ACTUAL',kind,'hosts',len(pub.manifest['expected_host_ids']), 'search',len(raw),digest(raw),flush=True)
+
+
+@pytest.mark.parametrize('version',[1,2,3,4,5])
+def test_search_b_upgrade_exact_prior_and_no_downgrade(tmp_path,monkeypatch,version):
+    import itertools
+    from test_run_catalog import v1
+    root,pub,rid,run=_search_b_setup(tmp_path,'native-v1' if version==5 else 'zero')
+    if version==1:v1(root,rid,pub)
+    else:portal.render_run(root,rid,with_history=version==3,with_crypto_indexes=version==4,with_portal_v5=version==5)
+    catalog.build_catalog(root);assert original._cc_row(root,rid)['portal_generation']=='portal-v'+str(version)
+    before=original._cc_bytes(root)
+    with pytest.raises(rs.StoreError,match='PORTAL_OUTPUT_COLLISION'):
+        portal.render_run(root,rid,with_portal_search=True)
+    assert original._cc_bytes(root)==before
+    # Bounded equivalent of a V5 receipt above the legacy 256 KiB cap. Only
+    # the legacy receipt limit is lowered; actual valid V5 bytes stay intact.
+    if version==5:
+        size=(run/'portal-v5'/portal._RECEIPT).stat().st_size
+        monkeypatch.setattr(portal,'_MAX_RECEIPT',size-1)
+    core=original._cc_bytes(run)
+    portal.render_run(root,rid,refresh_portal=True,with_history=True,with_crypto_indexes=True,
+                      with_portal_v5=True,with_portal_search=True)
+    after=original._cc_bytes(run)
+    assert all(after[n]==v for n,v in core.items() if n!='index.html')
+    assert after['index.html'][1]!=core['index.html'][1]
+    _search_b_receipt(run,pub);catalog.build_catalog(root)
+    assert original._cc_row(root,rid)['portal_generation']=='portal-v6'
+    (root/catalog.JSON).unlink();(root/catalog.HTML).unlink();(root/catalog.LOCK).unlink()
+    snap=original._cc_bytes(root)
+    # All legal flag combinations on the small actual prior V4 case; the
+    # other prior generations exercise default and all-on no-op separately.
+    flags=itertools.product((False,True),repeat=5) if version==4 else [(False,)*5,(True,)*5]
+    for refresh,history,crypto_mode,v5,search_mode in flags:
+        portal.render_run(root,rid,refresh_portal=refresh,with_history=history,with_crypto_indexes=crypto_mode,
+                          with_portal_v5=v5,with_portal_search=search_mode)
+        assert original._cc_bytes(root)==snap
+
+
+@pytest.mark.parametrize('kind',['unicode','certificates'])
+def test_search_b_prior_dom_same_input_bytes(tmp_path,monkeypatch,kind):
+    # Exact original A DOM fixture construction. Compare its actual output to
+    # the previously executed A DOM page digest, not a regenerated JS oracle.
+    if kind=='unicode':
+        monkeypatch.setattr(crypto_fixture,'MALICIOUS',EVIL)
+        populate=crypto_fixture.populate
+        def os_fixture(doc,host,second):
+            populate(doc,host,second)
+            if not second:
+                for version in ('9.9','9.10'):
+                    data=dict(os_family='redhat',os_version=version,distribution='oracle-linux',major=9,
+                              minor=int(version.split('.')[1]),patch=None,architecture='x86_64',platform_status='UNVERIFIED')
+                    crypto_fixture.add_scope(doc,host,'packages','platform-'+version,[crypto_fixture.record('os','PLATFORM_INFO',data)])
+        monkeypatch.setattr(crypto_fixture,'populate',os_fixture)
+        source='s1';prior='21f55370b970ba01c1bd74140abe70a1e80808da55a55b7e5eb6e8a3f182fd5b'
+    else:
+        c1=original.c1;old=c1.cert_snapshot
+        def snapshot(partial=False,large=False):
+            roots=old(partial,large)
+            for root in roots.values():
+                for src in root['sources']:
+                    for block in src['blocks']:
+                        c=block['certificate'];fp0=c['fingerprint']==c1.digest('public-fixture-0')
+                        c.update(not_before=('2025-01-01T00:00:00Z' if partial else '2026-01-01T00:00:00Z'),
+                                 not_after=('2028-01-01T00:00:00Z' if partial else '2027-01-01T00:00:00Z'))
+                        if not fp0:c['not_after' if partial else 'not_before']=None
+                        c['gaps']=c1.ca.metadata_gaps(c);block['reason']='METADATA_GAP' if c['gaps'] else 'OK'
+            return roots
+        monkeypatch.setattr(c1,'cert_snapshot',snapshot)
+        source='c1-assessed';prior='264794ab82b9e0117d2374ce6df5859d2bf31cd04baad4735310ba0d02f943a7'
+    pub,_,raw,root,_,_=fixture(tmp_path,monkeypatch,source,history=True)
+    rid=pub.manifest['run_id'];portal.render_run(root,rid,with_portal_search=True)
+    actual=(root/rid/'portal-v6/search.html').read_bytes()
+    assert actual==raw and digest(actual)==prior
+    print('V6_SAME_A_DOM_BYTES',kind,len(actual),digest(actual),flush=True)
+
+
+def test_search_b_cli_flag_and_catalog_gate(tmp_path):
+    import subprocess
+    from test_run_catalog import publish
+    root,pub,rid,run=_search_b_setup(tmp_path,history=False)
+    for value in (1,None,'true',[]):
+        with pytest.raises(rs.StoreError,match='INVALID_PORTAL_SEARCH_FLAG'):
+            portal.render_run(root,rid,with_portal_search=value)
+    for flag,code in [('refresh_portal','INVALID_REFRESH_FLAG'),('with_history','INVALID_HISTORY_FLAG'),
+                     ('with_crypto_indexes','INVALID_CRYPTO_INDEXES_FLAG'),('with_portal_v5','INVALID_PORTAL_V5_FLAG')]:
+        with pytest.raises(rs.StoreError,match=code):portal.render_run(root,rid,with_portal_search=1,**{flag:1})
+    before=original._cc_bytes(run)
+    with pytest.raises(rs.StoreError):portal.render_run(root,rid,with_portal_search=True)
+    assert original._cc_bytes(run)==before and not (run/'portal-v6').exists()
+    def cli(*flags):
+        return subprocess.run([sys.executable,'-B','-m','tools.render_portal','--report-root',str(root),'--run-id',rid,*flags],
+                              cwd=ROOT,capture_output=True,timeout=40)
+    assert cli('--with-portal-searc').returncode==2
+    catalog.build_catalog(root);p=cli('--with-portal-search','--with-portal-v5','--with-history','--with-crypto-indexes')
+    assert (p.returncode,p.stdout,p.stderr)==(0,b'PORTAL_RENDERED\n',b'')
+    _search_b_receipt(run,pub)
+    # A corrupt catalog cannot admit a new V6; an existing exact V6 no-op
+    # does not read or repair that catalog.
+    with pytest.MonkeyPatch.context() as m:publish(root,m,'fixture-new')
+    catalog.build_catalog(root);(root/catalog.JSON).write_bytes(b'{}')
+    before=original._cc_bytes(root)
+    with pytest.raises(rs.StoreError):portal.render_run(root,'fixture-new',with_portal_search=True)
+    portal.render_run(root,rid,refresh_portal=True)
+    assert original._cc_bytes(root)==before and not (root/'fixture-new/portal-v6').exists()
+
+
+def test_search_b_private_v3_public_rejected(tmp_path):
+    from tools import run_store_v3 as v3, scan_collectors as bridge, batch_execution as batch
+    root=tmp_path/'reports';root.mkdir(mode=0o700);rid='fixture-private-v3';target='fixture-v3.example.invalid'
+    limits=dict(max_hosts=10,forks=2,serial=2,ssh_timeout_s=15,command_timeout_s=30)
+    flags={f:False for f in bridge.FLAGS};rules=(ROOT/'config/assessment_rules.yml').read_bytes()
+    # A real complete all-disabled private publication, using actual terminal
+    # validator and V3 writer, not a forged marker/manifest or remote worker.
+    with rs.RunStore(root) as store:
+        with store._begin_v3(run_id=rid,expected_hosts=[dict(target_id=target,inventory_authority_id=None,identity_key=target)],
+                requested_flags={target:flags},limits=limits,profile='baseline',producer_rules_raw=rules) as w:
+            row=batch._blank(target,flags,'NO_EXECUTABLE_COLLECTORS',False)
+            row['platform']=batch._outcome(bridge.PLATFORM,False,'NOT_SCANNED','DISABLED')
+            host=bridge.host_record(rid,target,row['host_state'],row['reason_code'])
+            doc=bridge.document(rid,w.scope['started_at'],[host],rs._run_state([host]),None)
+            doc['run']['recorded_at']=v3._clock()
+            w.record_host(doc,attempted=False,terminal=row,details={})
+            state,reason,rc=batch._run_state([row]);term=dict(batch_manifest_version=2,target_ids=[target],target_count=1,
+                   limits=limits,profile='baseline',run_state=state,reason_code=reason,hosts=[row])
+            batch.validate_producer_manifest(term,rc)
+            pub=w.finalize(batch_raw=bridge.wire_bytes(term),batch_rc=rc,finished_at=v3._clock())
+        assert store._open_v3(rid)==pub and pub.manifest['manifest_version']=='1.1.0'
+        with pytest.raises(rs.StoreError):store.open(rid)
+    catalog.build_catalog(root);row=original._cc_row(root,rid)
+    assert row['publication_status']=='INVALID' and row['portal_status']=='NOT_VERIFIED' and row['href'] is None
+    before=original._cc_bytes(root/rid)
+    for kwargs in ({},{'with_portal_v5':True},{'with_portal_search':True}):
+        with pytest.raises(rs.StoreError):portal.render_run(root,rid,**kwargs)
+    assert original._cc_bytes(root/rid)==before and not (root/rid/'portal-v6').exists()
+
+
+@pytest.mark.parametrize('cap',['rows','page','html','bundle','receipt'])
+def test_search_b_exact_limits_before_write(tmp_path,monkeypatch,cap):
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    index,css,pages,receipt=portal._render_v6(pub,(run/'run_manifest.json').read_bytes())
+    html=len(index)+sum(len(raw) for name,raw in pages.items() if name.endswith('.html'))
+    bundle=len(index)+len(css)+len(receipt)+sum(map(len,pages.values()))
+    rows=sum(len(v) for v in HTML(pages['search.html']).rows.values())
+    mod,key,exact={'rows':(search,'_MAX_ROWS',rows),'page':(ca,'_MAX_HTML',max([len(index),*[len(v) for n,v in pages.items() if n.endswith('.html')]])),
+                   'html':(ca,'_MAX_HTML_TOTAL',html),'bundle':(ca,'_MAX_BUNDLE',bundle),
+                   'receipt':(portal,'_MAX_V5_RECEIPT',len(receipt))}[cap]
+    before=original._cc_bytes(root)
+    with monkeypatch.context() as m:
+        m.setattr(mod,key,exact-1)
+        with pytest.raises(rs.StoreError,match='PORTAL_PAYLOAD_SIZE_LIMIT'):portal.render_run(root,rid,with_portal_search=True)
+        assert original._cc_bytes(root)==before and not (run/'portal-v6').exists()
+        m.setattr(mod,key,exact);portal.render_run(root,rid,with_portal_search=True)
+        catalog.build_catalog(root);assert original._cc_row(root,rid)['portal_generation']=='portal-v6'
+    assert _search_b_receipt(run,pub)==pages
+    print('V6_EXACT_LIMIT',cap,exact,flush=True)
+
+
+@pytest.mark.parametrize('fault',['missing','extra','receipt','payload','symlink','hardlink','marker','missing-generation','css'])
+def test_search_b_active_tamper_no_link_no_repair(tmp_path,fault):
+    import os
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    portal.render_run(root,rid,with_portal_v5=True)
+    portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    catalog.build_catalog(root);gen=run/'portal-v6';p=gen/'search.html'
+    if fault=='missing':p.unlink()
+    elif fault=='extra':write(gen/'foreign.html',b'fixture')
+    elif fault=='receipt':
+        rec=json.loads((gen/portal._RECEIPT).read_bytes());rec['pages'][0]['name']='../foreign.html';write(gen/portal._RECEIPT,rs._json_bytes(rec))
+    elif fault=='payload':p.write_bytes(p.read_bytes()+b' ')
+    elif fault=='symlink':p.unlink();p.symlink_to(run/'portal-v5/hosts.html')
+    elif fault=='hardlink':p.unlink();os.link(run/'portal-v5/hosts.html',p)
+    elif fault=='marker':(run/'index.html').write_bytes(b'<!-- PQC portal-v7 -->\n'+(run/'index.html').read_bytes())
+    elif fault=='missing-generation':gen.rename(root.parent/'inactive-copy')
+    else:(run/'portal.css').write_bytes(b'foreign-css')
+    before=original._cc_bytes(run)
+    with pytest.raises(rs.StoreError):portal.render_run(root,rid,refresh_portal=True,with_portal_search=True)
+    assert original._cc_bytes(run)==before
+    catalog.build_catalog(root);row=original._cc_row(root,rid)
+    assert row['portal_status']=='INVALID' and row['portal_generation'] is None and row['href'] is None
+    assert original._cc_bytes(run)==before
+
+
+def test_search_b_catalog_budget_active_only_and_unsafe(tmp_path,monkeypatch):
+    import os
+    from test_run_catalog import catalog_state
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    portal.render_run(root,rid,with_portal_v5=True)
+    portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    catalog.build_catalog(root);before=catalog_state(root)
+    total=sum(r['size'] for r in pub.manifest['artifacts'])+sum((run/n).stat().st_size for n in ('run_manifest.json','journal.json','index.html','portal.css'))
+    gen=run/'portal-v6';total+=sum(p.stat().st_size for p in gen.iterdir())
+    (run/'portal-v5/foreign').symlink_to(run/'index.html')
+    actual=rs._open_dir
+    def guarded(fd,name,*args,**kwargs):
+        assert name!='portal-v5'
+        return actual(fd,name,*args,**kwargs)
+    monkeypatch.setattr(rs,'_open_dir',guarded)
+    with monkeypatch.context() as m:
+        m.setattr(catalog,'MAX_ADMITTED',total);catalog.build_catalog(root);assert catalog_state(root)==before
+        m.setattr(catalog,'MAX_ADMITTED',total-1)
+        with pytest.raises(rs.StoreError,match='CATALOG_CAPACITY'):catalog.build_catalog(root)
+        assert catalog_state(root)==before
+    p=gen/'search.html';size=p.stat().st_size
+    # Isolate the search slot: a legitimate coverage page can be larger than
+    # search on an empty run. Keep every other HTML slot within the test cap,
+    # then deliberately make only the persisted search slot one byte too large.
+    cap=max(size,(run/'index.html').stat().st_size,
+            *(q.stat().st_size for q in gen.glob('*.html') if q!=p))
+    with p.open('ab') as f:f.write(b' '*(cap+1-size))
+    assert p.stat().st_size==cap+1
+    # Safe actual oversized slot, before any read; reduced cap avoids giant files.
+    original_read=rs._read;parent=gen.stat().st_ino
+    def guarded_read(fd,name,*args,**kwargs):
+        assert not (name=='search.html' and os.fstat(fd).st_ino==parent)
+        return original_read(fd,name,*args,**kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(ca,'_MAX_HTML',cap);m.setattr(rs,'_read',guarded_read)
+        with pytest.raises(rs.StoreError,match='CATALOG_CAPACITY'):catalog.build_catalog(root)
+        assert catalog_state(root)==before
+        # Same size and unsafe inode: safety is checked before size admission.
+        p.chmod(0o644);catalog.build_catalog(root)
+        row=original._cc_row(root,rid);assert row['portal_status']=='INVALID' and row['href'] is None
+
+
+@pytest.mark.parametrize('boundary',['page','receipt','stable','after-switch'])
+def test_search_b_interruption_resume(tmp_path,monkeypatch,boundary):
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    portal.render_run(root,rid,with_portal_v5=True);catalog.build_catalog(root)
+    old=original._cc_bytes(run);actual_write,actual_replace,actual_sync=rs._write,portal._replace_v1_index,rs._sync
+    injected=[]
+    with monkeypatch.context() as m:
+        def put(fd,name,raw,device,**kwargs):
+            if boundary=='page' and name=='search.html' or boundary=='receipt' and name==portal._RECEIPT:
+                injected.append(name);raise rs.StoreError('STORE_IO')
+            return actual_write(fd,name,raw,device,**kwargs)
+        def replace(*args,**kwargs):
+            if boundary=='stable':injected.append(boundary);raise rs.StoreError('STORE_IO')
+            return actual_replace(*args,**kwargs)
+        def sync(fd):
+            if boundary=='after-switch' and portal._identity(fd)==(run.stat().st_dev,run.stat().st_ino) and (run/'index.html').read_bytes().startswith(portal._V6_MARKER):
+                injected.append(boundary);raise rs.StoreError('DURABILITY_UNCONFIRMED')
+            return actual_sync(fd)
+        m.setattr(rs,'_write',put);m.setattr(portal,'_replace_v1_index',replace);m.setattr(rs,'_sync',sync)
+        with pytest.raises(rs.StoreError,match='DURABILITY_UNCONFIRMED' if boundary=='after-switch' else 'STORE_IO'):
+            portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    assert injected
+    if boundary!='after-switch':assert original._cc_bytes(run)['index.html']==old['index.html']
+    else:assert (run/'index.html').read_bytes().startswith(portal._V6_MARKER)
+    stage=original._cc_bytes(run/'portal-v6')
+    assert (portal._RECEIPT in stage)==(boundary in ('stable','after-switch'))
+    portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    after=original._cc_bytes(run/'portal-v6');assert all(after[n]==v for n,v in stage.items())
+    assert all(original._cc_bytes(run)[n]==v for n,v in old.items() if n!='index.html')
+    _search_b_receipt(run,pub);catalog.build_catalog(root);assert original._cc_row(root,rid)['portal_generation']=='portal-v6'
+
+
+@pytest.mark.parametrize('fault',['old-page','old-inode','target-page','target-incomplete','css','catalog-slot','core','run-lock'])
+def test_search_b_prior_and_target_drift(tmp_path,monkeypatch,fault):
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    portal.render_run(root,rid,with_portal_v5=True);catalog.build_catalog(root)
+    old=original._cc_bytes(run)['index.html'];replace=portal._replace_v1_index;render=portal._render_v6
+    def same_bytes_new_inode(p):
+        raw=p.read_bytes();p.rename(tmp_path/'old-inode');write(p,raw)
+    if fault=='old-page':
+        p=run/'portal-v5/hosts.html';p.write_bytes(p.read_bytes()+b' ')
+    elif fault in ('catalog-slot','core','run-lock'):
+        def drift_render(*args):
+            value=render(*args)
+            same_bytes_new_inode({'catalog-slot':root/catalog.JSON,'core':run/'evidence.json','run-lock':run/'.writer.lock'}[fault])
+            return value
+        monkeypatch.setattr(portal,'_render_v6',drift_render)
+    else:
+        def drift(*args,**kwargs):
+            if fault=='target-incomplete':(run/'portal-v6/search.html').unlink()
+            else:same_bytes_new_inode({'old-inode':run/'portal-v5/hosts.html','target-page':run/'portal-v6/search.html','css':run/'portal.css'}[fault])
+            return replace(*args,**kwargs)
+        monkeypatch.setattr(portal,'_replace_v1_index',drift)
+    with pytest.raises(rs.StoreError):portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    assert original._cc_bytes(run)['index.html']==old
+    if fault in ('old-page','catalog-slot','core','run-lock'):assert not (run/'portal-v6').exists()
+
+
+def test_search_b_catalog_lock_order_and_switch(tmp_path,monkeypatch):
+    import fcntl,os
+    from contextlib import contextmanager
+    root,pub,rid,run=_search_b_setup(tmp_path)
+    portal.render_run(root,rid,with_portal_v5=True);catalog.build_catalog(root)
+    observed=[];ctx,render,replace=catalog._history_root,portal._render_v6,os.replace
+    def probe(path,held):
+        fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW)
+        try:
+            if held:
+                with pytest.raises(BlockingIOError):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            else:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        finally:os.close(fd)
+    @contextmanager
+    def history(path):
+        probe(run/'.writer.lock',False);observed.append('probe-released')
+        with ctx(path) as value:yield value
+    def assembly(*args):
+        probe(root/catalog.LOCK,True);observed.append('catalog-held');return render(*args)
+    def switch(src,dst,**kwargs):
+        if dst=='index.html':
+            probe(root/catalog.LOCK,True);probe(run/'.writer.lock',True);observed.append('switch-held')
+        return replace(src,dst,**kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(catalog,'_history_root',history);m.setattr(portal,'_render_v6',assembly);m.setattr(os,'replace',switch)
+        portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    assert observed==['probe-released','catalog-held','switch-held']
+    probe(root/catalog.LOCK,False);probe(run/'.writer.lock',False)
+    snapshot=original._cc_bytes(run)
+    with rs.RunStore(root) as store,store._locked_run(rid,shared=False):
+        with pytest.raises(rs.StoreError,match='RUN_BUSY'):portal.render_run(root,rid)
+    fd=os.open(root/catalog.LOCK,os.O_RDWR|os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);portal.render_run(root,rid)
+    finally:os.close(fd)
+    assert original._cc_bytes(run)==snapshot
+
+
+def test_search_b_fresh_stable_noreplace_race(tmp_path,monkeypatch):
+    import os
+    root,pub,rid,run=_search_b_setup(tmp_path);before=original._cc_bytes(run)
+    rename=rs._rename_noreplace;raced=[]
+    def collide(src_fd,src,dst_fd,dst):
+        if dst=='index.html':
+            assert (run/'portal-v6'/portal._RECEIPT).is_file() and not (run/'index.html').exists()
+            fd=os.open(dst,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=dst_fd)
+            try:os.write(fd,b'foreign-stable-index');os.fsync(fd)
+            finally:os.close(fd)
+            raced.append(True)
+        return rename(src_fd,src,dst_fd,dst)
+    with monkeypatch.context() as m:
+        m.setattr(rs,'_rename_noreplace',collide)
+        with pytest.raises(rs.StoreError):portal.render_run(root,rid,with_portal_search=True)
+    assert raced and (run/'index.html').read_bytes()==b'foreign-stable-index'
+    assert all(original._cc_bytes(run)[n]==v for n,v in before.items()) and not list(run.glob('.portal-index-*'))
+    with pytest.raises(rs.StoreError):portal.render_run(root,rid,with_portal_search=True,refresh_portal=True)
+    catalog.build_catalog(root);assert original._cc_row(root,rid)['portal_status']=='INVALID'

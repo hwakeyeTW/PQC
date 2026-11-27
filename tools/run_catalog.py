@@ -103,13 +103,15 @@ def _unknown(rid, status, reason):
 
 
 def _v5_portal_status(fd, device, published, marker, budget, current, index_signature,
-                      index_size, has_css):
-    """Verify only the fixed active V5 generation under the pinned run lock.
+                      index_size, has_css, *, portal_v6=False):
+    """Verify only the fixed active typed generation under the pinned run lock.
 
     Admit safe actual sizes before reading nested buffers or rendering. A
     receipt is never a path/size authority. Invalid safe slots still count.
     """
-    layout = portal._v5_layout(published)
+    rs.require(type(portal_v6) is bool, 'PORTAL_PAYLOAD_INVALID')
+    generation = portal._V6_GENERATION if portal_v6 else portal._V5_GENERATION
+    layout = portal._v6_layout(published) if portal_v6 else portal._v5_layout(published)
     caps = layout[0]
     sizes = {'index.html': index_size}
     signatures = {}
@@ -131,7 +133,7 @@ def _v5_portal_status(fd, device, published, marker, budget, current, index_sign
     if has_css:
         admit(fd, 'portal.css')
     expected = set(caps) - {'index.html', 'portal.css'}
-    with rs._directory(fd, (portal._V5_GENERATION,), device) as gen:
+    with rs._directory(fd, (generation,), device) as gen:
         # Stat only known fixed names. Unknown entries never authorize a
         # read or a size charge, even in a directory with excessive extras.
         present = {name for name in expected if rs._exists(gen, name)}
@@ -150,7 +152,8 @@ def _v5_portal_status(fd, device, published, marker, budget, current, index_sign
         css = rs._read(fd, 'portal.css', device, caps['portal.css'], sizes['portal.css'])
         core = portal._v5_core_signatures(fd, device, published)
         try:
-            index, expected_css, pages, receipt = portal._render_v5(published, marker)
+            render = portal._render_v6 if portal_v6 else portal._render_v5
+            index, expected_css, pages, receipt = render(published, marker)
         except rs.StoreError as exc:
             if exc.code == 'PORTAL_PAYLOAD_SIZE_LIMIT':
                 raise CapacityError('CATALOG_CAPACITY') from None
@@ -169,7 +172,7 @@ def _v5_portal_status(fd, device, published, marker, budget, current, index_sign
                              frozen_scope=journal['scope'], verified=published)
         rs.require(portal._v5_core_signatures(fd, device, published) == core,
                    'ARTIFACT_CHANGED')
-        _same_entry(fd, portal._V5_GENERATION, gen)
+        _same_entry(fd, generation, gen)
         rs.require(portal._index_stat(fd, device) == index_signature and
                    rs._read(fd, HTML, device, caps['index.html'], index_size) == index and
                    portal._index_stat(fd, device) == index_signature and
@@ -182,8 +185,8 @@ def _v5_portal_status(fd, device, published, marker, budget, current, index_sign
         rs.require(set(rs._entries(gen, len(expected))) == expected and
                    all(portal._file_signature(gen, name, device) == signatures[name]
                        for name in expected), 'ARTIFACT_CHANGED')
-        _same_entry(fd, portal._V5_GENERATION, gen)
-    return 'AVAILABLE', portal._V5_GENERATION
+        _same_entry(fd, generation, gen)
+    return 'AVAILABLE', generation
 
 
 def _portal_status(fd, device, published, marker, budget):
@@ -193,15 +196,21 @@ def _portal_status(fd, device, published, marker, budget):
     has_v3 = rs._exists(fd, portal._HISTORY_GENERATION)
     has_v4 = rs._exists(fd, portal._CRYPTO_GENERATION)
     has_v5 = rs._exists(fd, portal._V5_GENERATION)
-    if not (has_index or has_css or has_v2 or has_v3 or has_v4 or has_v5):
+    has_v6 = rs._exists(fd, portal._V6_GENERATION)
+    if not (has_index or has_css or has_v2 or has_v3 or has_v4 or has_v5 or has_v6):
         return 'NOT_GENERATED', None
     try:
         index_size = budget.file(fd, HTML, device, portal._MAX_HTML) if has_index else None
-        if has_v5 and has_index:
+        if (has_v5 or has_v6) and has_index:
             index_signature = portal._index_stat(fd, device)
             current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
             rs.require(portal._index_stat(fd, device) == index_signature, 'ARTIFACT_CHANGED')
+            if current.startswith(portal._V6_MARKER):
+                rs.require(has_v6, 'PORTAL_GENERATION_INCOMPLETE')
+                return _v5_portal_status(fd, device, published, marker, budget, current,
+                                         index_signature, index_size, has_css, portal_v6=True)
             if current.startswith(portal._V5_MARKER):
+                rs.require(has_v5, 'PORTAL_GENERATION_INCOMPLETE')
                 return _v5_portal_status(fd, device, published, marker, budget, current,
                                          index_signature, index_size, has_css)
         css_size = budget.file(fd, 'portal.css', device, portal._MAX_CSS) if has_css else None
@@ -210,9 +219,9 @@ def _portal_status(fd, device, published, marker, budget):
         css_signature = portal._file_signature(fd, 'portal.css', device)
         current = rs._read(fd, HTML, device, portal._MAX_HTML, index_size)
         css = rs._read(fd, 'portal.css', device, portal._MAX_CSS, css_size)
-        if current.startswith(portal._V5_MARKER):
+        if current.startswith((portal._V5_MARKER, portal._V6_MARKER)):
             # Missing active generation (or a concurrent marker change).
-            # Never classify a V5 marker as legacy.
+            # Never classify a typed marker as legacy.
             raise rs.StoreError('PORTAL_GENERATION_INCOMPLETE')
         crypto = current.startswith(portal._CRYPTO_MARKER)
         history = current.startswith(portal._HISTORY_MARKER)
@@ -635,7 +644,7 @@ def _validate_row(row):
     rs._int(row['missing_artifact_count'], 0, rs.MAX_SLOTS)
     rs.require(rs._match(row['manifest_sha256'], rs.HEX), 'INVALID_CATALOG')
     if pstatus == 'AVAILABLE':
-        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3', 'portal-v4', 'portal-v5'))
+        rs._enum(row['portal_generation'], ('portal-v1', 'portal-v2', 'portal-v3', 'portal-v4', 'portal-v5', 'portal-v6'))
         rs.require(row['href'] == rid + '/index.html' and row['reason_code'] == 'PUBLISHED', 'INVALID_CATALOG')
     else:
         rs.require(pstatus in ('NOT_GENERATED', 'INVALID') and row['portal_generation'] is None and

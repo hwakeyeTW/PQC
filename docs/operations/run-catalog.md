@@ -304,3 +304,59 @@ Portal v1/v2/v3 output, fixed pre-change v1/v2 hash oracles, exact HTML/JSON,
 local locks, fault injection and relocation. Official Controller/local filesystem/power-loss/load qualification,
 Windows/Linux `file://` browser and network-zero verification remain #27/#28
 release QA. Do not use engineering fixture success as formal release acceptance.
+
+### Portal V6: explicit offline search publication
+
+V6 adds the verified per-run `search.html` to the complete V5 generation.
+Search covers Hosts, Algorithms, Libraries, Certificates, Services, Findings
+and Coverage; it does not scan, reassess or infer new asset relationships.
+Search and filters operate within a selected run, with separate matched-row
+and unique-host counts. Missing Inventory group membership is shown as not
+recorded. Search uses fixed inline Vanilla JavaScript; without JavaScript all
+rows and relative links remain readable. Keep the complete report root when
+moving or extracting the archive; no web server, network access or new
+runtime dependency is needed.
+
+For an approved private report root and an existing published run:
+
+```sh
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.render_portal --report-root /approved/private/reports --run-id RID --with-portal-search
+python -m tools.run_catalog --report-root /approved/private/reports
+python -m tools.run_catalog --report-root /approved/private/reports --check
+```
+
+Open the report root `index.html` locally, select the run, then choose Search.
+For an existing verified V1-V5 generation, add `--refresh-portal` to the
+second command. The equivalent API flag is `with_portal_search=True` (exact
+bool, default false). Other supported generation flags may be combined; the
+highest requested generation is selected, without downgrading an existing
+verified higher generation. An exact existing V6 is a no-op even if lower
+flags or refresh are supplied and the catalog is missing or damaged. New
+V6 publication requires a coherent catalog; it does not build or recover it.
+
+V6 uses the fixed `portal-v6/` layout and a format 6 receipt. The receipt
+binds the original Store manifest, stable root index, CSS and every fixed
+nested file (14 + 3 per expected host before the receipt); it does not
+control filenames or authorize reads. Only the active stable marker selects
+a catalog generation. Old immutable generations are retained, not repaired,
+removed or counted as active. During publication the catalog lock precedes
+the run lock; exact prior and target bytes, file identities and original
+Store publication are rechecked. The complete sealed generation is durable
+before the stable root index changes. Retry a failed publication only with
+the same authorized options; mismatched, unsafe, missing or extra files fail
+closed. The catalog keeps its prior snapshot on capacity failure. An older
+binary is not guaranteed to recognize V6; the Store manifest remains 1.0.0,
+and private Store V3 publications are not admitted by this renderer/catalog.
+
+V6 retains the V5 class and aggregate byte limits: HTML 16 MiB per page and
+128 MiB total, JSON 32 MiB per fixed file, CSV 16 MiB per file and 32 MiB total,
+CBOM/provenance 32 MiB per pair and 256 MiB total, CSS 256 KiB, receipt 1 MiB,
+and 512 MiB for the entire derived generation including the marker/receipt.
+Search also has a combined limit of 20,000 result rows across the seven
+categories; it respects the actual remaining byte budgets. Overflow is
+`PORTAL_PAYLOAD_SIZE_LIMIT`, never truncated or partially published. A legal
+V5 generation may not fit V6; existing verified V5 remains available. The
+catalog retains its existing 4 GiB admission, 1,000 row and 16 MiB output
+limits. Full deployment browser, filesystem and maximum-load qualification
+remain release QA, not guaranteed by these engineering limits.
